@@ -105,7 +105,7 @@ pub const ControllerMapping = struct {
     stick_x_axis: u8 = 0,
     stick_y_axis: u8 = 1,
     deadzone: u32 = 8000,
-    socd_mode: u8 = 1, // 0=default, 1=L+R negate, 2=U+D negate, 3=both
+    socd_mode: u8 = 1, // 1=L+R negate, 2=U+D negate, 3=both (0 unused, normalized to 1)
     device_index: c_int = 0, // -1 = keyboard
 };
 

@@ -57,6 +57,9 @@ void igSpacing(void);
 void igSeparator(void);
 bool igInputText(const char* label, char* buf, size_t buf_size, ImGuiInputTextFlags flags, void* callback, void* user_data);
 bool igSliderInt(const char* label, int* v, int v_min, int v_max, const char* format, int flags);
+bool igSliderFloat(const char* label, float* v, float v_min, float v_max, const char* format, int flags);
+void igPushItemWidth(float item_width);
+void igPopItemWidth(void);
 bool igSetNextWindowSize(ImVec2_c size, int cond);
 void igSetNextWindowPos(ImVec2_c pos, int cond, ImVec2_c pivot);
 void igSetClipboardText(const char* text);
@@ -71,11 +74,13 @@ bool igSelectable_Bool(const char* label, bool selected, int flags, ImVec2_c siz
 // Radio buttons and combo boxes
 bool igRadioButton_Bool(const char* label, bool active);
 bool igCombo_Str_arr(const char* label, int* current_item, const char* const items[], int items_count, int popup_max_height_in_items);
+bool igCheckbox(const char* label, bool* v);
 
 // Layout helpers
 void igDummy(ImVec2_c size);
 void igIndent(float indent_w);
 void igUnindent(float indent_w);
+void igAlignTextToFramePadding(void);
 
 // ID stack
 void igPushID_Str(const char* str_id);

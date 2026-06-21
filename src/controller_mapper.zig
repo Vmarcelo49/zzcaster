@@ -105,7 +105,7 @@ pub const ControllerMapping = struct {
     stick_x_axis: u8 = 0,
     stick_y_axis: u8 = 1,
     deadzone: u32 = 8000,
-    socd_mode: u8 = 1, // 0=default, 1=L+R negate, 2=U+D negate, 3=both
+    socd_mode: u8 = 1, // 1=L+R negate, 2=U+D negate, 3=both (0 unused, normalized to 1)
     device_index: c_int = 0, // -1 = keyboard
 };
 
@@ -232,14 +232,28 @@ fn isBindingActive(binding: InputBinding, joy: ?*anyopaque, deadzone: u32) bool 
             const hat_idx: c_int = @intCast(binding.index & 0xFF);
             const dir: u8 = @intCast(binding.index >> 8);
             const hat = c.SDL_JoystickGetHat(@ptrCast(joy), hat_idx);
+            // Cardinal directions (2=Down, 4=Left, 6=Right, 8=Up) match
+            // if their primary direction bit is set, regardless of
+            // perpendicular bits. This allows diagonals to work: pressing
+            // Down+Right on the D-pad matches both the Down binding (dir=2)
+            // and the Right binding (dir=6), and readInputMapped combines
+            // them into numpad 3 (Down-Right).
+            //
+            // The old code had exclusivity checks (e.g. dir=2 required
+            // hat & LEFT == 0 AND hat & RIGHT == 0), which prevented
+            // diagonals from registering — pressing Down+Right matched
+            // neither Down nor Right, producing neutral input.
+            //
+            // Diagonal directions (1=DL, 3=DR, 7=UL, 9=UR) still require
+            // both bits, since those are explicit diagonal bindings.
             const matched = switch (dir) {
                 1 => (hat & c.SDL_HAT_LEFT != 0) and (hat & c.SDL_HAT_DOWN != 0),
-                2 => (hat & c.SDL_HAT_DOWN != 0) and (hat & c.SDL_HAT_LEFT == 0) and (hat & c.SDL_HAT_RIGHT == 0),
+                2 => (hat & c.SDL_HAT_DOWN != 0),
                 3 => (hat & c.SDL_HAT_RIGHT != 0) and (hat & c.SDL_HAT_DOWN != 0),
-                4 => (hat & c.SDL_HAT_LEFT != 0) and (hat & c.SDL_HAT_UP == 0) and (hat & c.SDL_HAT_DOWN == 0),
-                6 => (hat & c.SDL_HAT_RIGHT != 0) and (hat & c.SDL_HAT_UP == 0) and (hat & c.SDL_HAT_DOWN == 0),
+                4 => (hat & c.SDL_HAT_LEFT != 0),
+                6 => (hat & c.SDL_HAT_RIGHT != 0),
                 7 => (hat & c.SDL_HAT_LEFT != 0) and (hat & c.SDL_HAT_UP != 0),
-                8 => (hat & c.SDL_HAT_UP != 0) and (hat & c.SDL_HAT_LEFT == 0) and (hat & c.SDL_HAT_RIGHT == 0),
+                8 => (hat & c.SDL_HAT_UP != 0),
                 9 => (hat & c.SDL_HAT_RIGHT != 0) and (hat & c.SDL_HAT_UP != 0),
                 else => false,
             };

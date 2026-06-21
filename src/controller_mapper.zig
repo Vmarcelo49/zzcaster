@@ -302,27 +302,26 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
 pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u8, io: std.Io, log: *logging.Logger) void {
     // Ensure the parent directory exists. createFile does NOT create
     // intermediate directories — if "zzcaster/" doesn't exist yet (e.g.
-    // first run), the save would silently fail with a "file not found"
-    // error from the OS. This is especially important because the GUI
-    // saves to "zzcaster/mapping.ini" relative to CWD.
+    // first run), the save would silently fail.
     if (std.fs.path.dirname(path)) |dir| {
         if (dir.len > 0) {
             std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
     }
 
-    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch {
-        log.warn("Failed to save mapping to {s}", .{path});
-        return;
-    };
-    defer file.close(io);
-
-    var write_buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &write_buf);
-    const w = &writer.interface;
+    // Build the INI content in a fixed memory buffer first, then write it
+    // to the file in a single call. This avoids the buffered-writer issues
+    // that previously left the file empty (file.writer(&buf) + w.print +
+    // w.flush silently produced 0-byte files because the print errors were
+    // swallowed by catch {}).
+    var content_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&content_buf);
     var buf: [64]u8 = undefined;
 
-    w.print("[Player1]\ndevice={d}\n", .{p1.device_index}) catch {};
+    w.print("[Player1]\ndevice={d}\n", .{p1.device_index}) catch {
+        log.warn("saveMapping: P1 header write failed", .{});
+        return;
+    };
     w.print("a={s}\n", .{p1.a.serialize(&buf)}) catch {};
     w.print("b={s}\n", .{p1.b.serialize(&buf)}) catch {};
     w.print("c={s}\n", .{p1.c.serialize(&buf)}) catch {};
@@ -358,15 +357,21 @@ pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u
         p2.stick_x_axis, p2.stick_y_axis, p2.deadzone, p2.socd_mode,
     }) catch {};
 
-    // Flush the buffered writer so all the prints above actually hit the
-    // file. Without this, file.writer(&buf) only writes to its internal
-    // buffer and the file ends up empty (just truncated to 0 bytes).
-    w.flush() catch {
-        log.warn("Failed to flush mapping writer to {s}", .{path});
+    const written = w.buffered();
+    log.info("saveMapping: built {d} bytes of INI content", .{written.len});
+
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch {
+        log.warn("Failed to create mapping file {s}", .{path});
+        return;
+    };
+    defer file.close(io);
+
+    file.writeStreamingAll(io, written) catch {
+        log.warn("Failed to write mapping to {s}", .{path});
         return;
     };
 
-    log.info("Mapping saved to {s}", .{path});
+    log.info("Mapping saved to {s} ({d} bytes)", .{ path, written.len });
 }
 
 pub fn loadMapping(path: []const u8, io: std.Io, log: *logging.Logger) ?struct { p1: ControllerMapping, p2: ControllerMapping } {
@@ -376,15 +381,23 @@ pub fn loadMapping(path: []const u8, io: std.Io, log: *logging.Logger) ?struct {
     };
     defer file.close(io);
 
-    var read_buf: [4096]u8 = undefined;
+    // Read the file into a fixed buffer. readSliceShort returns the number
+    // of bytes actually read (0 for empty files) instead of erroring with
+    // EndOfStream like readAlloc does.
+    var read_buf: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buf);
-    const data = reader.interface.readAlloc(std.heap.page_allocator, 8192) catch |err| {
-        log.warn("loadMapping: readAlloc failed: {s}", .{@errorName(err)});
+    const len = reader.interface.readSliceShort(&read_buf) catch |err| {
+        log.warn("loadMapping: readSliceShort failed: {s}", .{@errorName(err)});
         return null;
     };
-    defer std.heap.page_allocator.free(data);
 
-    log.info("loadMapping: read {d} bytes from {s}", .{ data.len, path });
+    if (len == 0) {
+        log.warn("loadMapping: file is empty (0 bytes read from {s})", .{path});
+        return null;
+    }
+
+    const data = read_buf[0..len];
+    log.info("loadMapping: read {d} bytes from {s}", .{ len, path });
 
     var p1 = ControllerMapping{};
     var p2 = ControllerMapping{};

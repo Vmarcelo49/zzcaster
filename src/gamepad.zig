@@ -24,10 +24,19 @@ pub const GamepadMapping = struct {
     down: c_int = c.SDL_CONTROLLER_BUTTON_DPAD_DOWN,
     left: c_int = c.SDL_CONTROLLER_BUTTON_DPAD_LEFT,
     right: c_int = c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
-    a: c_int = c.SDL_CONTROLLER_BUTTON_A,
-    b: c_int = c.SDL_CONTROLLER_BUTTON_B,
-    c_btn: c_int = c.SDL_CONTROLLER_BUTTON_X,
-    d: c_int = c.SDL_CONTROLLER_BUTTON_Y,
+    // MBAACC Community Edition standard layout (matches original CCCaster
+    // defaultXboxMapping):
+    //   MBAA A ← Xbox X   (SDL_CONTROLLER_BUTTON_X)
+    //   MBAA B ← Xbox Y   (SDL_CONTROLLER_BUTTON_Y)
+    //   MBAA C ← Xbox B   (SDL_CONTROLLER_BUTTON_B)
+    //   MBAA D ← Xbox A   (SDL_CONTROLLER_BUTTON_A)
+    // This is the layout the community expects: the bottom face button
+    // (A on Xbox) is MBAA's D (the "weak" attack), and the left face
+    // button (X on Xbox) is MBAA's A (the "light" attack).
+    a: c_int = c.SDL_CONTROLLER_BUTTON_X,
+    b: c_int = c.SDL_CONTROLLER_BUTTON_Y,
+    c_btn: c_int = c.SDL_CONTROLLER_BUTTON_B,
+    d: c_int = c.SDL_CONTROLLER_BUTTON_A,
     e: c_int = c.SDL_CONTROLLER_BUTTON_LEFTSHOULDER,
     ab: c_int = c.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
     start: c_int = c.SDL_CONTROLLER_BUTTON_START,

@@ -96,6 +96,15 @@ pub const GamepadReader = struct {
     }
 
     pub fn hasGamepad(self: *const GamepadReader) bool {
+        // A custom keyboard mapping (device_index == -1) is always usable,
+        // even with no physical controller plugged in. Without this, the
+        // frameStep hook falls through to keyboard.readInput() (the legacy
+        // reader that polls MBAA.exe's built-in config at offset 0x14D2C0)
+        // and the user's custom keyboard bindings from mapping.ini are
+        // silently ignored.
+        if (self.custom_mapping) |m| {
+            if (m.device_index < 0) return true;
+        }
         return self.controller != null or self.joystick != null or self.mapped_joystick != null;
     }
 
@@ -123,14 +132,30 @@ pub const GamepadReader = struct {
     }
 
     pub fn readInput(self: *GamepadReader) u16 {
-        // If a custom mapping is loaded, use it. If the mapped joystick
-        // failed to open, fall through to the controller/joystick path
-        // instead of returning 0 (which would silently disable input).
+        // If a custom mapping is loaded, route to readInputMapped() —
+        // which handles both keyboard bindings (via GetAsyncKeyState) and
+        // joystick bindings (via SDL_Joystick* API). The previous code only
+        // routed when mapped_joystick was non-null, which meant keyboard
+        // mappings (device_index == -1) were silently dropped here and
+        // frameStep fell back to the legacy keyboard reader using MBAA's
+        // built-in config.
         if (self.custom_mapping) |m| {
+            const mapper = @import("controller_mapper.zig");
+            // Keyboard mapping: poll keyboard bindings via GetAsyncKeyState.
+            // Pass null as the joystick so readInputMapped skips its
+            // analog-stick code path (which would dereference a null joy).
+            if (m.device_index < 0) {
+                return mapper.readInputMapped(null, m);
+            }
+            // Joystick mapping: use the opened mapped_joystick.
             if (self.mapped_joystick != null) {
-                const mapper = @import("controller_mapper.zig");
                 return mapper.readInputMapped(self.mapped_joystick, m);
             }
+            // Custom joystick mapping requested but no joystick could be
+            // opened (rare — SDL_Init failed or controller unplugged since
+            // GUI saved the mapping). Fall through to the controller /
+            // joystick paths below instead of returning 0 (which would
+            // silently disable input).
         }
         if (self.controller != null) return self.readGameController();
         if (self.joystick != null) return self.readJoystick();

@@ -1,0 +1,21 @@
+# Build artifacts
+.zig-cache/
+zig-out/
+*.obj
+*.lib
+*.dll
+*.exe
+
+# Vendored dependencies (fetched by scripts/fetch-deps.sh)
+libs/
+
+# Editor / OS cruft
+.DS_Store
+*.swp
+*.swo
+.vscode/
+.idea/
+*.iml
+
+# Logs
+*.log

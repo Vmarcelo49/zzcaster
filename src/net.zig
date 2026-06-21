@@ -1,0 +1,161 @@
+const std = @import("std");
+const logging = @import("logging.zig");
+
+// ENet via @cImport — this is the SINGLE cimport for the whole project.
+// Other files (dll/netplay_manager.zig, dll/spectator_manager.zig) import
+// `enet` from here via `@import("net.zig").enet` to share the same type
+// definitions.
+pub const enet = @cImport({
+    @cInclude("enet/enet.h");
+});
+
+pub const TransportEvent = enum {
+    connected,
+    disconnected,
+    timed_out,
+    message_received,
+    err_state,
+};
+
+pub const TransportStats = struct {
+    rtt_ms: u32 = 0,
+    jitter_ms: u32 = 0,
+    packet_loss_pct: u32 = 0,
+};
+
+pub const EnetTransport = struct {
+    host: ?*enet.ENetHost = null,
+    peer: ?*enet.ENetPeer = null,
+    is_host: bool = false,
+    connected: bool = false,
+    last_message: [4096]u8 = undefined,
+    last_message_len: usize = 0,
+
+    pub fn init() EnetTransport {
+        return EnetTransport{};
+    }
+
+    pub fn deinit(self: *EnetTransport) void {
+        if (self.peer != null) {
+            enet.enet_peer_disconnect(self.peer, 0);
+            enet.enet_host_flush(self.host);
+            self.peer = null;
+        }
+        if (self.host != null) {
+            enet.enet_host_destroy(self.host);
+            self.host = null;
+        }
+        self.connected = false;
+    }
+
+    pub fn listen(self: *EnetTransport, port: u16, log: *logging.Logger) !void {
+        if (enet.enet_initialize() != 0) return error.EnetInitFailed;
+        defer enet.enet_deinitialize();
+
+        var addr: enet.ENetAddress = undefined;
+        addr.host = enet.ENET_HOST_ANY;
+        addr.port = port;
+
+        self.host = enet.enet_host_create(&addr, 2, 2, 0, 0);
+        if (self.host == null) {
+            log.err("enet_host_create failed on port {d}", .{port});
+            return error.HostCreateFailed;
+        }
+        self.is_host = true;
+        log.info("ENet listening on port {d}", .{port});
+    }
+
+    pub fn connect(self: *EnetTransport, host_str: []const u8, port: u16, log: *logging.Logger) !void {
+        if (enet.enet_initialize() != 0) return error.EnetInitFailed;
+
+        self.host = enet.enet_host_create(null, 1, 2, 0, 0);
+        if (self.host == null) {
+            log.err("enet_host_create (client) failed", .{});
+            return error.HostCreateFailed;
+        }
+
+        // Parse IP address
+        var addr: enet.ENetAddress = undefined;
+        var host_buf: [64]u8 = undefined;
+        const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{host_str}) catch return error.HostTooLong;
+        if (enet.enet_address_set_host(&addr, host_z.ptr) != 0) {
+            log.err("Failed to parse host: {s}", .{host_str});
+            return error.InvalidHost;
+        }
+        addr.port = port;
+
+        self.peer = enet.enet_host_connect(self.host, &addr, 2, 0);
+        if (self.peer == null) {
+            log.err("enet_host_connect failed", .{});
+            return error.ConnectFailed;
+        }
+        self.is_host = false;
+        log.info("ENet connecting to {s}:{d}", .{ host_str, port });
+    }
+
+    pub fn sendReliable(self: *EnetTransport, data: []const u8) bool {
+        if (self.peer == null or !self.connected) return false;
+        const packet = enet.enet_packet_create(data.ptr, data.len, enet.ENET_PACKET_FLAG_RELIABLE);
+        if (packet == null) return false;
+        if (enet.enet_peer_send(self.peer, 0, packet) < 0) {
+            enet.enet_packet_destroy(packet);
+            return false;
+        }
+        enet.enet_host_flush(self.host);
+        return true;
+    }
+
+    pub fn sendUnreliable(self: *EnetTransport, data: []const u8) bool {
+        if (self.peer == null or !self.connected) return false;
+        const packet = enet.enet_packet_create(data.ptr, data.len, 0);
+        if (packet == null) return false;
+        if (enet.enet_peer_send(self.peer, 1, packet) < 0) {
+            enet.enet_packet_destroy(packet);
+            return false;
+        }
+        enet.enet_host_flush(self.host);
+        return true;
+    }
+
+    pub fn poll(self: *EnetTransport, timeout_ms: u32) ?TransportEvent {
+        if (self.host == null) return null;
+
+        var event: enet.ENetEvent = undefined;
+        const result = enet.enet_host_service(self.host, &event, timeout_ms);
+        if (result <= 0) return null;
+
+        switch (event.type) {
+            enet.ENET_EVENT_TYPE_CONNECT => {
+                self.peer = event.peer;
+                self.connected = true;
+                return .connected;
+            },
+            enet.ENET_EVENT_TYPE_RECEIVE => {
+                const len = @min(event.packet.dataLength, self.last_message.len);
+                @memcpy(self.last_message[0..len], event.packet.data[0..len]);
+                self.last_message_len = len;
+                enet.enet_packet_destroy(event.packet);
+                return .message_received;
+            },
+            enet.ENET_EVENT_TYPE_DISCONNECT => {
+                self.connected = false;
+                self.peer = null;
+                return .disconnected;
+            },
+            else => return null,
+        }
+    }
+
+    pub fn getLastMessage(self: *const EnetTransport) []const u8 {
+        return self.last_message[0..self.last_message_len];
+    }
+
+    pub fn getStats(self: *const EnetTransport) TransportStats {
+        if (self.peer == null) return .{};
+        return .{
+            .rtt_ms = self.peer.?.roundTripTime,
+            .jitter_ms = self.peer.?.lastRoundTripTimeVariance,
+            .packet_loss_pct = self.peer.?.packetLoss / enet.ENET_PEER_PACKET_LOSS_SCALE,
+        };
+    }
+};

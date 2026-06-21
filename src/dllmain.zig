@@ -39,6 +39,7 @@ const win32 = struct {
     extern "kernel32" fn SetThreadExecutionState(esFlags: u32) callconv(.winapi) u32;
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
+    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
     extern "kernel32" fn CreateThread(
         lpThreadAttributes: ?*anyopaque, dwStackSize: usize,
         lpStartAddress: ?*const fn (?*anyopaque) callconv(.winapi) u32,
@@ -129,7 +130,32 @@ var ipc_pipe: ?*anyopaque = null;
 var ipc_connected: bool = false;
 var last_world_timer: u32 = 0;
 var prev_game_mode: u32 = 0;
+// The DLL's own module handle, captured in DllMain(PROCESS_ATTACH).
+// Used to resolve the DLL's own file path via GetModuleFileNameA, so we
+// can find mapping.ini in the same directory as hook.dll regardless of
+// the process's current working directory. Without this, the relative
+// path "zzcaster/mapping.ini" resolves against MBAA.exe's CWD, which may
+// not be the MBAACC root (e.g. if launched from a shortcut).
+var dll_module_handle: ?*anyopaque = null;
 var reader: ?gamepad.GamepadReader = null;
+// Diagnostic: one-shot flag so frameStep logs the input pipeline state on
+// the first frame where config_received becomes true. Lets the user
+// verify from the log that reader / reader2 / keyboard were set up.
+var input_diag_logged: bool = false;
+// Periodic input-value logging frame counter.
+var input_log_frame: u32 = 0;
+// SDL must be initialized on the SAME thread that polls it. lazyInit runs
+// on a worker thread, so we defer SDL_Init + controller open to the first
+// frameStep call (which runs on MBAA's main thread). Without this, all
+// SDL_GameControllerGetButton / SDL_JoystickGetButton calls return 0
+// because SDL's internal state is thread-local.
+var sdl_init_done: bool = false;
+// Second reader for offline Versus P2. Null in netplay/spectator modes
+// (P2 input comes from the network there). Built in applyPostLoadHacks
+// from the [Player2] section of zzcaster/mapping.ini. Without this, P2
+// in offline Versus is hard-locked to neutral every frame — the GUI
+// saves P2 bindings but the DLL threw them away.
+var reader2: ?gamepad.GamepadReader = null;
 var sdl_initialized: bool = false;
 
 // Netplay
@@ -155,9 +181,14 @@ export fn zzcasterFrameCallback() callconv(.c) void {
 
 // Zig 0.16: DllMain must return std.os.windows.BOOL (was `callconv(.c) i32`
 // before — the standard library now expects the proper Win32 BOOL type).
-pub export fn DllMain(_: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL {
+pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL {
     switch (fdwReason) {
         1 => { // DLL_PROCESS_ATTACH
+            // Capture the DLL's own module handle so we can resolve its file
+            // path later (GetModuleFileNameA(dll_module_handle, ...)). This
+            // lets us find mapping.ini in the same directory as hook.dll
+            // regardless of the process CWD.
+            dll_module_handle = hModule;
             // BARE MINIMUM only. This runs on the remote LoadLibraryA thread,
             // which under Wine has a small stack (~64KB-1MB) — any heavy
             // Zig 0.16 std.Io work here blows the stack
@@ -539,6 +570,42 @@ fn applySfxAsmHacks() void {
     });
 }
 
+/// Resolve the path to mapping.ini relative to the DLL's own directory.
+///
+/// The DLL is typically installed at `<MBAACC>/zzcaster/hook.dll`, so
+/// mapping.ini lives at `<MBAACC>/zzcaster/mapping.ini` — same directory.
+/// Using the DLL's own path (via GetModuleFileNameA) avoids CWD-dependent
+/// resolution bugs: if the user launches zzcaster.exe from a shortcut or
+/// a different working directory, MBAA.exe inherits that CWD, and the
+/// relative path "zzcaster/mapping.ini" won't resolve. The DLL's own path
+/// is always correct regardless of CWD.
+///
+/// Returns a slice into the provided buffer, or null if the path can't be
+/// resolved (e.g. GetModuleFileNameA failed or the buffer is too small).
+fn resolveMappingIniPath(buf: []u8) ?[]const u8 {
+    var dll_path: [512]u8 = undefined;
+    const len = win32.GetModuleFileNameA(dll_module_handle, &dll_path, dll_path.len);
+    if (len == 0) return null;
+
+    // Find the last path separator and replace everything after it with
+    // "mapping.ini". e.g. "C:\MBAACC\zzcaster\hook.dll" → "C:\MBAACC\zzcaster\mapping.ini"
+    var last_sep: usize = 0;
+    for (dll_path[0..len], 0..) |ch, i| {
+        if (ch == '\\' or ch == '/') last_sep = i;
+    }
+    if (last_sep == 0) return null; // no separator found — shouldn't happen
+
+    const dir = dll_path[0 .. last_sep + 1]; // include trailing separator
+    const filename = "mapping.ini";
+    if (dir.len + filename.len + 1 > buf.len) return null; // +1 for NUL
+
+    @memcpy(buf[0..dir.len], dir);
+    @memcpy(buf[dir.len..dir.len + filename.len], filename);
+    const total = dir.len + filename.len;
+    buf[total] = 0; // null-terminate for Win32 APIs
+    return buf[0..total];
+}
+
 fn applyPostLoadHacks() void {
     if (log == null) return;
     log.?.info("Applying post-load hacks...", .{});
@@ -556,56 +623,13 @@ fn applyPostLoadHacks() void {
     timer_speed_addr.* = 2;
     win_count_vs_addr.* = 2;
 
-    // Init SDL2 for gamepad
-    if (c.SDL_Init(c.SDL_INIT_GAMECONTROLLER | c.SDL_INIT_JOYSTICK) == 0) {
-        sdl_initialized = true;
-        reader = gamepad.GamepadReader.init(log.?);
+    // NOTE: SDL_Init + controller open is deferred to initSdlOnMainThread(),
+    // which runs on MBAA's main thread (via frameStep). SDL is NOT thread-safe
+    // — initializing it on the worker thread and polling on the main thread
+    // causes all SDL_GameControllerGetButton / SDL_JoystickGetButton calls to
+    // return 0, making controllers appear dead.
 
-        // Load custom controller mapping if available. If no mapping.ini
-        // exists, fall back to the built-in Xbox default so the buttons
-        // route correctly (MBAA A→X, B→Y, C→B, D→A) instead of using the
-        // raw joystick hardcoded mapping in GamepadReader.readJoystick.
-        var loaded_mapping: ?mapper.ControllerMapping = null;
-        if (mapper.loadMapping("zzcaster/mapping.ini", app_io_backend.io(), log.?)) |mappings| {
-            loaded_mapping = mappings.p1;
-        } else {
-            log.?.info("No custom mapping found, using built-in Xbox default", .{});
-            loaded_mapping = mapper.defaultXboxMapping();
-            // device_index defaults to 0 in defaultXboxMapping, which
-            // matches the first SDL joystick — same as the previous
-            // GamepadReader.init() behavior.
-        }
-        reader.?.custom_mapping = loaded_mapping;
-        if (loaded_mapping.?.device_index >= 0) {
-            // Try to open the requested joystick first. If that fails
-            // (controller not yet enumerated, different index in this
-            // process, etc.) fall back to any available joystick so the
-            // custom mapping still works instead of silently disabling
-            // input.
-            var opened: ?*c.SDL_Joystick = c.SDL_JoystickOpen(loaded_mapping.?.device_index);
-            if (opened == null) {
-                log.?.warn("Joystick {d} not available, trying index 0", .{loaded_mapping.?.device_index});
-                opened = c.SDL_JoystickOpen(0);
-            }
-            reader.?.mapped_joystick = @ptrCast(opened);
-            if (reader.?.mapped_joystick != null) {
-                log.?.info("Opened joystick for mapping", .{});
-                // Close the GameController since we're using raw joystick
-                if (reader.?.controller != null) {
-                    c.SDL_GameControllerClose(@ptrCast(reader.?.controller));
-                    reader.?.controller = null;
-                }
-            } else {
-                log.?.err("No joystick available for mapping — input will not work", .{});
-            }
-        } else {
-            log.?.info("Mapping uses keyboard (device=-1)", .{});
-        }
-    } else {
-        log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
-    }
-
-    // Init keyboard
+    // Init keyboard (reads MBAA.exe file, no threading concerns)
     keyboard.init(log.?, app_io_backend.io());
 
     // Init ENet connection for netplay
@@ -618,6 +642,101 @@ fn applyPostLoadHacks() void {
             log.?.err("ENet init failed — netplay disabled", .{});
             is_netplay = false;
         };
+    }
+}
+
+/// Initialize SDL2 and open controllers/gamepads. MUST be called on MBAA's
+/// main thread (i.e. from frameStep), because SDL is not thread-safe and
+/// all subsequent SDL_GameControllerGetButton / SDL_PollEvent calls happen
+/// on that thread. Called once on the first frameStep after config is
+/// received.
+fn initSdlOnMainThread() void {
+    if (sdl_init_done) return;
+    sdl_init_done = true;
+
+    if (c.SDL_Init(c.SDL_INIT_GAMECONTROLLER | c.SDL_INIT_JOYSTICK) == 0) {
+        sdl_initialized = true;
+        reader = gamepad.GamepadReader.init(log.?);
+
+        // Load custom controller mappings if available. If no mapping.ini
+        // exists, fall back to the SDL_GameController API with built-in
+        // button layout (works for any XInput-compatible controller).
+        //
+        // Path resolution: use the DLL's own directory (robust against
+        // CWD mismatches), falling back to "zzcaster/mapping.ini".
+        var mapping_path_buf: [600]u8 = undefined;
+        const mapping_path = resolveMappingIniPath(&mapping_path_buf) orelse "zzcaster/mapping.ini";
+        log.?.info("Looking for mapping.ini at: {s}", .{mapping_path});
+
+        var p1_mapping: mapper.ControllerMapping = undefined;
+        var p2_mapping: mapper.ControllerMapping = undefined;
+        var have_mappings: bool = false;
+        if (mapper.loadMapping(mapping_path, app_io_backend.io(), log.?)) |mappings| {
+            p1_mapping = mappings.p1;
+            p2_mapping = mappings.p2;
+            have_mappings = true;
+            log.?.info("Custom mapping loaded successfully", .{});
+        } else {
+            log.?.info("No custom mapping found — using GameController API with built-in button layout", .{});
+            p1_mapping = mapper.defaultXboxMapping();
+            p2_mapping = mapper.defaultXboxMapping();
+            p2_mapping.device_index = -1;
+        }
+
+        // Apply P1 mapping. ONLY set custom_mapping + open raw joystick
+        // when the user has explicitly saved a mapping.ini. Without a
+        // saved mapping, leave reader.custom_mapping = null so
+        // readGameController() handles input via the GameController API.
+        if (have_mappings) {
+            reader.?.custom_mapping = p1_mapping;
+            openMappedJoystick(&reader.?, p1_mapping, "P1");
+        } else {
+            log.?.info("P1: using GameController API (no custom mapping)", .{});
+        }
+
+        // Apply P2 mapping.
+        if (have_mappings or p2_mapping.device_index >= 0) {
+            reader2 = gamepad.GamepadReader{};
+            reader2.?.custom_mapping = p2_mapping;
+            openMappedJoystick(&reader2.?, p2_mapping, "P2");
+        } else {
+            log.?.info("P2: keyboard-only default, no reader2 allocated", .{});
+        }
+    } else {
+        log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
+    }
+}
+
+/// Open the SDL_Joystick referenced by `m.device_index` and attach it to
+/// `r.mapped_joystick`. If `device_index < 0` the mapping is keyboard-only
+/// and nothing is opened. If the requested index can't be opened, falls
+/// back to joystick 0 so the mapping still works instead of silently
+/// disabling input.
+///
+/// Closes any existing `r.controller` once a raw joystick is successfully
+/// attached, because the custom-mapping path uses SDL_Joystick* API and
+/// having both APIs open on the same device produces duplicate input.
+fn openMappedJoystick(r: *gamepad.GamepadReader, m: mapper.ControllerMapping, label: []const u8) void {
+    if (m.device_index < 0) {
+        log.?.info("{s}: mapping uses keyboard (device=-1)", .{label});
+        return;
+    }
+    var opened: ?*c.SDL_Joystick = c.SDL_JoystickOpen(m.device_index);
+    if (opened == null) {
+        log.?.warn("{s}: joystick {d} not available, trying index 0", .{ label, m.device_index });
+        opened = c.SDL_JoystickOpen(0);
+    }
+    r.mapped_joystick = @ptrCast(opened);
+    if (r.mapped_joystick != null) {
+        log.?.info("{s}: opened joystick for mapping", .{label});
+        // Close any GameController that GamepadReader.init() opened for
+        // this same physical device — we're using raw joystick API now.
+        if (r.controller != null) {
+            c.SDL_GameControllerClose(@ptrCast(r.controller));
+            r.controller = null;
+        }
+    } else {
+        log.?.err("{s}: no joystick available for mapping — input will not work", .{label});
     }
 }
 
@@ -704,6 +823,43 @@ fn frameStep() callconv(.c) void {
         waitForConfig();
         if (config_received) {
             applyPostLoadHacks();
+        }
+    }
+
+    // SDL must be initialized on MBAA's main thread (this thread). The
+    // worker thread's applyPostLoadHacks deferred SDL init to here. This
+    // runs once on the first frameStep after config is received.
+    if (config_received and !sdl_init_done) {
+        initSdlOnMainThread();
+    }
+
+    // One-shot diagnostic: log the input pipeline state once, right after
+    // SDL init has run. This lets the user check the log to see whether
+    // the custom mapping was loaded and whether reader/reader2 were
+    // allocated. If reader is null here, frameStep will fall back to
+    // keyboard.readInput() which uses MBAA's built-in config.
+    if (config_received and sdl_init_done and !input_diag_logged) {
+        input_diag_logged = true;
+        const base_ptr_val = @as(usize, @bitCast(ptr_to_write_input_addr[0..@sizeOf(usize)].*));
+        log.?.info("InputDiag: reader={} reader2={} keyboard.init={} base_ptr=0x{x:0>8} game_mode={d} is_netplay={}", .{
+            reader != null,
+            reader2 != null,
+            keyboard.isInitialized(),
+            base_ptr_val,
+            game_mode_addr.*,
+            is_netplay,
+        });
+        if (reader) |*r| {
+            if (r.custom_mapping) |m| {
+                log.?.info("InputDiag: P1 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
+            } else {
+                log.?.info("InputDiag: P1 no custom_mapping (will use default Xbox or legacy keyboard)", .{});
+            }
+        }
+        if (reader2) |*r| {
+            if (r.custom_mapping) |m| {
+                log.?.info("InputDiag: P2 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
+            }
         }
     }
 
@@ -907,14 +1063,47 @@ fn frameStep() callconv(.c) void {
             }
     } else {
         // === OFFLINE MODE ===
-        const local_input: u16 = blk: {
+        // P1 input — uses reader (with custom_mapping from [Player1]),
+        // falling back to the legacy keyboard reader only if reader is
+        // null/uninitialized. The legacy keyboard.readInput() polls
+        // MBAA.exe's built-in config at offset 0x14D2C0 — it's a
+        // last-resort fallback, not the primary path.
+        const p1_input: u16 = blk: {
             if (reader) |*r| {
                 r.update();
                 if (r.hasGamepad()) break :blk r.readInput();
             }
             break :blk keyboard.readInput();
         };
-        writeInput(1, local_input);
+        // P2 input — uses reader2 (with custom_mapping from [Player2]).
+        // reader2 is null in netplay/spectator modes (P2 input comes
+        // from the network there) and may be null if the user never
+        // saved a [Player2] section in mapping.ini. When null, P2 stays
+        // at neutral (0) — there's no legacy keyboard reader for P2
+        // because MBAA.exe's config table is single-player.
+        const p2_input: u16 = blk: {
+            if (reader2) |*r| {
+                r.update();
+                if (r.hasGamepad()) break :blk r.readInput();
+            }
+            break :blk 0;
+        };
+        writeInput(1, p1_input);
+        writeInput(2, p2_input);
+
+        // Periodic diagnostic: log P1/P2 input values every 300 frames
+        // (~5s at 60fps). If p1_input is always 0 even when the user
+        // presses keys, the binding poll is failing — check whether
+        // reader.custom_mapping loaded correctly (see InputDiag above).
+        // If p1_input is non-zero but the game still doesn't respond,
+        // the issue is in writeInput (wrong base ptr, wrong offsets, or
+        // MBAA's own polling clobbering our writes).
+        input_log_frame +%= 1;
+        if (input_log_frame % 300 == 0) {
+            log.?.info("InputFrame {d}: P1=0x{x:0>4} P2=0x{x:0>4} mode={d}", .{
+                input_log_frame, p1_input, p2_input, game_mode,
+            });
+        }
     }
 }
 

@@ -130,6 +130,14 @@ var ipc_connected: bool = false;
 var last_world_timer: u32 = 0;
 var prev_game_mode: u32 = 0;
 var reader: ?gamepad.GamepadReader = null;
+// Diagnostic: one-shot flag so frameStep logs the input pipeline state on
+// the first frame where config_received becomes true. Lets the user
+// verify from the log that reader / reader2 / keyboard were set up.
+var input_diag_logged: bool = false;
+// Diagnostic: frame counter for periodic input-value logging (every 300
+// frames ≈ 5s at 60fps). Helps confirm writeInput is actually writing
+// non-zero values into the game's input struct.
+var input_log_frame: u32 = 0;
 // Second reader for offline Versus P2. Null in netplay/spectator modes
 // (P2 input comes from the network there). Built in applyPostLoadHacks
 // from the [Player2] section of zzcaster/mapping.ini. Without this, P2
@@ -753,6 +761,37 @@ fn frameStep() callconv(.c) void {
         }
     }
 
+    // One-shot diagnostic: log the input pipeline state once, right after
+    // applyPostLoadHacks has run. This lets the user check the log to see
+    // whether the custom mapping was loaded and whether reader/reader2
+    // were allocated. If reader is null here, frameStep will fall back to
+    // keyboard.readInput() which uses MBAA's built-in config — that's the
+    // "bindings don't work" symptom.
+    if (config_received and !input_diag_logged) {
+        input_diag_logged = true;
+        const base_ptr_val = @as(usize, @bitCast(ptr_to_write_input_addr[0..@sizeOf(usize)].*));
+        log.?.info("InputDiag: reader={} reader2={} keyboard.init={} base_ptr=0x{x:0>8} game_mode={d} is_netplay={}", .{
+            reader != null,
+            reader2 != null,
+            keyboard.isInitialized(),
+            base_ptr_val,
+            game_mode_addr.*,
+            is_netplay,
+        });
+        if (reader) |*r| {
+            if (r.custom_mapping) |m| {
+                log.?.info("InputDiag: P1 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
+            } else {
+                log.?.info("InputDiag: P1 no custom_mapping (will use default Xbox or legacy keyboard)", .{});
+            }
+        }
+        if (reader2) |*r| {
+            if (r.custom_mapping) |m| {
+                log.?.info("InputDiag: P2 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
+            }
+        }
+    }
+
     const world_timer = world_timer_addr.*;
     if (world_timer == last_world_timer) return;
     last_world_timer = world_timer;
@@ -980,6 +1019,20 @@ fn frameStep() callconv(.c) void {
         };
         writeInput(1, p1_input);
         writeInput(2, p2_input);
+
+        // Periodic diagnostic: log P1/P2 input values every 300 frames
+        // (~5s at 60fps). If p1_input is always 0 even when the user
+        // presses keys, the binding poll is failing — check whether
+        // reader.custom_mapping loaded correctly (see InputDiag above).
+        // If p1_input is non-zero but the game still doesn't respond,
+        // the issue is in writeInput (wrong base ptr, wrong offsets, or
+        // MBAA's own polling clobbering our writes).
+        input_log_frame +%= 1;
+        if (input_log_frame % 300 == 0) {
+            log.?.info("InputFrame {d}: P1=0x{x:0>4} P2=0x{x:0>4} mode={d}", .{
+                input_log_frame, p1_input, p2_input, game_mode,
+            });
+        }
     }
 }
 

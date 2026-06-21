@@ -899,28 +899,33 @@ fn frameStep() callconv(.c) void {
         if (nm) |*n| {
             // If ENet isn't connected yet (connection setup was deferred from
             // DllMain so the main thread can keep ticking), poll for the
-            // connect event here with a short timeout. We cap the total
-            // wall time at ~60s so a missing peer eventually gives up.
+            // connect event here with a short timeout.
+            //
+            // The launcher already validated the peer via its own handshake
+            // before opening the game, so this reconnect should succeed in
+            // well under a second. We cap at ~15s (300 × 50ms) — if the peer
+            // doesn't reconnect by then something is genuinely wrong (firewall
+            // killed the post-launch UDP path, or the peer's game crashed).
             if (!n.enet_connected and !n.connect_attempts_exhausted) {
                 if (n.connect_attempts == 0) {
-                    log.?.info("ENet connecting...", .{});
+                    log.?.info("ENet reconnecting (peer already confirmed by launcher)...", .{});
                 }
                 n.connect_attempts += 1;
                 n.pollAndDispatch(50);
-                if (!n.enet_connected and n.connect_attempts > 1200) {
+                if (!n.enet_connected and n.connect_attempts > 300) {
                     // Stage-0 diag (netcode-test-plan.md Stage 0.3): distinguish
                     // "no peer ever responded" (silent timeout) from "the peer
                     // actively refused us" (disconnects observed) from "we
                     // received unexpected packets instead of a CONNECT". The
                     // diag_* counters are maintained in pollEnet and reset
                     // only on a successful connect — so their values here are
-                    // exactly what we saw across the ~60s connect window.
+                    // exactly what we saw across the ~15s connect window.
                     if (n.diag_connect_disconnects > 0) {
-                        log.?.err("No opponent connected after ~60s — peer REFUSED/disconnected (disconnects={d}, stray_packets={d})", .{
+                        log.?.err("No opponent reconnected after ~15s — peer REFUSED/disconnected (disconnects={d}, stray_packets={d})", .{
                             n.diag_connect_disconnects, n.diag_connect_receives,
                         });
                     } else {
-                        log.?.err("No opponent connected after ~60s — silent timeout (no CONNECT/REFUSE event; stray_packets={d})", .{
+                        log.?.err("No opponent reconnected after ~15s — silent timeout (no CONNECT/REFUSE event; stray_packets={d})", .{
                             n.diag_connect_receives,
                         });
                     }

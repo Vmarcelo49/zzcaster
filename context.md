@@ -108,6 +108,10 @@ environment variable override.
 
 **UI State Machine:**
 - `idle` — sidebar + content area
+- `waiting_for_peer` — netplay handshake in progress (host listening / client
+  connecting). Shows the host's public+local IP for the peer, ping stats,
+  and a Start/Cancel prompt. Driven by a background thread running
+  `NetplaySession.host()/join()` (see `session.zig`).
 - `in_game` — shows game PID, monitors exit, Force Kill button
 - `error_state` — shows error message + OK button
 
@@ -117,6 +121,24 @@ environment variable override.
 - Length-prefix framing: 4-byte LE length + payload
 - The IPC server is stored in the UI state and properly closed on game exit
   (via `cleanupGame()`) so the pipe handle is released for reuse
+
+**Netplay handshake (launcher-side, before the game opens):**
+`src/session.zig` — `NetplaySession` runs the full connect protocol in the
+launcher, mirroring the legacy CCCaster `MainApp.cpp` flow. The game is NOT
+opened until both peers have completed the handshake and the host has confirmed.
+1. Host: `NetplaySession.host(port)` → ENet `listen`, looks up public+local IP
+   (`net.getPublicIp` via wininet + `net.getLocalIp` via ws2_32), waits for the
+   peer's CONNECT, exchanges version (strict), exchanges pings (drives auto
+   input-delay), sends `NetplayConfig`, waits for client `ConfirmConfig`, then
+   parks in `waiting_confirmation` until the UI calls `hostConfirm()`.
+2. Client: `NetplaySession.join(ip, port)` → ENet `connect`, same handshake,
+   auto-confirms and reaches `launching`.
+3. On confirm: `launchGameAfterHandshake()` closes the handshake socket, waits
+   ~1s (so the OS releases the UDP port — matches `MainApp.cpp:933-934`),
+   then `CreateProcess` + inject + send negotiated config via IPC.
+The background handshake runs on a dedicated `std.Thread` so the SDL/ImGui
+event loop stays responsive; `cancel()` tears down the transport and the UI
+thread `join()`s the worker.
 
 **Game launching:** `src/launcher.zig`
 - `CreateProcessA` with `CREATE_SUSPENDED` flag
@@ -372,16 +394,21 @@ successful ENet connection occurs. `frameStep` checks `was_connected and !enet_c
 to detect mid-game disconnects.
 
 **Lazy ENet connect:** `connect_attempts` counter incremented each frame in
-`frameStep()` with `pollAndDispatch(50)`. After 1200 attempts (~60s), sets
+`frameStep()` with `pollAndDispatch(50)`. After 300 attempts (~15s — reduced
+from the original 60s because the launcher now validates the peer before the
+game opens, so a healthy reconnect completes in well under a second), sets
 `connect_attempts_exhausted = true` and gives up.
 
 ### 4.10 Session (`src/session.zig`)
 
-A higher-level netplay session FSM (version handshake, ping exchange, config
-negotiation). Currently **not wired into the main game flow** — the DLL uses
-`NetplayManager` directly. `Session` may be used in a future lobby/lobby system.
-
-Stores `io: std.Io` for timestamp operations. Uses `std.Io.Clock.now(.real, io)`.
+The launcher-side netplay handshake FSM (version exchange, ping measurement,
+config negotiation, host confirmation). **Now wired into the main game flow**:
+the launcher runs the full handshake in a background thread BEFORE opening
+MBAA.exe, so the game only starts once both peers are confirmed connected.
+The DLL's `NetplayManager` then re-establishes the ENet connection (the
+launcher closes its handshake socket first, mirroring the legacy
+`MainApp.cpp:1271-1274` pattern). Uses `std.Io.Clock.now(.real, io)` for ping
+timestamps and auto-computes input delay from RTT.
 
 ---
 
@@ -636,14 +663,19 @@ when targeting x86. This also fixes `winnt.h`'s `PCONTEXT` type.
 - ✅ Spectator chain forwarding (pending/active/redirect states)
 - ✅ Cross-compilation from Linux to Windows
 - ✅ Zig 0.16 migration complete (std.Io throughout)
+- ✅ Launcher-side netplay handshake (`session.zig`) — host listens, peer
+     connects, version + ping + config exchanged, host confirms, THEN the
+     game opens. Auto input-delay from RTT. Public+local IP lookup for the
+     host screen.
 
 ### Known Issues / TODO
 
-1. **Netcode not fully tested** — The rollback logic compiles and the state
-   transitions + TransitionIndex exchange are implemented, but real-world
-   testing over the internet hasn't been done. Localhost testing on Wine
-   showed the game launches and reaches chara_select, but ENet connection
-   between two Wine processes had issues.
+1. **Netcode not fully tested end-to-end** — The rollback logic compiles and
+   the launcher-side handshake now mirrors the legacy CCCaster flow
+   (connect-before-launch). Real-world testing over the internet still hasn't
+   been done. The launcher handshake guarantees both peers are reachable
+   before the game opens, which should resolve the previous "game opens then
+   tries to connect" failure mode.
 
 2. **Player 2 controller mapping in DLL** — The UI has Player 2 panels and
    `mapping.ini` stores both P1 and P2 mappings. However, `dllmain.zig`'s
@@ -670,10 +702,10 @@ when targeting x86. This also fixes `winnt.h`'s `PCONTEXT` type.
    independently. If both are in the same process (they shouldn't be, but
    under Wine this can happen), SDL2 may conflict.
 
-7. **Session module unused** — `src/session.zig` implements a higher-level
-   netplay session FSM (handshake, ping exchange, config negotiation) but
-   is not currently wired into the main game flow. The DLL uses
-   `NetplayManager` directly with hardcoded config from IPC.
+7. **Spectator handshake not migrated** — `src/session.zig` now drives the
+   player host/join handshake in the launcher, but the Spectate button still
+   uses the old direct-launch path (`launchNetplayImpl` with `is_spectator`).
+   Spectator mode could be migrated to the session flow for consistency.
 
 ---
 
@@ -820,7 +852,9 @@ This project was built across multiple LLM sessions:
 
 1. **Test netcode on real Windows** — The rollback logic compiles but hasn't
    been tested with two real game instances. Need to verify state transitions,
-   TransitionIndex exchange, and rollback trigger work correctly.
+   TransitionIndex exchange, and rollback trigger work correctly. The launcher
+   handshake now ensures both peers connect before the game opens, so the
+   previous "opens then tries to connect" failure mode should be gone.
 
 2. **Pass Player 2 mapping to DLL** — For offline versus mode, the DLL needs
    to know Player 2's controller mapping. Currently only Player 1 is loaded.
@@ -837,9 +871,12 @@ This project was built across multiple LLM sessions:
    exists in the device dropdown, but keyboard bindings use Win32 VK codes
    which need testing.
 
-7. **Adaptive delay** — Auto-compute input delay from ENet RTT + jitter
-   (the legacy code has this; our version uses fixed delay from config).
+7. **Migrate Spectate to the session flow** — `session.zig` now drives
+   Host/Join; Spectate still uses the legacy direct-launch path. Migrating it
+   would give spectators the same connect-before-launch guarantee and a
+   consistent code path.
 
-8. **Wire session.zig into the flow** — The session FSM (handshake, pings,
-   config negotiation) exists but is unused. Could be used for a future
-   lobby system or to replace the simple IPC-based config exchange.
+8. **NAT traversal / UPnP** — The launcher handshake requires the host's port
+   to be reachable (port-forwarded) for internet play. Auto-configuring port
+   forwarding via UPnP would remove the manual router setup step.
+

@@ -37,8 +37,8 @@ pub fn main(init: std.process.Init.Minimal) !void {
     //   zzcaster.exe                  → interactive ImGui menu (default)
     //   zzcaster.exe --mode=training  → bypass UI, launch offline training
     //   zzcaster.exe --mode=versus    → bypass UI, launch offline versus
-    //   zzcaster.exe --mode=host --port=46318
-    //   zzcaster.exe --mode=join --peer=1.2.3.4:46318
+    //   zzcaster.exe --mode=host --port=46318 [--name=Bob]
+    //   zzcaster.exe --mode=join --peer=1.2.3.4:46318 [--name=Bob]
     //   zzcaster.exe --mode=spectate --peer=1.2.3.4:46318
     //
     // Zig 0.16: argsWithAllocator is gone; iterate via Args.Iterator.
@@ -49,6 +49,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cli_mode: CliMode = .menu;
     var cli_port: u16 = config.default_port;
     var cli_peer: ?[]const u8 = null;
+    var cli_name: ?[]const u8 = null;
     while (it.next()) |a| {
         if (std.mem.startsWith(u8, a, "--mode=")) {
             const v = a["--mode=".len..];
@@ -62,11 +63,16 @@ pub fn main(init: std.process.Init.Minimal) !void {
             cli_port = std.fmt.parseInt(u16, a["--port=".len..], 10) catch config.default_port;
         } else if (std.mem.startsWith(u8, a, "--peer=")) {
             cli_peer = a["--peer=".len..];
+        } else if (std.mem.startsWith(u8, a, "--name=")) {
+            cli_name = a["--name=".len..];
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            std.Io.File.stdout().writeStreamingAll(io, "Usage: zzcaster.exe [--mode=training|versus|host|join|spectate] [--port=N] [--peer=ip:port]\n") catch {};
+            std.Io.File.stdout().writeStreamingAll(io, "Usage: zzcaster.exe [--mode=training|versus|host|join|spectate] [--port=N] [--peer=ip:port] [--name=NAME]\n") catch {};
             return;
         }
     }
+
+    // --name overrides the config's display name for this session.
+    // (Applied here — needs both cli_name and cfg to be in scope.)
 
     // Each launcher instance needs a unique pipe name so two zzcaster.exe
     // processes can run side-by-side (e.g. for local netplay testing).
@@ -87,6 +93,12 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var cfg = try config.loadConfig(allocator, io);
     defer cfg.deinit();
     log.info("App dir: {s}", .{cfg.app_dir});
+
+    // --name overrides the config's display name for this session.
+    if (cli_name) |name| {
+        if (cfg.display_name.len > 0) allocator.free(cfg.display_name);
+        cfg.display_name = allocator.dupe(u8, name) catch &.{};
+    }
 
     // Non-interactive mode: bypass the UI entirely.
     if (cli_mode != .menu) {

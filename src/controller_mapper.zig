@@ -214,12 +214,19 @@ pub fn defaultXboxMapping() ControllerMapping {
 // ============================================================================
 
 /// Read a single binding's state (true = pressed).
-fn isBindingActive(binding: InputBinding, joy: ?*anyopaque) bool {
+///
+/// `deadzone` only affects `.sdl_axis_pos` / `.sdl_axis_neg` bindings — it's
+/// the absolute value (0..32767) above which an axis is considered "pressed".
+/// Passing the user-configurable `m.deadzone` here (instead of a hardcoded
+/// 8000) ensures that axis-bound buttons (e.g. D-pad mapped to left stick)
+/// respect the deadzone slider in the GUI. Otherwise a higher deadzone set
+/// to suppress stick drift would have no effect on axis bindings.
+fn isBindingActive(binding: InputBinding, joy: ?*anyopaque, deadzone: u32) bool {
     return switch (binding.type) {
         .none => false,
         .sdl_button => joy != null and c.SDL_JoystickGetButton(@ptrCast(joy), binding.index) != 0,
-        .sdl_axis_pos => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) > 8000,
-        .sdl_axis_neg => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) < -8000,
+        .sdl_axis_pos => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) > @as(c_int, @intCast(deadzone)),
+        .sdl_axis_neg => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) < -@as(c_int, @intCast(deadzone)),
         .sdl_hat => blk: {
             if (joy == null) break :blk false;
             const hat_idx: c_int = @intCast(binding.index & 0xFF);
@@ -244,11 +251,13 @@ fn isBindingActive(binding: InputBinding, joy: ?*anyopaque) bool {
 
 /// Read input using a ControllerMapping. Returns the MBAA combined input u16.
 pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
+    const dz = m.deadzone;
+
     // Directions
-    var up = isBindingActive(m.up, joy);
-    var down = isBindingActive(m.down, joy);
-    var left = isBindingActive(m.left, joy);
-    var right = isBindingActive(m.right, joy);
+    var up = isBindingActive(m.up, joy, dz);
+    var down = isBindingActive(m.down, joy, dz);
+    var left = isBindingActive(m.left, joy, dz);
+    var right = isBindingActive(m.right, joy, dz);
 
     // Analog stick also contributes to directions
     if (joy != null) {
@@ -271,15 +280,15 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
 
     // Buttons
     var btns: u16 = 0;
-    if (isBindingActive(m.a, joy)) btns |= gamepad.button_a;
-    if (isBindingActive(m.b, joy)) btns |= gamepad.button_b;
-    if (isBindingActive(m.c, joy)) btns |= gamepad.button_c;
-    if (isBindingActive(m.d, joy)) btns |= gamepad.button_d;
-    if (isBindingActive(m.e, joy)) btns |= gamepad.button_e;
-    if (isBindingActive(m.ab, joy)) btns |= gamepad.button_ab;
-    if (isBindingActive(m.start, joy)) btns |= gamepad.button_start;
-    if (isBindingActive(m.fn1, joy)) btns |= 0x0100; // FN1
-    if (isBindingActive(m.fn2, joy)) btns |= 0x0200; // FN2
+    if (isBindingActive(m.a, joy, dz)) btns |= gamepad.button_a;
+    if (isBindingActive(m.b, joy, dz)) btns |= gamepad.button_b;
+    if (isBindingActive(m.c, joy, dz)) btns |= gamepad.button_c;
+    if (isBindingActive(m.d, joy, dz)) btns |= gamepad.button_d;
+    if (isBindingActive(m.e, joy, dz)) btns |= gamepad.button_e;
+    if (isBindingActive(m.ab, joy, dz)) btns |= gamepad.button_ab;
+    if (isBindingActive(m.start, joy, dz)) btns |= gamepad.button_start;
+    if (isBindingActive(m.fn1, joy, dz)) btns |= 0x0100; // FN1
+    if (isBindingActive(m.fn2, joy, dz)) btns |= 0x0200; // FN2
     if (btns & gamepad.button_a != 0) btns |= gamepad.button_confirm;
     if (btns & gamepad.button_b != 0) btns |= gamepad.button_cancel;
 

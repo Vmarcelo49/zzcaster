@@ -879,6 +879,31 @@ fn frameStep() callconv(.c) void {
     writeInput(1, 0);
     writeInput(2, 0);
 
+    // Clear SFX dedup filter array at the start of each frame, UNLESS we're
+    // in the middle of a rollback re-run. The filter array is used to
+    // suppress duplicate SFX during a single re-run pass; without clearing
+    // it per-frame, the filter accumulates indefinitely and the ASM hook
+    // (which skips playback when filter[i] > 1) mutes every SFX after its
+    // 2nd play — causing "some SFX plays only once" (issue #3).
+    //
+    // During a rollback re-run, the filter is managed by
+    // SfxDedup.applyRollbackFilter / saveRerunSounds / finishedRerun —
+    // clearing it here would destroy the 0x80 sentinels that track which
+    // pre-rollback sounds need cancellation.
+    //
+    // In offline mode (nm == null), there is no rollback, so we always
+    // clear. In netplay mode, we clear only when not re-running.
+    if (nm) |*n| {
+        if (!n.isRerunning()) {
+            @memset(&sfx_dedup.sfx_filter_array, 0);
+            @memset(&sfx_dedup.sfx_mute_array, 0);
+        }
+    } else {
+        // Offline — no NetplayManager, no rollback. Always clear.
+        @memset(&sfx_dedup.sfx_filter_array, 0);
+        @memset(&sfx_dedup.sfx_mute_array, 0);
+    }
+
     // Check if game is exiting
     if (alive_flag_addr.* == 0) return;
 

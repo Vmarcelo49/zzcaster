@@ -39,6 +39,7 @@ const win32 = struct {
     extern "kernel32" fn SetThreadExecutionState(esFlags: u32) callconv(.winapi) u32;
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
+    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
     extern "kernel32" fn CreateThread(
         lpThreadAttributes: ?*anyopaque, dwStackSize: usize,
         lpStartAddress: ?*const fn (?*anyopaque) callconv(.winapi) u32,
@@ -129,6 +130,13 @@ var ipc_pipe: ?*anyopaque = null;
 var ipc_connected: bool = false;
 var last_world_timer: u32 = 0;
 var prev_game_mode: u32 = 0;
+// The DLL's own module handle, captured in DllMain(PROCESS_ATTACH).
+// Used to resolve the DLL's own file path via GetModuleFileNameA, so we
+// can find mapping.ini in the same directory as hook.dll regardless of
+// the process's current working directory. Without this, the relative
+// path "zzcaster/mapping.ini" resolves against MBAA.exe's CWD, which may
+// not be the MBAACC root (e.g. if launched from a shortcut).
+var dll_module_handle: ?*anyopaque = null;
 var reader: ?gamepad.GamepadReader = null;
 // Diagnostic: one-shot flag so frameStep logs the input pipeline state on
 // the first frame where config_received becomes true. Lets the user
@@ -169,9 +177,14 @@ export fn zzcasterFrameCallback() callconv(.c) void {
 
 // Zig 0.16: DllMain must return std.os.windows.BOOL (was `callconv(.c) i32`
 // before — the standard library now expects the proper Win32 BOOL type).
-pub export fn DllMain(_: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL {
+pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL {
     switch (fdwReason) {
         1 => { // DLL_PROCESS_ATTACH
+            // Capture the DLL's own module handle so we can resolve its file
+            // path later (GetModuleFileNameA(dll_module_handle, ...)). This
+            // lets us find mapping.ini in the same directory as hook.dll
+            // regardless of the process CWD.
+            dll_module_handle = hModule;
             // BARE MINIMUM only. This runs on the remote LoadLibraryA thread,
             // which under Wine has a small stack (~64KB-1MB) — any heavy
             // Zig 0.16 std.Io work here blows the stack
@@ -553,6 +566,42 @@ fn applySfxAsmHacks() void {
     });
 }
 
+/// Resolve the path to mapping.ini relative to the DLL's own directory.
+///
+/// The DLL is typically installed at `<MBAACC>/zzcaster/hook.dll`, so
+/// mapping.ini lives at `<MBAACC>/zzcaster/mapping.ini` — same directory.
+/// Using the DLL's own path (via GetModuleFileNameA) avoids CWD-dependent
+/// resolution bugs: if the user launches zzcaster.exe from a shortcut or
+/// a different working directory, MBAA.exe inherits that CWD, and the
+/// relative path "zzcaster/mapping.ini" won't resolve. The DLL's own path
+/// is always correct regardless of CWD.
+///
+/// Returns a slice into the provided buffer, or null if the path can't be
+/// resolved (e.g. GetModuleFileNameA failed or the buffer is too small).
+fn resolveMappingIniPath(buf: []u8) ?[]const u8 {
+    var dll_path: [512]u8 = undefined;
+    const len = win32.GetModuleFileNameA(dll_module_handle, &dll_path, dll_path.len);
+    if (len == 0) return null;
+
+    // Find the last path separator and replace everything after it with
+    // "mapping.ini". e.g. "C:\MBAACC\zzcaster\hook.dll" → "C:\MBAACC\zzcaster\mapping.ini"
+    var last_sep: usize = 0;
+    for (dll_path[0..len], 0..) |ch, i| {
+        if (ch == '\\' or ch == '/') last_sep = i;
+    }
+    if (last_sep == 0) return null; // no separator found — shouldn't happen
+
+    const dir = dll_path[0 .. last_sep + 1]; // include trailing separator
+    const filename = "mapping.ini";
+    if (dir.len + filename.len + 1 > buf.len) return null; // +1 for NUL
+
+    @memcpy(buf[0..dir.len], dir);
+    @memcpy(buf[dir.len..dir.len + filename.len], filename);
+    const total = dir.len + filename.len;
+    buf[total] = 0; // null-terminate for Win32 APIs
+    return buf[0..total];
+}
+
 fn applyPostLoadHacks() void {
     if (log == null) return;
     log.?.info("Applying post-load hacks...", .{});
@@ -585,29 +634,53 @@ fn applyPostLoadHacks() void {
         // only consumed P1. Without applying P2 here, offline Versus P2
         // is hard-locked to neutral every frame regardless of what the
         // user bound in the GUI.
+        //
+        // Path resolution: try the DLL's own directory first (robust
+        // against CWD mismatches), then fall back to the relative path
+        // "zzcaster/mapping.ini" (works when CWD is the MBAACC root).
+        var mapping_path_buf: [600]u8 = undefined;
+        const mapping_path = resolveMappingIniPath(&mapping_path_buf) orelse "zzcaster/mapping.ini";
+        log.?.info("Looking for mapping.ini at: {s}", .{mapping_path});
+
         var p1_mapping: mapper.ControllerMapping = undefined;
         var p2_mapping: mapper.ControllerMapping = undefined;
         var have_mappings: bool = false;
-        if (mapper.loadMapping("zzcaster/mapping.ini", app_io_backend.io(), log.?)) |mappings| {
+        if (mapper.loadMapping(mapping_path, app_io_backend.io(), log.?)) |mappings| {
             p1_mapping = mappings.p1;
             p2_mapping = mappings.p2;
             have_mappings = true;
+            log.?.info("Custom mapping loaded successfully", .{});
         } else {
-            log.?.info("No custom mapping found, using built-in Xbox default", .{});
+            log.?.info("No custom mapping found — using GameController API with built-in button layout", .{});
+            // Don't set custom_mapping to defaultXboxMapping(). The default
+            // Xbox mapping uses raw SDL_Joystick button indices (0-9) which
+            // may not match the physical controller's layout when opened as
+            // a raw joystick. Instead, leave custom_mapping = null so
+            // GamepadReader.readInput() falls through to readGameController(),
+            // which uses the SDL_GameController API with standard button
+            // names (SDL_CONTROLLER_BUTTON_A, etc.). This works correctly
+            // for any XInput-compatible controller, including the 8BitDo.
+            //
+            // We still need p1_mapping/p2_mapping variables for the P2
+            // path below, but we won't apply p1_mapping to reader.
             p1_mapping = mapper.defaultXboxMapping();
-            // P2 defaults to keyboard (device_index = -1) rather than
-            // re-using defaultXboxMapping()'s device_index = 0. Both
-            // players defaulting to joystick 0 would open the same
-            // physical device twice and both players would read the
-            // identical input — useless for offline Versus. The user
-            // is expected to set P2's bindings explicitly in the GUI.
             p2_mapping = mapper.defaultXboxMapping();
-            p2_mapping.device_index = -1;
+            p2_mapping.device_index = -1; // P2 defaults to keyboard
         }
 
-        // Apply P1 mapping + open its joystick (if any).
-        reader.?.custom_mapping = p1_mapping;
-        openMappedJoystick(&reader.?, p1_mapping, "P1");
+        // Apply P1 mapping. ONLY set custom_mapping + open raw joystick
+        // when the user has explicitly saved a mapping.ini. Without a
+        // saved mapping, leave reader.custom_mapping = null so
+        // readGameController() handles input via the GameController API.
+        if (have_mappings) {
+            reader.?.custom_mapping = p1_mapping;
+            openMappedJoystick(&reader.?, p1_mapping, "P1");
+        } else {
+            // No custom mapping — keep the GameController that
+            // GamepadReader.init() already opened. readGameController()
+            // will poll it with standard SDL button names.
+            log.?.info("P1: using GameController API (no custom mapping)", .{});
+        }
 
         // Apply P2 mapping. Don't call GamepadReader.init() for reader2 —
         // init() opens the first available controller/joystick which

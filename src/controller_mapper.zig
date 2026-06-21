@@ -300,6 +300,17 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
 // ============================================================================
 
 pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u8, io: std.Io, log: *logging.Logger) void {
+    // Ensure the parent directory exists. createFile does NOT create
+    // intermediate directories — if "zzcaster/" doesn't exist yet (e.g.
+    // first run), the save would silently fail with a "file not found"
+    // error from the OS. This is especially important because the GUI
+    // saves to "zzcaster/mapping.ini" relative to CWD.
+    if (std.fs.path.dirname(path)) |dir| {
+        if (dir.len > 0) {
+            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        }
+    }
+
     const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch {
         log.warn("Failed to save mapping to {s}", .{path});
         return;

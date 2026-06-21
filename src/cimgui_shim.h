@@ -20,6 +20,7 @@ typedef struct ImDrawData ImDrawData;
 
 // cimgui uses ImVec2_c for by-value parameters
 typedef struct ImVec2_c { float x, y; } ImVec2_c;
+typedef struct ImVec4_c { float x, y, z, w; } ImVec4_c;
 
 // ImGui window flags
 typedef int ImGuiWindowFlags;
@@ -48,6 +49,7 @@ void igStyleColorsDark(void* dst);
 bool igBegin(const char* name, bool* p_open, ImGuiWindowFlags flags);
 void igEnd(void);
 void igText(const char* fmt, ...);
+void igTextColored(ImVec4_c col, const char* fmt, ...);
 bool igButton(const char* label, ImVec2_c size);
 void igSameLine(float offset_from_start_x, float spacing);
 bool igIsItemClicked(int mouse_button);
@@ -57,6 +59,7 @@ bool igInputText(const char* label, char* buf, size_t buf_size, ImGuiInputTextFl
 bool igSliderInt(const char* label, int* v, int v_min, int v_max, const char* format, int flags);
 bool igSetNextWindowSize(ImVec2_c size, int cond);
 void igSetNextWindowPos(ImVec2_c pos, int cond, ImVec2_c pivot);
+void igSetClipboardText(const char* text);
 
 // Child windows
 bool igBeginChild_Str(const char* str_id, ImVec2_c size, bool border, ImGuiWindowFlags flags);

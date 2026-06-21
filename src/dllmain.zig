@@ -130,6 +130,12 @@ var ipc_connected: bool = false;
 var last_world_timer: u32 = 0;
 var prev_game_mode: u32 = 0;
 var reader: ?gamepad.GamepadReader = null;
+// Second reader for offline Versus P2. Null in netplay/spectator modes
+// (P2 input comes from the network there). Built in applyPostLoadHacks
+// from the [Player2] section of zzcaster/mapping.ini. Without this, P2
+// in offline Versus is hard-locked to neutral every frame — the GUI
+// saves P2 bindings but the DLL threw them away.
+var reader2: ?gamepad.GamepadReader = null;
 var sdl_initialized: bool = false;
 
 // Netplay
@@ -561,45 +567,52 @@ fn applyPostLoadHacks() void {
         sdl_initialized = true;
         reader = gamepad.GamepadReader.init(log.?);
 
-        // Load custom controller mapping if available. If no mapping.ini
+        // Load custom controller mappings if available. If no mapping.ini
         // exists, fall back to the built-in Xbox default so the buttons
         // route correctly (MBAA A→X, B→Y, C→B, D→A) instead of using the
         // raw joystick hardcoded mapping in GamepadReader.readJoystick.
-        var loaded_mapping: ?mapper.ControllerMapping = null;
+        //
+        // P2 is also loaded here. The GUI saves both [Player1] and
+        // [Player2] sections to mapping.ini, but historically the DLL
+        // only consumed P1. Without applying P2 here, offline Versus P2
+        // is hard-locked to neutral every frame regardless of what the
+        // user bound in the GUI.
+        var p1_mapping: mapper.ControllerMapping = undefined;
+        var p2_mapping: mapper.ControllerMapping = undefined;
+        var have_mappings: bool = false;
         if (mapper.loadMapping("zzcaster/mapping.ini", app_io_backend.io(), log.?)) |mappings| {
-            loaded_mapping = mappings.p1;
+            p1_mapping = mappings.p1;
+            p2_mapping = mappings.p2;
+            have_mappings = true;
         } else {
             log.?.info("No custom mapping found, using built-in Xbox default", .{});
-            loaded_mapping = mapper.defaultXboxMapping();
-            // device_index defaults to 0 in defaultXboxMapping, which
-            // matches the first SDL joystick — same as the previous
-            // GamepadReader.init() behavior.
+            p1_mapping = mapper.defaultXboxMapping();
+            // P2 defaults to keyboard (device_index = -1) rather than
+            // re-using defaultXboxMapping()'s device_index = 0. Both
+            // players defaulting to joystick 0 would open the same
+            // physical device twice and both players would read the
+            // identical input — useless for offline Versus. The user
+            // is expected to set P2's bindings explicitly in the GUI.
+            p2_mapping = mapper.defaultXboxMapping();
+            p2_mapping.device_index = -1;
         }
-        reader.?.custom_mapping = loaded_mapping;
-        if (loaded_mapping.?.device_index >= 0) {
-            // Try to open the requested joystick first. If that fails
-            // (controller not yet enumerated, different index in this
-            // process, etc.) fall back to any available joystick so the
-            // custom mapping still works instead of silently disabling
-            // input.
-            var opened: ?*c.SDL_Joystick = c.SDL_JoystickOpen(loaded_mapping.?.device_index);
-            if (opened == null) {
-                log.?.warn("Joystick {d} not available, trying index 0", .{loaded_mapping.?.device_index});
-                opened = c.SDL_JoystickOpen(0);
-            }
-            reader.?.mapped_joystick = @ptrCast(opened);
-            if (reader.?.mapped_joystick != null) {
-                log.?.info("Opened joystick for mapping", .{});
-                // Close the GameController since we're using raw joystick
-                if (reader.?.controller != null) {
-                    c.SDL_GameControllerClose(@ptrCast(reader.?.controller));
-                    reader.?.controller = null;
-                }
-            } else {
-                log.?.err("No joystick available for mapping — input will not work", .{});
-            }
+
+        // Apply P1 mapping + open its joystick (if any).
+        reader.?.custom_mapping = p1_mapping;
+        openMappedJoystick(&reader.?, p1_mapping, "P1");
+
+        // Apply P2 mapping. Don't call GamepadReader.init() for reader2 —
+        // init() opens the first available controller/joystick which
+        // would be the same device P1 just opened (or its GameController
+        // equivalent). Instead, start from an empty reader and rely on
+        // the custom_mapping path. If P2's mapping uses a joystick, we
+        // open that specific index below.
+        if (have_mappings or p2_mapping.device_index >= 0) {
+            reader2 = gamepad.GamepadReader{};
+            reader2.?.custom_mapping = p2_mapping;
+            openMappedJoystick(&reader2.?, p2_mapping, "P2");
         } else {
-            log.?.info("Mapping uses keyboard (device=-1)", .{});
+            log.?.info("P2: keyboard-only default, no reader2 allocated", .{});
         }
     } else {
         log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
@@ -618,6 +631,39 @@ fn applyPostLoadHacks() void {
             log.?.err("ENet init failed — netplay disabled", .{});
             is_netplay = false;
         };
+    }
+}
+
+/// Open the SDL_Joystick referenced by `m.device_index` and attach it to
+/// `r.mapped_joystick`. If `device_index < 0` the mapping is keyboard-only
+/// and nothing is opened. If the requested index can't be opened, falls
+/// back to joystick 0 so the mapping still works instead of silently
+/// disabling input.
+///
+/// Closes any existing `r.controller` once a raw joystick is successfully
+/// attached, because the custom-mapping path uses SDL_Joystick* API and
+/// having both APIs open on the same device produces duplicate input.
+fn openMappedJoystick(r: *gamepad.GamepadReader, m: mapper.ControllerMapping, label: []const u8) void {
+    if (m.device_index < 0) {
+        log.?.info("{s}: mapping uses keyboard (device=-1)", .{label});
+        return;
+    }
+    var opened: ?*c.SDL_Joystick = c.SDL_JoystickOpen(m.device_index);
+    if (opened == null) {
+        log.?.warn("{s}: joystick {d} not available, trying index 0", .{ label, m.device_index });
+        opened = c.SDL_JoystickOpen(0);
+    }
+    r.mapped_joystick = @ptrCast(opened);
+    if (r.mapped_joystick != null) {
+        log.?.info("{s}: opened joystick for mapping", .{label});
+        // Close any GameController that GamepadReader.init() opened for
+        // this same physical device — we're using raw joystick API now.
+        if (r.controller != null) {
+            c.SDL_GameControllerClose(@ptrCast(r.controller));
+            r.controller = null;
+        }
+    } else {
+        log.?.err("{s}: no joystick available for mapping — input will not work", .{label});
     }
 }
 
@@ -907,14 +953,33 @@ fn frameStep() callconv(.c) void {
             }
     } else {
         // === OFFLINE MODE ===
-        const local_input: u16 = blk: {
+        // P1 input — uses reader (with custom_mapping from [Player1]),
+        // falling back to the legacy keyboard reader only if reader is
+        // null/uninitialized. The legacy keyboard.readInput() polls
+        // MBAA.exe's built-in config at offset 0x14D2C0 — it's a
+        // last-resort fallback, not the primary path.
+        const p1_input: u16 = blk: {
             if (reader) |*r| {
                 r.update();
                 if (r.hasGamepad()) break :blk r.readInput();
             }
             break :blk keyboard.readInput();
         };
-        writeInput(1, local_input);
+        // P2 input — uses reader2 (with custom_mapping from [Player2]).
+        // reader2 is null in netplay/spectator modes (P2 input comes
+        // from the network there) and may be null if the user never
+        // saved a [Player2] section in mapping.ini. When null, P2 stays
+        // at neutral (0) — there's no legacy keyboard reader for P2
+        // because MBAA.exe's config table is single-player.
+        const p2_input: u16 = blk: {
+            if (reader2) |*r| {
+                r.update();
+                if (r.hasGamepad()) break :blk r.readInput();
+            }
+            break :blk 0;
+        };
+        writeInput(1, p1_input);
+        writeInput(2, p2_input);
     }
 }
 

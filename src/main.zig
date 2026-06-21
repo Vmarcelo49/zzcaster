@@ -1,0 +1,99 @@
+const std = @import("std");
+const builtin = @import("builtin");
+const config = @import("config.zig");
+const logging = @import("logging.zig");
+const ipc = @import("ipc.zig");
+const ui = @import("ui.zig");
+const launcher = @import("launcher.zig");
+
+pub const CliMode = enum {
+    menu,
+    training,
+    versus,
+    host,
+    join,
+    spectate,
+};
+
+// Zig 0.16: main() now receives args + environ via std.process.Init.Minimal
+// (or can stay zero-arg). We take Minimal so we can iterate argv without
+// needing std.process.argsWithAllocator (removed in 0.16).
+pub fn main(init: std.process.Init.Minimal) !void {
+    const args_vector = init.args;
+
+    // Zig 0.16: GeneralPurposeAllocator → DebugAllocator (drop-in).
+    var gpa_storage: std.heap.DebugAllocator(.{}) = .init;
+    defer _ = gpa_storage.deinit();
+    const allocator = gpa_storage.allocator();
+
+    // Zig 0.16: every file/stdout operation needs an explicit Io handle. We
+    // create the single-threaded variant in the launcher to avoid spawning
+    // worker threads — the launcher is a thin UI/CLI driver that does only a
+    // handful of config/log reads and writes.
+    var io_backend: std.Io.Threaded = .init_single_threaded;
+    const io = io_backend.io();
+
+    // Parse CLI args (very minimal — just enough for non-interactive launch).
+    //   zzcaster.exe                  → interactive ImGui menu (default)
+    //   zzcaster.exe --mode=training  → bypass UI, launch offline training
+    //   zzcaster.exe --mode=versus    → bypass UI, launch offline versus
+    //   zzcaster.exe --mode=host --port=46318
+    //   zzcaster.exe --mode=join --peer=1.2.3.4:46318
+    //   zzcaster.exe --mode=spectate --peer=1.2.3.4:46318
+    //
+    // Zig 0.16: argsWithAllocator is gone; iterate via Args.Iterator.
+    // On Windows the iterator buffers into a WTF-8 string; initAllocator is
+    // the cross-platform path that handles both POSIX and Windows.
+    var it = try args_vector.iterateAllocator(allocator);
+    defer it.deinit();
+    var cli_mode: CliMode = .menu;
+    var cli_port: u16 = config.default_port;
+    var cli_peer: ?[]const u8 = null;
+    while (it.next()) |a| {
+        if (std.mem.startsWith(u8, a, "--mode=")) {
+            const v = a["--mode=".len..];
+            cli_mode = std.meta.stringToEnum(CliMode, v) orelse {
+                std.Io.File.stdout().writeStreamingAll(io, "unknown --mode value: ") catch {};
+                std.Io.File.stdout().writeStreamingAll(io, v) catch {};
+                std.Io.File.stdout().writeStreamingAll(io, "\n") catch {};
+                std.process.exit(2);
+            };
+        } else if (std.mem.startsWith(u8, a, "--port=")) {
+            cli_port = std.fmt.parseInt(u16, a["--port=".len..], 10) catch config.default_port;
+        } else if (std.mem.startsWith(u8, a, "--peer=")) {
+            cli_peer = a["--peer=".len..];
+        } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
+            std.Io.File.stdout().writeStreamingAll(io, "Usage: zzcaster.exe [--mode=training|versus|host|join|spectate] [--port=N] [--peer=ip:port]\n") catch {};
+            return;
+        }
+    }
+
+    // Each launcher instance needs a unique pipe name so two zzcaster.exe
+    // processes can run side-by-side (e.g. for local netplay testing).
+    var pipe_name_buf: [64]u8 = undefined;
+    const pipe_name = std.fmt.bufPrint(
+        &pipe_name_buf,
+        "zzcaster_{d}_pipe",
+        .{launcher.getCurrentProcessId_win32()},
+    ) catch "zzcaster_pipe";
+    launcher.setenv_win32("CCCASTER_PIPE", pipe_name);
+
+    // Init logging
+    var log = try logging.Logger.init(allocator, io, "zzcaster/debug.log");
+    defer log.deinit();
+    log.info("CCCaster v{s} (zig port) [mode={t}]", .{ config.version_string, cli_mode });
+
+    // Parse config
+    var cfg = try config.loadConfig(allocator, io);
+    defer cfg.deinit();
+    log.info("App dir: {s}", .{cfg.app_dir});
+
+    // Non-interactive mode: bypass the UI entirely.
+    if (cli_mode != .menu) {
+        try ui.runCli(allocator, io, &cfg, &log, cli_mode, cli_port, cli_peer, pipe_name);
+        return;
+    }
+
+    // Run the interactive ImGui UI (SDL2 init happens inside ui.run)
+    try ui.run(allocator, io, &cfg, &log, pipe_name);
+}

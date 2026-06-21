@@ -74,11 +74,13 @@ bool igSelectable_Bool(const char* label, bool selected, int flags, ImVec2_c siz
 // Radio buttons and combo boxes
 bool igRadioButton_Bool(const char* label, bool active);
 bool igCombo_Str_arr(const char* label, int* current_item, const char* const items[], int items_count, int popup_max_height_in_items);
+bool igCheckbox(const char* label, bool* v);
 
 // Layout helpers
 void igDummy(ImVec2_c size);
 void igIndent(float indent_w);
 void igUnindent(float indent_w);
+void igAlignTextToFramePadding(void);
 
 // ID stack
 void igPushID_Str(const char* str_id);

@@ -246,6 +246,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var p1_device_sel: c_int = 0; // 0=keyboard, 1+=joystick index+1
     var p2_device_sel: c_int = 0;
     var bind_cooldown: u32 = 0; // frames to skip before polling (avoids click re-bind)
+    // View mode toggle: false = classic grid layout, true = list layout.
+    // List layout shows both players side-by-side, each as a vertical list
+    // of (in-game button name | bind button) rows. Easier to scan when
+    // the user has many bindings to review at a glance.
+    var list_view: bool = false;
 
     // Resolve mapping.ini path relative to the exe's own directory, so
     // the GUI and DLL agree on the file location regardless of CWD.
@@ -446,6 +451,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                     },
                     .controllers => {
                         c.igText("Controller Mapper");
+                        c.igSameLine(0, 16);
+                        _ = c.igCheckbox("List View", &list_view);
                         c.igSpacing();
                         c.igSeparator();
                         c.igSpacing();
@@ -494,21 +501,42 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                             }
                         }
 
-                        // Player 1 panel
-                        drawPlayerPanel("Player 1", &p1_mapping, &p1_bind_target, &p1_joystick, &p1_device_sel, &dev_names, dev_count, num_joy, log, &bind_cooldown);
+                        if (list_view) {
+                            // === LIST VIEW ===
+                            // Two side-by-side columns: Player 1 (left) and
+                            // Player 2 (right). Each column has a device
+                            // combo, then a vertical list of bind rows:
+                            //   [in-game button name] [bind button]
+                            // Below both columns: shared controls (deadzone,
+                            // default bindings, clear, save).
+
+                            // Left column: Player 1
+                            _ = c.igBeginChild_Str("P1List", .{ .x = 0, .y = 0 }, true, 0);
+                            drawListPanel("Player 1", &p1_mapping, &p1_bind_target, &p1_joystick, &p1_device_sel, &dev_names, dev_count, log, &bind_cooldown);
+                            c.igEndChild();
+
+                            c.igSameLine(0, 8);
+
+                            // Right column: Player 2
+                            _ = c.igBeginChild_Str("P2List", .{ .x = 0, .y = 0 }, true, 0);
+                            drawListPanel("Player 2", &p2_mapping, &p2_bind_target, &p2_joystick, &p2_device_sel, &dev_names, dev_count, log, &bind_cooldown);
+                            c.igEndChild();
+                        } else {
+                            // === GRID VIEW (classic layout) ===
+                            drawPlayerPanel("Player 1", &p1_mapping, &p1_bind_target, &p1_joystick, &p1_device_sel, &dev_names, dev_count, num_joy, log, &bind_cooldown);
+
+                            c.igSpacing();
+                            c.igSeparator();
+                            c.igSpacing();
+
+                            drawPlayerPanel("Player 2", &p2_mapping, &p2_bind_target, &p2_joystick, &p2_device_sel, &dev_names, dev_count, num_joy, log, &bind_cooldown);
+                        }
 
                         c.igSpacing();
                         c.igSeparator();
                         c.igSpacing();
 
-                        // Player 2 panel
-                        drawPlayerPanel("Player 2", &p2_mapping, &p2_bind_target, &p2_joystick, &p2_device_sel, &dev_names, dev_count, num_joy, log, &bind_cooldown);
-
-                        c.igSpacing();
-                        c.igSeparator();
-                        c.igSpacing();
-
-                        // Save button
+                        // Save button (shared between both views)
                         if (c.igButton("Save Mapping", .{ .x = 160, .y = 30 })) {
                             p1_mapping.device_index = p1_device_sel - 1;
                             p2_mapping.device_index = p2_device_sel - 1;
@@ -826,6 +854,142 @@ fn drawPlayerPanel(
         m.left = .{};
         m.right = .{};
         // Keep device_index, stick axes, deadzone, socd_mode as-is.
+    }
+
+    c.igPopID();
+}
+
+/// List view panel — alternative to drawPlayerPanel. Renders the player's
+/// bindings as a vertical list of rows, each row showing the in-game button
+/// name on the left and the bind button on the right. Below the list: device
+/// combo, SOCD, deadzone, default bindings, clear.
+///
+/// This is the "list view" toggled by the checkbox at the top of the
+/// Controllers tab. Two of these panels sit side-by-side (P1 left, P2 right)
+/// in equal-width child windows.
+fn drawListPanel(
+    name: []const u8,
+    m: *mapper.ControllerMapping,
+    bind_target: *mapper.BindingTarget,
+    joy: *?*anyopaque,
+    device_sel: *c_int,
+    dev_names: *const [16][*:0]const u8,
+    dev_count: c_int,
+    log: *logging.Logger,
+    cooldown: *u32,
+) void {
+    // Build unique ID suffix for ImGui ID stack
+    var id_suffix_buf: [32]u8 = undefined;
+    const id_suffix = std.fmt.bufPrintZ(&id_suffix_buf, "##list_{s}", .{name}) catch "##list_p";
+    c.igPushID_Str(id_suffix.ptr);
+
+    // Player name header
+    var name_buf: [32]u8 = undefined;
+    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch name;
+    c.igText("%s", @as([*:0]const u8, @ptrCast(name_z.ptr)));
+    c.igSpacing();
+
+    // Device combo
+    var combo_label_buf: [48]u8 = undefined;
+    const combo_label = std.fmt.bufPrintZ(&combo_label_buf, "##device_{s}", .{name}) catch "##device";
+    _ = c.igCombo_Str_arr(combo_label.ptr, @ptrCast(device_sel), @ptrCast(dev_names), dev_count, 8);
+
+    // Open/close joystick when device changes
+    const new_dev: c_int = device_sel.* - 1;
+    if (new_dev != m.device_index) {
+        if (joy.*) |j| {
+            c.SDL_JoystickClose(@ptrCast(j));
+            joy.* = null;
+        }
+        if (new_dev >= 0) {
+            joy.* = @ptrCast(c.SDL_JoystickOpen(new_dev));
+            if (joy.* != null) {
+                log.info("{s}: opened joystick {d}", .{ name, new_dev });
+            }
+        }
+        m.device_index = new_dev;
+    }
+
+    c.igSpacing();
+    c.igSeparator();
+    c.igSpacing();
+
+    // Each row: [in-game button name (fixed width)] [bind button]
+    // Use a table-like layout with align_text_to_frame_padding for clean
+    // vertical alignment. The name column is 90px wide; the bind button
+    // fills the rest.
+    const rows = [_]struct { label: []const u8, target: mapper.BindingTarget, binding: mapper.InputBinding }{
+        .{ .label = "Up", .target = .up, .binding = m.up },
+        .{ .label = "Down", .target = .down, .binding = m.down },
+        .{ .label = "Left", .target = .left, .binding = m.left },
+        .{ .label = "Right", .target = .right, .binding = m.right },
+        .{ .label = "A", .target = .a, .binding = m.a },
+        .{ .label = "B", .target = .b, .binding = m.b },
+        .{ .label = "C", .target = .c, .binding = m.c },
+        .{ .label = "D", .target = .d, .binding = m.d },
+        .{ .label = "E", .target = .e, .binding = m.e },
+        .{ .label = "A+B", .target = .ab, .binding = m.ab },
+        .{ .label = "Start", .target = .start, .binding = m.start },
+        .{ .label = "FN1", .target = .fn1, .binding = m.fn1 },
+        .{ .label = "FN2", .target = .fn2, .binding = m.fn2 },
+    };
+
+    for (rows) |row| {
+        // In-game button name (left column, fixed width)
+        c.igAlignTextToFramePadding();
+        var label_buf: [32]u8 = undefined;
+        const label_z = std.fmt.bufPrintZ(&label_buf, "{s}", .{row.label}) catch row.label;
+        c.igText("%s", @as([*:0]const u8, @ptrCast(label_z.ptr)));
+        c.igSameLine(90, 8); // 90px name column + 8px spacing
+        // Bind button (right column)
+        bindButton(row.label, row.target, row.binding, bind_target, cooldown);
+    }
+
+    c.igSpacing();
+    c.igSeparator();
+    c.igSpacing();
+
+    // SOCD mode radio buttons
+    c.igText("SOCD:");
+    c.igSameLine(0, 8);
+    if (c.igRadioButton_Bool("L+R neg", m.socd_mode == 1)) m.socd_mode = 1;
+    c.igSameLine(0, 8);
+    if (c.igRadioButton_Bool("U+D neg", m.socd_mode == 2)) m.socd_mode = 2;
+    c.igSameLine(0, 8);
+    if (c.igRadioButton_Bool("Both neg", m.socd_mode == 3)) m.socd_mode = 3;
+    if (m.socd_mode == 0) m.socd_mode = 1;
+
+    c.igSpacing();
+
+    // Analog Deadzone (0.0-1.0 float, small field)
+    var dz_float: f32 = @as(f32, @floatFromInt(m.deadzone)) / 32767.0;
+    c.igPushItemWidth(120.0);
+    _ = c.igSliderFloat("Analog Deadzone", &dz_float, 0.0, 1.0, "%.2f", 0);
+    c.igPopItemWidth();
+    m.deadzone = @intFromFloat(dz_float * 32767.0);
+
+    c.igSpacing();
+
+    // Default Bindings + Clear buttons
+    if (c.igButton("Default Bindings", .{ .x = 130, .y = 0 })) {
+        m.* = mapper.defaultXboxMapping();
+        m.device_index = device_sel.* - 1;
+    }
+    c.igSameLine(0, 8);
+    if (c.igButton("Clear", .{ .x = 60, .y = 0 })) {
+        m.a = .{};
+        m.b = .{};
+        m.c = .{};
+        m.d = .{};
+        m.e = .{};
+        m.ab = .{};
+        m.start = .{};
+        m.fn1 = .{};
+        m.fn2 = .{};
+        m.up = .{};
+        m.down = .{};
+        m.left = .{};
+        m.right = .{};
     }
 
     c.igPopID();

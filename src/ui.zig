@@ -722,7 +722,8 @@ fn drawPlayerPanel(
     c.igSpacing();
 
     // Two columns: Directions (left) + Buttons (right)
-    _ = c.igBeginChild_Str("dir", .{ .x = 220, .y = 140 }, true, 0);
+    // Reduced height by ~30px (one button row) to tighten the layout.
+    _ = c.igBeginChild_Str("dir", .{ .x = 220, .y = 110 }, true, 0);
 
     c.igText("Directions");
     c.igSpacing();
@@ -748,7 +749,7 @@ fn drawPlayerPanel(
 
     c.igSameLine(0, 8);
 
-    _ = c.igBeginChild_Str("btn", .{ .x = 310, .y = 140 }, true, 0);
+    _ = c.igBeginChild_Str("btn", .{ .x = 310, .y = 110 }, true, 0);
 
     c.igText("Buttons");
     c.igSpacing();
@@ -773,23 +774,30 @@ fn drawPlayerPanel(
 
     c.igSpacing();
 
-    // SOCD mode radio buttons
+    // SOCD mode radio buttons — "Default" removed since the default is
+    // already L+R neg (mode 1). Modes: 1=L+R neg, 2=U+D neg, 3=Both neg.
     c.igText("SOCD:");
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("Default", m.socd_mode == 0)) m.socd_mode = 0;
     c.igSameLine(0, 8);
     if (c.igRadioButton_Bool("L+R neg", m.socd_mode == 1)) m.socd_mode = 1;
     c.igSameLine(0, 8);
     if (c.igRadioButton_Bool("U+D neg", m.socd_mode == 2)) m.socd_mode = 2;
     c.igSameLine(0, 8);
     if (c.igRadioButton_Bool("Both neg", m.socd_mode == 3)) m.socd_mode = 3;
+    // If the user had socd_mode == 0 (old "Default"), normalize to 1.
+    if (m.socd_mode == 0) m.socd_mode = 1;
 
     c.igSpacing();
 
-    // Deadzone slider + buttons on same line
-    var dz: c_int = @intCast(m.deadzone);
-    _ = c.igSliderInt("Analog Deadzone", @ptrCast(&dz), 0, 30000, "%d", 0);
-    m.deadzone = @intCast(dz);
+    // Analog Deadzone as a 0.0-1.0 float slider.
+    // Internally stored as u32 (0-32767, matching SDL axis range), but
+    // displayed as a normalized float for user-friendliness.
+    // Use PushItemWidth to make the slider a small field (120px) instead
+    // of stretching to fill the available width.
+    var dz_float: f32 = @as(f32, @floatFromInt(m.deadzone)) / 32767.0;
+    c.igPushItemWidth(120.0);
+    _ = c.igSliderFloat("Analog Deadzone", &dz_float, 0.0, 1.0, "%.2f", 0);
+    c.igPopItemWidth();
+    m.deadzone = @intFromFloat(dz_float * 32767.0);
 
     c.igSameLine(0, 16);
 
@@ -800,8 +808,24 @@ fn drawPlayerPanel(
     c.igSameLine(0, 8);
 
     if (c.igButton("Clear", .{ .x = 60, .y = 0 })) {
-        m.* = .{};
-        m.device_index = device_sel.* - 1;
+        // Clear all bindings to .none (type=none, index=0). The struct
+        // defaults pre-fill buttons with sdl_button indices, so m.* = .{}
+        // does NOT actually clear — it resets to those defaults. We need
+        // to explicitly set each binding to an empty InputBinding.
+        m.a = .{};
+        m.b = .{};
+        m.c = .{};
+        m.d = .{};
+        m.e = .{};
+        m.ab = .{};
+        m.start = .{};
+        m.fn1 = .{};
+        m.fn2 = .{};
+        m.up = .{};
+        m.down = .{};
+        m.left = .{};
+        m.right = .{};
+        // Keep device_index, stick axes, deadzone, socd_mode as-is.
     }
 
     c.igPopID();

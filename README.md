@@ -41,7 +41,7 @@ ZZCaster consists of two binaries:
 
 | Component | How to install |
 |-----------|---------------|
-| **Zig 0.15.1+** | https://ziglang.org/download/ → extract → add to PATH |
+| **Zig 0.16** | https://ziglang.org/download/ → extract → add to PATH or your package manager |
 
 All C/C++ dependencies (ENet, Dear ImGui, cimgui, SDL2 MinGW) are
 auto-downloaded by `scripts/fetch-deps.sh`.

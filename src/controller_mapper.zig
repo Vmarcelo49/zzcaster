@@ -214,12 +214,19 @@ pub fn defaultXboxMapping() ControllerMapping {
 // ============================================================================
 
 /// Read a single binding's state (true = pressed).
-fn isBindingActive(binding: InputBinding, joy: ?*anyopaque) bool {
+///
+/// `deadzone` only affects `.sdl_axis_pos` / `.sdl_axis_neg` bindings — it's
+/// the absolute value (0..32767) above which an axis is considered "pressed".
+/// Passing the user-configurable `m.deadzone` here (instead of a hardcoded
+/// 8000) ensures that axis-bound buttons (e.g. D-pad mapped to left stick)
+/// respect the deadzone slider in the GUI. Otherwise a higher deadzone set
+/// to suppress stick drift would have no effect on axis bindings.
+fn isBindingActive(binding: InputBinding, joy: ?*anyopaque, deadzone: u32) bool {
     return switch (binding.type) {
         .none => false,
         .sdl_button => joy != null and c.SDL_JoystickGetButton(@ptrCast(joy), binding.index) != 0,
-        .sdl_axis_pos => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) > 8000,
-        .sdl_axis_neg => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) < -8000,
+        .sdl_axis_pos => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) > @as(c_int, @intCast(deadzone)),
+        .sdl_axis_neg => joy != null and c.SDL_JoystickGetAxis(@ptrCast(joy), binding.index) < -@as(c_int, @intCast(deadzone)),
         .sdl_hat => blk: {
             if (joy == null) break :blk false;
             const hat_idx: c_int = @intCast(binding.index & 0xFF);
@@ -244,11 +251,13 @@ fn isBindingActive(binding: InputBinding, joy: ?*anyopaque) bool {
 
 /// Read input using a ControllerMapping. Returns the MBAA combined input u16.
 pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
+    const dz = m.deadzone;
+
     // Directions
-    var up = isBindingActive(m.up, joy);
-    var down = isBindingActive(m.down, joy);
-    var left = isBindingActive(m.left, joy);
-    var right = isBindingActive(m.right, joy);
+    var up = isBindingActive(m.up, joy, dz);
+    var down = isBindingActive(m.down, joy, dz);
+    var left = isBindingActive(m.left, joy, dz);
+    var right = isBindingActive(m.right, joy, dz);
 
     // Analog stick also contributes to directions
     if (joy != null) {
@@ -271,15 +280,15 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
 
     // Buttons
     var btns: u16 = 0;
-    if (isBindingActive(m.a, joy)) btns |= gamepad.button_a;
-    if (isBindingActive(m.b, joy)) btns |= gamepad.button_b;
-    if (isBindingActive(m.c, joy)) btns |= gamepad.button_c;
-    if (isBindingActive(m.d, joy)) btns |= gamepad.button_d;
-    if (isBindingActive(m.e, joy)) btns |= gamepad.button_e;
-    if (isBindingActive(m.ab, joy)) btns |= gamepad.button_ab;
-    if (isBindingActive(m.start, joy)) btns |= gamepad.button_start;
-    if (isBindingActive(m.fn1, joy)) btns |= 0x0100; // FN1
-    if (isBindingActive(m.fn2, joy)) btns |= 0x0200; // FN2
+    if (isBindingActive(m.a, joy, dz)) btns |= gamepad.button_a;
+    if (isBindingActive(m.b, joy, dz)) btns |= gamepad.button_b;
+    if (isBindingActive(m.c, joy, dz)) btns |= gamepad.button_c;
+    if (isBindingActive(m.d, joy, dz)) btns |= gamepad.button_d;
+    if (isBindingActive(m.e, joy, dz)) btns |= gamepad.button_e;
+    if (isBindingActive(m.ab, joy, dz)) btns |= gamepad.button_ab;
+    if (isBindingActive(m.start, joy, dz)) btns |= gamepad.button_start;
+    if (isBindingActive(m.fn1, joy, dz)) btns |= 0x0100; // FN1
+    if (isBindingActive(m.fn2, joy, dz)) btns |= 0x0200; // FN2
     if (btns & gamepad.button_a != 0) btns |= gamepad.button_confirm;
     if (btns & gamepad.button_b != 0) btns |= gamepad.button_cancel;
 
@@ -291,18 +300,28 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
 // ============================================================================
 
 pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u8, io: std.Io, log: *logging.Logger) void {
-    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch {
-        log.warn("Failed to save mapping to {s}", .{path});
-        return;
-    };
-    defer file.close(io);
+    // Ensure the parent directory exists. createFile does NOT create
+    // intermediate directories — if "zzcaster/" doesn't exist yet (e.g.
+    // first run), the save would silently fail.
+    if (std.fs.path.dirname(path)) |dir| {
+        if (dir.len > 0) {
+            std.Io.Dir.cwd().createDirPath(io, dir) catch {};
+        }
+    }
 
-    var write_buf: [4096]u8 = undefined;
-    var writer = file.writer(io, &write_buf);
-    const w = &writer.interface;
+    // Build the INI content in a fixed memory buffer first, then write it
+    // to the file in a single call. This avoids the buffered-writer issues
+    // that previously left the file empty (file.writer(&buf) + w.print +
+    // w.flush silently produced 0-byte files because the print errors were
+    // swallowed by catch {}).
+    var content_buf: [4096]u8 = undefined;
+    var w: std.Io.Writer = .fixed(&content_buf);
     var buf: [64]u8 = undefined;
 
-    w.print("[Player1]\ndevice={d}\n", .{p1.device_index}) catch {};
+    w.print("[Player1]\ndevice={d}\n", .{p1.device_index}) catch {
+        log.warn("saveMapping: P1 header write failed", .{});
+        return;
+    };
     w.print("a={s}\n", .{p1.a.serialize(&buf)}) catch {};
     w.print("b={s}\n", .{p1.b.serialize(&buf)}) catch {};
     w.print("c={s}\n", .{p1.c.serialize(&buf)}) catch {};
@@ -338,25 +357,47 @@ pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u
         p2.stick_x_axis, p2.stick_y_axis, p2.deadzone, p2.socd_mode,
     }) catch {};
 
-    // Flush the buffered writer so all the prints above actually hit the
-    // file. Without this, file.writer(&buf) only writes to its internal
-    // buffer and the file ends up empty (just truncated to 0 bytes).
-    w.flush() catch {
-        log.warn("Failed to flush mapping writer to {s}", .{path});
+    const written = w.buffered();
+    log.info("saveMapping: built {d} bytes of INI content", .{written.len});
+
+    const file = std.Io.Dir.cwd().createFile(io, path, .{ .truncate = true }) catch {
+        log.warn("Failed to create mapping file {s}", .{path});
+        return;
+    };
+    defer file.close(io);
+
+    file.writeStreamingAll(io, written) catch {
+        log.warn("Failed to write mapping to {s}", .{path});
         return;
     };
 
-    log.info("Mapping saved to {s}", .{path});
+    log.info("Mapping saved to {s} ({d} bytes)", .{ path, written.len });
 }
 
 pub fn loadMapping(path: []const u8, io: std.Io, log: *logging.Logger) ?struct { p1: ControllerMapping, p2: ControllerMapping } {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        log.info("loadMapping: openFile('{s}') failed: {s}", .{ path, @errorName(err) });
+        return null;
+    };
     defer file.close(io);
 
-    var read_buf: [4096]u8 = undefined;
+    // Read the file into a fixed buffer. readSliceShort returns the number
+    // of bytes actually read (0 for empty files) instead of erroring with
+    // EndOfStream like readAlloc does.
+    var read_buf: [8192]u8 = undefined;
     var reader = file.reader(io, &read_buf);
-    const data = reader.interface.readAlloc(std.heap.page_allocator, 8192) catch return null;
-    defer std.heap.page_allocator.free(data);
+    const len = reader.interface.readSliceShort(&read_buf) catch |err| {
+        log.warn("loadMapping: readSliceShort failed: {s}", .{@errorName(err)});
+        return null;
+    };
+
+    if (len == 0) {
+        log.warn("loadMapping: file is empty (0 bytes read from {s})", .{path});
+        return null;
+    }
+
+    const data = read_buf[0..len];
+    log.info("loadMapping: read {d} bytes from {s}", .{ len, path });
 
     var p1 = ControllerMapping{};
     var p2 = ControllerMapping{};

@@ -5,6 +5,8 @@ const launcher = @import("launcher.zig");
 const ipc = @import("ipc.zig");
 const mapper = @import("controller_mapper.zig");
 const gamepad = @import("gamepad.zig");
+const net = @import("net.zig");
+const session = @import("session.zig");
 
 // Win32 for GetModuleFileNameA — used to resolve mapping.ini relative to
 // the exe's own directory, matching how the DLL resolves it relative to
@@ -87,7 +89,7 @@ const c = @cImport({
 
 pub const CliMode = @import("main.zig").CliMode;
 
-const UiState = enum { idle, in_game, error_state };
+const UiState = enum { idle, waiting_for_peer, in_game, error_state };
 const MenuPage = enum { netplay, offline, game_config, controllers };
 
 pub fn runCli(
@@ -115,9 +117,9 @@ pub fn runCli(
             try launchGame(allocator, io, cfg, log, false, false, port, pipe_name, true);
         },
         .host => {
-            stdout.interface.print("[cli] launching netplay host on port {d}\n", .{port}) catch {};
+            stdout.interface.print("[cli] hosting netplay on port {d}\n", .{port}) catch {};
             stdout.interface.flush() catch {};
-            try launchGame(allocator, io, cfg, log, false, true, port, pipe_name, true);
+            try runCliNetplay(allocator, io, cfg, log, port, null, false, pipe_name);
         },
         .join => {
             const p = peer orelse {
@@ -127,7 +129,15 @@ pub fn runCli(
             };
             stdout.interface.print("[cli] joining netplay peer {s}\n", .{p}) catch {};
             stdout.interface.flush() catch {};
-            try launchNetplayPeerImpl(allocator, io, cfg, log, p, false, pipe_name);
+            // Parse host:port out of --peer for the handshake session.
+            const colon = std.mem.lastIndexOfScalar(u8, p, ':') orelse {
+                stdout.interface.print("[cli] --peer must be ip:port\n", .{}) catch {};
+                stdout.interface.flush() catch {};
+                std.process.exit(2);
+            };
+            const host_part = p[0..colon];
+            const join_port = std.fmt.parseInt(u16, p[colon + 1 ..], 10) catch config.default_port;
+            try runCliNetplay(allocator, io, cfg, log, join_port, host_part, false, pipe_name);
         },
         .spectate => {
             const p = peer orelse {
@@ -202,10 +212,29 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var wincount_buf: [8]u8 = "2\x00\x00\x00\x00\x00\x00\x00".*;
     var rollback_buf: [8]u8 = "4\x00\x00\x00\x00\x00\x00\x00".*;
 
+    // Display name input buffer (sentinel-terminated for ImGui). Initialized
+    // from cfg.display_name on startup; saved back when the user clicks Apply.
+    var name_buf: [40]u8 = [_]u8{0} ** 40;
+    {
+        const dn = cfg.display_name;
+        const n = @min(dn.len, name_buf.len - 1);
+        @memcpy(name_buf[0..n], dn[0..n]);
+        name_buf[n] = 0;
+    }
+
     // Game tracking
     var win_launcher: ?launcher.WindowsLauncher = null;
     var game_pid: u32 = 0;
     var ipc_server: ?ipc.IpcServer = null;
+
+    // Netplay session (launcher-side handshake before the game opens).
+    // Owned by the UI thread; the background session thread only reads/writes
+    // fields on the NetplaySession itself (state, stats, etc.) which are
+    // single-reader/single-writer between the two threads.
+    var np_session: ?session.NetplaySession = null;
+    var np_thread: ?std.Thread = null;
+    // Host-mode wait screen: has the user clicked "Start"?
+    var host_start_clicked: bool = false;
 
     // Controller mapper state
     var p1_mapping: mapper.ControllerMapping = .{};
@@ -331,13 +360,18 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         c.igSpacing();
 
                         if (c.igButton("Host Game", .{ .x = 160, .y = 36 })) {
-                            launchGameImpl(allocator, io, cfg, log, false, true, parsePort(&port_buf), pipe_name, &win_launcher, &game_pid, &ipc_server, &error_msg, &error_msg_len);
-                            if (game_pid > 0) ui_state = .in_game else ui_state = .error_state;
+                            startHostSession(allocator, io, cfg, log, parsePort(&port_buf), &np_session, &np_thread);
+                            if (np_session != null) {
+                                host_start_clicked = false;
+                                ui_state = .waiting_for_peer;
+                            }
                         }
                         c.igSpacing();
                         if (c.igButton("Join Game", .{ .x = 160, .y = 36 })) {
-                            launchNetplayImpl(allocator, io, cfg, log, std.mem.sliceTo(@as([*:0]u8, @ptrCast(&peer_buf)), 0), false, pipe_name, &win_launcher, &game_pid, &ipc_server, &error_msg, &error_msg_len);
-                            if (game_pid > 0) ui_state = .in_game else ui_state = .error_state;
+                            startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(@as([*:0]u8, @ptrCast(&peer_buf)), 0), pipe_name, &np_session, &np_thread);
+                            if (np_session != null) {
+                                ui_state = .waiting_for_peer;
+                            }
                         }
                         c.igSpacing();
                         if (c.igButton("Spectate Match", .{ .x = 160, .y = 36 })) {
@@ -367,6 +401,20 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         c.igSeparator();
                         c.igSpacing();
 
+                        c.igText("Display Name:");
+                        c.igSameLine(0, 8);
+                        _ = c.igInputText("##displayname", &name_buf, name_buf.len, 0, null, null);
+                        c.igSameLine(0, 8);
+                        if (c.igButton("Apply##name", .{ .x = 60, .y = 0 })) {
+                            const new_name = std.mem.sliceTo(@as([*:0]u8, @ptrCast(&name_buf)), 0);
+                            if (cfg.display_name.len > 0) allocator.free(cfg.display_name);
+                            cfg.display_name = allocator.dupe(u8, new_name) catch &.{};
+                            config.saveConfig(cfg, io) catch {};
+                            log.info("Display name set to '{s}'", .{new_name});
+                        }
+
+                        c.igSpacing();
+
                         c.igText("Versus Win Count:");
                         c.igSameLine(0, 8);
                         _ = c.igInputText("##wincount", &wincount_buf, wincount_buf.len, 0, null, null);
@@ -394,6 +442,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         c.igSpacing();
 
                         c.igText("Current: Win Count = %d, Rollback = %d", cfg.versus_win_count, cfg.default_rollback);
+                        c.igText("Display Name = %s", @as([*:0]const u8, @ptrCast(&name_buf)));
                     },
                     .controllers => {
                         c.igText("Controller Mapper");
@@ -472,6 +521,15 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
 
                 c.igEndChild(); // Content
             },
+            .waiting_for_peer => {
+                drawWaitingForPeer(
+                    allocator, io, cfg, log, pipe_name,
+                    &np_session, &np_thread,
+                    &win_launcher, &game_pid, &ipc_server,
+                    &ui_state, &error_msg, &error_msg_len,
+                    &host_start_clicked,
+                );
+            },
             .in_game => {
                 c.igText("Game running (PID: %d)", game_pid);
                 c.igSpacing();
@@ -516,6 +574,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     }
 
     // Cleanup on quit
+    cleanupSession(&np_session, &np_thread);
     cleanupGame(&win_launcher, &game_pid, &ipc_server);
 }
 
@@ -537,6 +596,25 @@ fn cleanupGame(
     if (win_launcher.*) |*wl| wl.terminate();
     win_launcher.* = null;
     game_pid.* = 0;
+}
+
+/// Tear down any in-progress netplay session (background thread + transport).
+/// Called when leaving the waiting_for_peer screen (cancel, success, or quit).
+fn cleanupSession(
+    np_session: *?session.NetplaySession,
+    np_thread: *?std.Thread,
+) void {
+    if (np_session.*) |*s| {
+        s.cancel(); // signals the background thread + closes transport
+    }
+    if (np_thread.*) |t| {
+        t.join();
+        np_thread.* = null;
+    }
+    if (np_session.*) |*s| {
+        s.deinit();
+    }
+    np_session.* = null;
 }
 
 // ============================================================================
@@ -898,6 +976,408 @@ fn launchNetplayImpl(
     });
 }
 
+// ============================================================================
+// Netplay session (launcher-side handshake before the game opens)
+// ============================================================================
+
+const SessionThreadCtx = struct {
+    s: *session.NetplaySession,
+    port: u16,
+    training: bool,
+    is_host: bool,
+    peer_addr: ?[]const u8 = null, // only for join
+};
+
+/// Background thread entry point: runs the blocking host()/join() call.
+/// The NetplaySession's state field is the communication channel back to
+/// the UI thread.
+fn sessionThreadMain(ctx: SessionThreadCtx) void {
+    if (ctx.is_host) {
+        ctx.s.host(ctx.port, ctx.training) catch |err| {
+            if (err != error.Cancelled) {
+                ctx.s.log.warn("host() failed: {t}", .{err});
+            }
+        };
+    } else {
+        const addr = ctx.peer_addr orelse return;
+        ctx.s.join(addr, ctx.port, ctx.training) catch |err| {
+            if (err != error.Cancelled) {
+                ctx.s.log.warn("join() failed: {t}", .{err});
+            }
+        };
+    }
+}
+
+/// Start the host-side handshake session in a background thread.
+fn startHostSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    port: u16,
+    np_session: *?session.NetplaySession,
+    np_thread: *?std.Thread,
+) void {
+    // Tear down any previous session first.
+    cleanupSession(np_session, np_thread);
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    // Look up public + local IPs for the host display screen. Synchronous but
+    // fast (wininet uses system timeout).
+    s.lookupHostAddresses();
+    np_session.* = s;
+
+    const ctx = SessionThreadCtx{
+        .s = &np_session.*.?,
+        .port = port,
+        .training = false,
+        .is_host = true,
+    };
+    np_thread.* = std.Thread.spawn(.{}, sessionThreadMain, .{ctx}) catch null;
+    log.info("Host session started on port {d} (pub={s} local={s} name='{s}')", .{
+        port,
+        s.publicIp() orelse "?",
+        s.localIp() orelse "?",
+        s.localName(),
+    });
+}
+
+/// Start the client-side handshake session in a background thread.
+fn startJoinSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    addr_str: []const u8,
+    pipe_name: []const u8,
+    np_session: *?session.NetplaySession,
+    np_thread: *?std.Thread,
+) void {
+    _ = pipe_name;
+    cleanupSession(np_session, np_thread);
+
+    // Validate ip:port format up front.
+    const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse {
+        log.err("Invalid address (no colon): {s}", .{addr_str});
+        return;
+    };
+    const port = std.fmt.parseInt(u16, addr_str[colon + 1 ..], 10) catch {
+        log.err("Invalid port in: {s}", .{addr_str});
+        return;
+    };
+    // Copy the host part into a stable buffer the thread can outlive the
+    // stack frame that holds addr_str. The session also stores it in
+    // config.peer_addr, but we need a separate owned slice for the thread ctx.
+    const host_part = addr_str[0..colon];
+    const host_owned = allocator.dupe(u8, host_part) catch {
+        log.err("OOM duplicating host addr", .{});
+        return;
+    };
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    np_session.* = s;
+
+    const ctx = SessionThreadCtx{
+        .s = &np_session.*.?,
+        .port = port,
+        .training = false,
+        .is_host = false,
+        .peer_addr = host_owned,
+    };
+    np_thread.* = std.Thread.spawn(.{}, sessionThreadMain, .{ctx}) catch blk: {
+        allocator.free(host_owned);
+        break :blk null;
+    };
+    log.info("Join session started -> {s}:{d} (name='{s}')", .{ host_part, port, s.localName() });
+}
+
+/// Draw the waiting-for-peer screen. Polls the session state each frame and
+/// either shows progress, a confirmation prompt, or transitions to the game.
+fn drawWaitingForPeer(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    pipe_name: []const u8,
+    np_session: *?session.NetplaySession,
+    np_thread: *?std.Thread,
+    win_launcher: *?launcher.WindowsLauncher,
+    game_pid: *u32,
+    ipc_server: *?ipc.IpcServer,
+    ui_state: *UiState,
+    error_msg: *[256]u8,
+    error_msg_len: *usize,
+    host_start_clicked: *bool,
+) void {
+    // Take a mutable pointer directly into the optional storage so we can
+    // call mutating methods (hostConfirm) and read live state updated by the
+    // background thread.
+    if (np_session.* == null) {
+        ui_state.* = .idle;
+        return;
+    }
+    const s = &np_session.*.?;
+    const is_host = s.config.is_host;
+
+    c.igText("%s", @as([*:0]const u8, @ptrCast(if (is_host) "Hosting — waiting for opponent" else "Connecting to host")));
+    c.igSpacing();
+    c.igSeparator();
+    c.igSpacing();
+
+    switch (s.state) {
+        .idle, .listening, .connecting, .handshaking, .ping_exchanging => {
+            // In-progress: show address info + a spinner-ish message.
+            if (is_host) {
+                if (s.publicIp()) |pub_ip| {
+                    var addr_buf: [80]u8 = undefined;
+                    const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ pub_ip, s.config.peer_port }) catch "?:?";
+                    c.igText("Give your opponent this address:");
+                    c.igSameLine(0, 8);
+                    c.igTextColored(.{ .x = 0.4, .y = 0.8, .z = 1.0, .w = 1.0 }, "%s", @as([*:0]const u8, @ptrCast(addr_z.ptr)));
+                    c.igSameLine(0, 8);
+                    if (c.igButton("Copy", .{ .x = 60, .y = 0 })) {
+                        setClipboardZ(addr_z);
+                    }
+                } else {
+                    c.igText("Looking up public IP...");
+                }
+                if (s.localIp()) |loc_ip| {
+                    var addr_buf: [80]u8 = undefined;
+                    const addr_z = std.fmt.bufPrintZ(&addr_buf, "Local IP: {s}:{d}", .{ loc_ip, s.config.peer_port }) catch "";
+                    c.igText("%s", @as([*:0]const u8, @ptrCast(addr_z.ptr)));
+                }
+            } else {
+                var addr_buf: [80]u8 = undefined;
+                const peer_z = std.mem.sliceTo(&s.config.peer_addr, 0);
+                const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ peer_z, s.config.peer_port }) catch "?:?";
+                c.igText("Connecting to %s...", @as([*:0]const u8, @ptrCast(addr_z.ptr)));
+            }
+            c.igSpacing();
+            c.igText("(make sure the port is open / forwarded on the host's router)");
+
+            c.igSpacing();
+            c.igSeparator();
+            c.igSpacing();
+            if (c.igButton("Cancel", .{ .x = 120, .y = 30 })) {
+                cleanupSession(np_session, np_thread);
+                ui_state.* = .idle;
+            }
+        },
+
+        .waiting_confirmation => {
+            // Host: handshake done, show ping + a Start button.
+            const remote = s.remoteName();
+            if (remote.len > 0) {
+                c.igText("%.*s connected!", @as(c_int, @intCast(remote.len)), remote.ptr);
+            } else {
+                c.igText("Opponent connected!");
+            }
+            c.igSpacing();
+            c.igText("Ping: avg=%.0fms  min=%.0fms  max=%.0fms", s.stats.avg_ms, s.stats.min_ms, s.stats.max_ms);
+            c.igText("Auto input delay: %d", s.config.delay);
+            c.igSpacing();
+            c.igSeparator();
+            c.igSpacing();
+            if (c.igButton("Start Match", .{ .x = 160, .y = 36 })) {
+                host_start_clicked.* = true;
+                s.hostConfirm();
+            }
+            c.igSameLine(0, 16);
+            if (c.igButton("Cancel", .{ .x = 120, .y = 36 })) {
+                cleanupSession(np_session, np_thread);
+                ui_state.* = .idle;
+            }
+        },
+
+        .launching => {
+            // Both sides agreed — open the game now.
+            // For the host this is reached after hostConfirm(); for the
+            // client it's reached right after waitForConfig().
+            launchGameAfterHandshake(
+                allocator, io, cfg, log, pipe_name,
+                np_session, np_thread,
+                win_launcher, game_pid, ipc_server,
+                error_msg, error_msg_len,
+            );
+            if (game_pid.* > 0) {
+                ui_state.* = .in_game;
+            } else {
+                ui_state.* = .error_state;
+            }
+        },
+
+        .completed => {
+            c.igText("Session completed.");
+            c.igSpacing();
+            if (c.igButton("OK", .{ .x = 120, .y = 30 })) {
+                cleanupSession(np_session, np_thread);
+                ui_state.* = .idle;
+            }
+        },
+
+        .failed => {
+            const msg = s.errorMessage();
+            setErr(error_msg, error_msg_len, if (msg.len > 0) msg else "Connection failed");
+            cleanupSession(np_session, np_thread);
+            ui_state.* = .error_state;
+        },
+
+        .cancelled => {
+            cleanupSession(np_session, np_thread);
+            ui_state.* = .idle;
+        },
+    }
+}
+
+// Module-local references removed: the host-screen IP buffers are now passed
+// through startHostSession → drawWaitingForPeer as explicit parameters.
+
+fn setClipboardZ(text: []const u8) void {
+    // Build a null-terminated copy on the stack and hand it to ImGui.
+    var buf: [128]u8 = undefined;
+    const n = @min(text.len, buf.len - 1);
+    @memcpy(buf[0..n], text[0..n]);
+    buf[n] = 0;
+    c.igSetClipboardText(@ptrCast(&buf));
+}
+
+/// Launch the game after the launcher-side handshake completed. Mirrors
+/// MainApp.cpp:1263-1289: close the handshake socket, wait ~1s (so the OS
+/// releases the UDP port — the legacy startTimer delay), then CreateProcess +
+/// inject + send the negotiated config via IPC.
+fn launchGameAfterHandshake(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    pipe_name: []const u8,
+    np_session: *?session.NetplaySession,
+    np_thread: *?std.Thread,
+    win_launcher: *?launcher.WindowsLauncher,
+    game_pid: *u32,
+    ipc_server: *?ipc.IpcServer,
+    error_msg: *[256]u8,
+    error_msg_len: *usize,
+) void {
+    // Snapshot the negotiated config BEFORE we tear down the session.
+    const snap = blk: {
+        if (np_session.*) |*s| break :blk s.config;
+        setErr(error_msg, error_msg_len, "No session to launch from");
+        return;
+    };
+    const is_host = snap.is_host;
+    const peer_port = snap.peer_port;
+    const delay = snap.delay;
+    const rollback = snap.rollback;
+    const win_count = snap.win_count;
+    const host_player = snap.host_player;
+    var peer_addr: [64]u8 = snap.peer_addr;
+
+    // Join the session thread (it has finished its work by now — state is
+    // .launching) and tear down the transport so the OS frees the UDP port.
+    if (np_thread.*) |t| {
+        t.join();
+        np_thread.* = null;
+    }
+    if (np_session.*) |*s| {
+        s.deinit();
+    }
+    np_session.* = null;
+
+    log.info("Handshake done ({s}). Closing socket, waiting 1s before opening game...", .{
+        if (is_host) "host" else "client",
+    });
+    // Mirror the legacy 1000ms startTimer delay (MainApp.cpp:933-934) so the
+    // OS releases the port before the DLL rebinds it.
+    std.Io.sleep(io, .{ .nanoseconds = 1 * std.time.ns_per_s }, .real) catch {};
+
+    // Clean up any previous game state before launching a new one.
+    cleanupGame(win_launcher, game_pid, ipc_server);
+
+    const game_exe = std.fs.path.join(allocator, &.{ cfg.app_dir, "MBAA.exe" }) catch {
+        setErr(error_msg, error_msg_len, "Failed to allocate path");
+        return;
+    };
+    defer allocator.free(game_exe);
+    const dll_path = std.fs.path.join(allocator, &.{ cfg.app_dir, "zzcaster", "hook.dll" }) catch {
+        setErr(error_msg, error_msg_len, "Failed to allocate dll path");
+        return;
+    };
+    defer allocator.free(dll_path);
+
+    std.Io.Dir.cwd().access(io, game_exe, .{}) catch {
+        setErr(error_msg, error_msg_len, "MBAA.exe not found");
+        log.err("MBAA.exe not found: {s}", .{game_exe});
+        return;
+    };
+    std.Io.Dir.cwd().access(io, dll_path, .{}) catch {
+        setErr(error_msg, error_msg_len, "hook.dll not found");
+        log.err("hook.dll not found: {s}", .{dll_path});
+        return;
+    };
+
+    ipc_server.* = ipc.IpcServer.listen(pipe_name) catch {
+        setErr(error_msg, error_msg_len, "IPC listen failed");
+        return;
+    };
+
+    win_launcher.* = launcher.WindowsLauncher{};
+    const pid = win_launcher.*.?.launch(.{
+        .game_exe = game_exe,
+        .dll_path = dll_path,
+        .high_priority = cfg.high_cpu_priority,
+    }, log) catch {
+        setErr(error_msg, error_msg_len, "Failed to launch MBAA.exe");
+        return;
+    };
+    game_pid.* = pid;
+    log.info("Game launched (PID={d})", .{pid});
+
+    if (ipc_server.*) |*srv| {
+        srv.waitForConnection() catch {
+            setErr(error_msg, error_msg_len, "IPC connection failed");
+            return;
+        };
+    }
+    log.info("DLL connected via IPC", .{});
+
+    // Build the config buffer using the SAME layout the DLL parses in
+    // dllmain.zig:waitForConfig():
+    //   [1 byte flags] [1 byte delay] [1 byte rollback] [1 byte win_count]
+    //   [1 byte host_player] [2 bytes peer_port] [N bytes peer_addr]
+    // flags bit0=training, bit1=netplay, bit2=host, bit3=spectator.
+    var config_buf: [256]u8 = undefined;
+    config_buf[0] = 0x02 | (if (is_host) @as(u8, 0x04) else 0);
+    config_buf[1] = delay;
+    config_buf[2] = rollback;
+    config_buf[3] = win_count;
+    config_buf[4] = host_player;
+    std.mem.writeInt(u16, config_buf[5..7], peer_port, .little);
+
+    // Host does NOT send a peer address (it listens); client sends the host's
+    // address so the DLL can connect outbound.
+    var msg_len: usize = 7;
+    if (!is_host) {
+        const addr_slice = std.mem.sliceTo(&peer_addr, 0);
+        const addr_copy_len = @min(addr_slice.len, 248);
+        @memcpy(config_buf[7..7 + addr_copy_len], addr_slice[0..addr_copy_len]);
+        msg_len = 7 + addr_copy_len;
+    }
+
+    if (ipc_server.*) |*srv| {
+        _ = srv.send(config_buf[0..msg_len]);
+    }
+    log.info("Config sent to DLL (host={} delay={d} rollback={d} port={d})", .{
+        is_host, delay, rollback, peer_port,
+    });
+}
+
 fn setErr(msg: *[256]u8, len: *usize, text: []const u8) void {
     const n = @min(text.len, msg.len - 1);
     @memcpy(msg[0..n], text[0..n]);
@@ -1013,4 +1493,119 @@ fn launchNetplayPeerImpl(allocator: std.mem.Allocator, io: std.Io, cfg: *config.
         std.Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
     }
     log.info("Session ended", .{});
+}
+
+/// CLI netplay: run the launcher-side handshake session (blocking, no UI —
+/// the host auto-confirms after the peer connects), then launch the game with
+/// the negotiated config. Mirrors the GUI's startHostSession/Join +
+/// launchGameAfterHandshake but single-threaded for the CLI path.
+///
+/// `peer_host` is null for host mode, "ip" for join mode.
+fn runCliNetplay(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    port: u16,
+    peer_host: ?[]const u8,
+    is_spectator: bool,
+    pipe_name: []const u8,
+) !void {
+    _ = is_spectator;
+    var s = session.NetplaySession.init(allocator, io, log);
+    defer s.deinit();
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+
+    if (peer_host == null) {
+        // Host: look up public IP, listen, handshake, then auto-confirm.
+        s.lookupHostAddresses();
+        try s.host(port, false);
+        // host() leaves us in waiting_confirmation — auto-confirm like the
+        // legacy --dummy path does.
+        s.hostConfirm();
+    } else {
+        try s.join(peer_host.?, port, false);
+    }
+
+    if (s.state != .launching) {
+        log.err("Handshake did not reach launching state (state={t})", .{s.state});
+        return error.HandshakeFailed;
+    }
+
+    log.info("Handshake OK — launching game (delay={d} rollback={d})", .{
+        s.config.delay, s.config.rollback,
+    });
+
+    // Snapshot config and tear down the handshake socket before opening the
+    // game (matches launchGameAfterHandshake in the GUI path).
+    const snap = s.config;
+    s.deinit();
+
+    // 1s delay so the OS frees the UDP port before the DLL rebinds it.
+    std.Io.sleep(io, .{ .nanoseconds = 1 * std.time.ns_per_s }, .real) catch {};
+
+    // Launch the game + inject + send config via IPC.
+    const game_exe = try std.fs.path.join(allocator, &.{ cfg.app_dir, "MBAA.exe" });
+    defer allocator.free(game_exe);
+    const dll_path = try std.fs.path.join(allocator, &.{ cfg.app_dir, "zzcaster", "hook.dll" });
+    defer allocator.free(dll_path);
+
+    std.Io.Dir.cwd().access(io, game_exe, .{}) catch {
+        log.err("MBAA.exe not found: {s}", .{game_exe});
+        return;
+    };
+    std.Io.Dir.cwd().access(io, dll_path, .{}) catch {
+        log.err("hook.dll not found: {s}", .{dll_path});
+        return;
+    };
+
+    var ipc_server = try ipc.IpcServer.listen(pipe_name);
+    defer ipc_server.close();
+    log.info("IPC server listening", .{});
+
+    var win_launcher = launcher.WindowsLauncher{};
+    const pid = win_launcher.launch(.{
+        .game_exe = game_exe,
+        .dll_path = dll_path,
+        .high_priority = cfg.high_cpu_priority,
+    }, log) catch {
+        log.err("Failed to launch MBAA.exe", .{});
+        return;
+    };
+    log.info("Game launched (PID={d})", .{pid});
+
+    ipc_server.waitForConnection() catch {
+        log.warn("IPC connection failed", .{});
+        return;
+    };
+    log.info("DLL connected via IPC", .{});
+
+    // Build config buffer (same layout as launchGameAfterHandshake).
+    var config_buf: [256]u8 = undefined;
+    config_buf[0] = 0x02 | (if (snap.is_host) @as(u8, 0x04) else 0);
+    config_buf[1] = snap.delay;
+    config_buf[2] = snap.rollback;
+    config_buf[3] = snap.win_count;
+    config_buf[4] = snap.host_player;
+    std.mem.writeInt(u16, config_buf[5..7], snap.peer_port, .little);
+
+    var msg_len: usize = 7;
+    if (!snap.is_host) {
+        const addr_slice = std.mem.sliceTo(&snap.peer_addr, 0);
+        const addr_copy_len = @min(addr_slice.len, 248);
+        @memcpy(config_buf[7..7 + addr_copy_len], addr_slice[0..addr_copy_len]);
+        msg_len = 7 + addr_copy_len;
+    }
+
+    _ = ipc_server.send(config_buf[0..msg_len]);
+    log.info("Config sent to DLL (host={} delay={d} port={d})", .{
+        snap.is_host, snap.delay, snap.peer_port,
+    });
+
+    while (win_launcher.isAlive()) {
+        std.Io.sleep(io, .{ .nanoseconds = 100 * std.time.ns_per_ms }, .real) catch {};
+    }
+    log.info("Game exited", .{});
 }

@@ -23,6 +23,7 @@ pub const button_cancel: u16 = 0x0800;
 // VK codes (will be loaded from MBAA.exe config)
 var vk_codes: [10]u32 = [_]u32{0} ** 10;
 var initialized: bool = false;
+pub fn isInitialized() bool { return initialized; }
 
 const MAPVK_VSC_TO_VK_EX: u32 = 3;
 

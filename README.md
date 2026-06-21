@@ -4,10 +4,12 @@ A Zig port of [CCCaster](https://github.com/Rhekar/CCCaster), the netplay
 launcher and DLL injector for **MELTY BLOOD Actress Again Current Code**
 (MBAACC).
 
+Why the name? First Z from Zig the programming language, second from Z.ai which this project used(almost by its entirety).
+
 ## Credits
 
-ZZCaster is a from-scratch rewrite of the original CCCaster by **Rhekar**
-and contributors. The original project is a C++ Win32 application that has
+ZZCaster is a from-scratch rewrite of the CCCaster fork of **Rhekar**.
+The original project is a C++ Win32 application that has
 served the MBAACC community for years. This Zig port aims to modernize the
 codebase while preserving the same netcode algorithm and game compatibility.
 

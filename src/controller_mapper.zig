@@ -370,13 +370,21 @@ pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u
 }
 
 pub fn loadMapping(path: []const u8, io: std.Io, log: *logging.Logger) ?struct { p1: ControllerMapping, p2: ControllerMapping } {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return null;
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch |err| {
+        log.info("loadMapping: openFile('{s}') failed: {s}", .{ path, @errorName(err) });
+        return null;
+    };
     defer file.close(io);
 
     var read_buf: [4096]u8 = undefined;
     var reader = file.reader(io, &read_buf);
-    const data = reader.interface.readAlloc(std.heap.page_allocator, 8192) catch return null;
+    const data = reader.interface.readAlloc(std.heap.page_allocator, 8192) catch |err| {
+        log.warn("loadMapping: readAlloc failed: {s}", .{@errorName(err)});
+        return null;
+    };
     defer std.heap.page_allocator.free(data);
+
+    log.info("loadMapping: read {d} bytes from {s}", .{ data.len, path });
 
     var p1 = ControllerMapping{};
     var p2 = ControllerMapping{};

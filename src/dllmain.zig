@@ -142,10 +142,14 @@ var reader: ?gamepad.GamepadReader = null;
 // the first frame where config_received becomes true. Lets the user
 // verify from the log that reader / reader2 / keyboard were set up.
 var input_diag_logged: bool = false;
-// Diagnostic: frame counter for periodic input-value logging (every 300
-// frames ≈ 5s at 60fps). Helps confirm writeInput is actually writing
-// non-zero values into the game's input struct.
+// Periodic input-value logging frame counter.
 var input_log_frame: u32 = 0;
+// SDL must be initialized on the SAME thread that polls it. lazyInit runs
+// on a worker thread, so we defer SDL_Init + controller open to the first
+// frameStep call (which runs on MBAA's main thread). Without this, all
+// SDL_GameControllerGetButton / SDL_JoystickGetButton calls return 0
+// because SDL's internal state is thread-local.
+var sdl_init_done: bool = false;
 // Second reader for offline Versus P2. Null in netplay/spectator modes
 // (P2 input comes from the network there). Built in applyPostLoadHacks
 // from the [Player2] section of zzcaster/mapping.ini. Without this, P2
@@ -619,25 +623,47 @@ fn applyPostLoadHacks() void {
     timer_speed_addr.* = 2;
     win_count_vs_addr.* = 2;
 
-    // Init SDL2 for gamepad
+    // NOTE: SDL_Init + controller open is deferred to initSdlOnMainThread(),
+    // which runs on MBAA's main thread (via frameStep). SDL is NOT thread-safe
+    // — initializing it on the worker thread and polling on the main thread
+    // causes all SDL_GameControllerGetButton / SDL_JoystickGetButton calls to
+    // return 0, making controllers appear dead.
+
+    // Init keyboard (reads MBAA.exe file, no threading concerns)
+    keyboard.init(log.?, app_io_backend.io());
+
+    // Init ENet connection for netplay
+    if (is_netplay and nm != null) {
+        // Don't block in DllMain waiting for the peer — under Wine that
+        // appears to stall the game's main thread. Instead, ENet setup
+        // runs to completion synchronously here, but the wait-for-connect
+        // happens lazily in frameStep (see NetplayManager.connect_attempts).
+        nm.?.initEnet() catch {
+            log.?.err("ENet init failed — netplay disabled", .{});
+            is_netplay = false;
+        };
+    }
+}
+
+/// Initialize SDL2 and open controllers/gamepads. MUST be called on MBAA's
+/// main thread (i.e. from frameStep), because SDL is not thread-safe and
+/// all subsequent SDL_GameControllerGetButton / SDL_PollEvent calls happen
+/// on that thread. Called once on the first frameStep after config is
+/// received.
+fn initSdlOnMainThread() void {
+    if (sdl_init_done) return;
+    sdl_init_done = true;
+
     if (c.SDL_Init(c.SDL_INIT_GAMECONTROLLER | c.SDL_INIT_JOYSTICK) == 0) {
         sdl_initialized = true;
         reader = gamepad.GamepadReader.init(log.?);
 
         // Load custom controller mappings if available. If no mapping.ini
-        // exists, fall back to the built-in Xbox default so the buttons
-        // route correctly (MBAA A→X, B→Y, C→B, D→A) instead of using the
-        // raw joystick hardcoded mapping in GamepadReader.readJoystick.
+        // exists, fall back to the SDL_GameController API with built-in
+        // button layout (works for any XInput-compatible controller).
         //
-        // P2 is also loaded here. The GUI saves both [Player1] and
-        // [Player2] sections to mapping.ini, but historically the DLL
-        // only consumed P1. Without applying P2 here, offline Versus P2
-        // is hard-locked to neutral every frame regardless of what the
-        // user bound in the GUI.
-        //
-        // Path resolution: try the DLL's own directory first (robust
-        // against CWD mismatches), then fall back to the relative path
-        // "zzcaster/mapping.ini" (works when CWD is the MBAACC root).
+        // Path resolution: use the DLL's own directory (robust against
+        // CWD mismatches), falling back to "zzcaster/mapping.ini".
         var mapping_path_buf: [600]u8 = undefined;
         const mapping_path = resolveMappingIniPath(&mapping_path_buf) orelse "zzcaster/mapping.ini";
         log.?.info("Looking for mapping.ini at: {s}", .{mapping_path});
@@ -652,20 +678,9 @@ fn applyPostLoadHacks() void {
             log.?.info("Custom mapping loaded successfully", .{});
         } else {
             log.?.info("No custom mapping found — using GameController API with built-in button layout", .{});
-            // Don't set custom_mapping to defaultXboxMapping(). The default
-            // Xbox mapping uses raw SDL_Joystick button indices (0-9) which
-            // may not match the physical controller's layout when opened as
-            // a raw joystick. Instead, leave custom_mapping = null so
-            // GamepadReader.readInput() falls through to readGameController(),
-            // which uses the SDL_GameController API with standard button
-            // names (SDL_CONTROLLER_BUTTON_A, etc.). This works correctly
-            // for any XInput-compatible controller, including the 8BitDo.
-            //
-            // We still need p1_mapping/p2_mapping variables for the P2
-            // path below, but we won't apply p1_mapping to reader.
             p1_mapping = mapper.defaultXboxMapping();
             p2_mapping = mapper.defaultXboxMapping();
-            p2_mapping.device_index = -1; // P2 defaults to keyboard
+            p2_mapping.device_index = -1;
         }
 
         // Apply P1 mapping. ONLY set custom_mapping + open raw joystick
@@ -676,18 +691,10 @@ fn applyPostLoadHacks() void {
             reader.?.custom_mapping = p1_mapping;
             openMappedJoystick(&reader.?, p1_mapping, "P1");
         } else {
-            // No custom mapping — keep the GameController that
-            // GamepadReader.init() already opened. readGameController()
-            // will poll it with standard SDL button names.
             log.?.info("P1: using GameController API (no custom mapping)", .{});
         }
 
-        // Apply P2 mapping. Don't call GamepadReader.init() for reader2 —
-        // init() opens the first available controller/joystick which
-        // would be the same device P1 just opened (or its GameController
-        // equivalent). Instead, start from an empty reader and rely on
-        // the custom_mapping path. If P2's mapping uses a joystick, we
-        // open that specific index below.
+        // Apply P2 mapping.
         if (have_mappings or p2_mapping.device_index >= 0) {
             reader2 = gamepad.GamepadReader{};
             reader2.?.custom_mapping = p2_mapping;
@@ -697,21 +704,6 @@ fn applyPostLoadHacks() void {
         }
     } else {
         log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
-    }
-
-    // Init keyboard
-    keyboard.init(log.?, app_io_backend.io());
-
-    // Init ENet connection for netplay
-    if (is_netplay and nm != null) {
-        // Don't block in DllMain waiting for the peer — under Wine that
-        // appears to stall the game's main thread. Instead, ENet setup
-        // runs to completion synchronously here, but the wait-for-connect
-        // happens lazily in frameStep (see NetplayManager.connect_attempts).
-        nm.?.initEnet() catch {
-            log.?.err("ENet init failed — netplay disabled", .{});
-            is_netplay = false;
-        };
     }
 }
 
@@ -834,13 +826,19 @@ fn frameStep() callconv(.c) void {
         }
     }
 
+    // SDL must be initialized on MBAA's main thread (this thread). The
+    // worker thread's applyPostLoadHacks deferred SDL init to here. This
+    // runs once on the first frameStep after config is received.
+    if (config_received and !sdl_init_done) {
+        initSdlOnMainThread();
+    }
+
     // One-shot diagnostic: log the input pipeline state once, right after
-    // applyPostLoadHacks has run. This lets the user check the log to see
-    // whether the custom mapping was loaded and whether reader/reader2
-    // were allocated. If reader is null here, frameStep will fall back to
-    // keyboard.readInput() which uses MBAA's built-in config — that's the
-    // "bindings don't work" symptom.
-    if (config_received and !input_diag_logged) {
+    // SDL init has run. This lets the user check the log to see whether
+    // the custom mapping was loaded and whether reader/reader2 were
+    // allocated. If reader is null here, frameStep will fall back to
+    // keyboard.readInput() which uses MBAA's built-in config.
+    if (config_received and sdl_init_done and !input_diag_logged) {
         input_diag_logged = true;
         const base_ptr_val = @as(usize, @bitCast(ptr_to_write_input_addr[0..@sizeOf(usize)].*));
         log.?.info("InputDiag: reader={} reader2={} keyboard.init={} base_ptr=0x{x:0>8} game_mode={d} is_netplay={}", .{

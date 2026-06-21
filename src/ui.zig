@@ -6,6 +6,79 @@ const ipc = @import("ipc.zig");
 const mapper = @import("controller_mapper.zig");
 const gamepad = @import("gamepad.zig");
 
+// Win32 for GetModuleFileNameA — used to resolve mapping.ini relative to
+// the exe's own directory, matching how the DLL resolves it relative to
+// hook.dll. This ensures GUI and DLL agree on the file location.
+const win32 = struct {
+    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
+};
+
+/// Resolve the path to mapping.ini relative to the exe's own directory.
+/// zzcaster.exe is typically at `<MBAACC>/zzcaster.exe` or
+/// `<MBAACC>/zzcaster/zzcaster.exe`. The mapping.ini file should be in
+/// the same directory as hook.dll — i.e. `<MBAACC>/zzcaster/mapping.ini`.
+///
+/// To match the DLL's path resolution (which uses hook.dll's directory),
+/// we check two locations:
+///   1. `<exe_dir>/mapping.ini` (if exe is in zzcaster/ subdir)
+///   2. `<exe_dir>/zzcaster/mapping.ini` (if exe is in MBAACC root)
+///
+/// Returns a slice into the provided buffer.
+fn resolveMappingPath(buf: []u8) []const u8 {
+    var exe_path: [512]u8 = undefined;
+    const len = win32.GetModuleFileNameA(null, &exe_path, exe_path.len);
+    if (len == 0) return "zzcaster/mapping.ini";
+
+    // Find last path separator
+    var last_sep: usize = 0;
+    for (exe_path[0..len], 0..) |ch, i| {
+        if (ch == '\\' or ch == '/') last_sep = i;
+    }
+    if (last_sep == 0) return "zzcaster/mapping.ini";
+
+    const exe_dir = exe_path[0 .. last_sep + 1]; // include trailing sep
+
+    // Check if the exe directory itself is named "zzcaster" — if so,
+    // mapping.ini is in the same directory (matching hook.dll's location).
+    const dir_name = blk: {
+        const name_end = last_sep; // position of last sep
+        var name_start: usize = 0;
+        var i: usize = name_end;
+        while (i > 0) : (i -= 1) {
+            if (exe_path[i - 1] == '\\' or exe_path[i - 1] == '/') {
+                name_start = i;
+                break;
+            }
+        }
+        break :blk exe_path[name_start..name_end];
+    };
+
+    const filename = "mapping.ini";
+    if (std.mem.eql(u8, dir_name, "zzcaster")) {
+        // exe is in zzcaster/ subdir — mapping.ini is right here
+        if (exe_dir.len + filename.len + 1 <= buf.len) {
+            @memcpy(buf[0..exe_dir.len], exe_dir);
+            @memcpy(buf[exe_dir.len..exe_dir.len + filename.len], filename);
+            const total = exe_dir.len + filename.len;
+            buf[total] = 0;
+            return buf[0..total];
+        }
+    }
+
+    // exe is in MBAACC root — mapping.ini is in zzcaster/ subdir
+    const subdir = "zzcaster\\";
+    if (exe_dir.len + subdir.len + filename.len + 1 <= buf.len) {
+        @memcpy(buf[0..exe_dir.len], exe_dir);
+        @memcpy(buf[exe_dir.len..exe_dir.len + subdir.len], subdir);
+        @memcpy(buf[exe_dir.len + subdir.len .. exe_dir.len + subdir.len + filename.len], filename);
+        const total = exe_dir.len + subdir.len + filename.len;
+        buf[total] = 0;
+        return buf[0..total];
+    }
+
+    return "zzcaster/mapping.ini";
+}
+
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_opengl.h");
@@ -145,8 +218,14 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var p2_device_sel: c_int = 0;
     var bind_cooldown: u32 = 0; // frames to skip before polling (avoids click re-bind)
 
+    // Resolve mapping.ini path relative to the exe's own directory, so
+    // the GUI and DLL agree on the file location regardless of CWD.
+    var mapping_path_buf: [600]u8 = undefined;
+    const mapping_path = resolveMappingPath(&mapping_path_buf);
+    log.info("Mapping path: {s}", .{mapping_path});
+
     // Load existing mapping; default to Xbox layout on first run
-    if (mapper.loadMapping("zzcaster/mapping.ini", io, log)) |mappings| {
+    if (mapper.loadMapping(mapping_path, io, log)) |mappings| {
         p1_mapping = mappings.p1;
         p2_mapping = mappings.p2;
         p1_device_sel = if (mappings.p1.device_index >= 0) mappings.p1.device_index + 1 else 0;
@@ -384,10 +463,10 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         if (c.igButton("Save Mapping", .{ .x = 160, .y = 30 })) {
                             p1_mapping.device_index = p1_device_sel - 1;
                             p2_mapping.device_index = p2_device_sel - 1;
-                            mapper.saveMapping(p1_mapping, p2_mapping, "zzcaster/mapping.ini", io, log);
+                            mapper.saveMapping(p1_mapping, p2_mapping, mapping_path, io, log);
                         }
                         c.igSameLine(0, 8);
-                        c.igText("(saves to zzcaster/mapping.ini, loaded by hook.dll on game start)");
+                        c.igText("(loaded by hook.dll on game start)");
                     },
                 }
 

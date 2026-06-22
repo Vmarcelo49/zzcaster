@@ -1,5 +1,5 @@
 const std = @import("std");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 
 // ENet via @cImport — this is the SINGLE cimport for the whole project.
 // Other files (netplay_manager.zig, spectator_manager.zig) import

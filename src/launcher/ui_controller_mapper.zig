@@ -12,8 +12,8 @@
 // the pointers passed in. ui.zig / ui_pages.zig calls them.
 
 const std = @import("std");
-const logging = @import("logging.zig");
-const mapper = @import("controller_mapper.zig");
+const logging = @import("common").logging;
+const mapper = @import("dll").controller_mapper;
 
 const c = @cImport({
     @cInclude("SDL2/SDL.h");

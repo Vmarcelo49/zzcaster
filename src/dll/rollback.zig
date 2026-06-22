@@ -1,5 +1,5 @@
 const std = @import("std");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 const builtin = @import("builtin");
 
 // Rollback state pool — saves/restores game memory snapshots.

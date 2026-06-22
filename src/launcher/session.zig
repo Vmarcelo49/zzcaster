@@ -1,7 +1,7 @@
 const std = @import("std");
-const logging = @import("logging.zig");
-const net = @import("enet_transport.zig");
-const ip_discovery = @import("ip_discovery.zig");
+const logging = @import("common").logging;
+const net = @import("net").enet_transport;
+const ip_discovery = @import("net").ip_discovery;
 const net_util = @import("net_util.zig");
 
 // Re-use NetplayManager.NetplayConfig so the launcher and the DLL see the same

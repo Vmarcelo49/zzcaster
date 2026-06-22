@@ -11,11 +11,11 @@
 // ui_controller_mapper.zig for the actual session/launch/binding logic.
 
 const std = @import("std");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
 const launcher = @import("launcher.zig");
-const ipc = @import("ipc.zig");
-const mapper = @import("controller_mapper.zig");
+const ipc = @import("common").ipc;
+const mapper = @import("dll").controller_mapper;
 const session = @import("session.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui_controller_mapper = @import("ui_controller_mapper.zig");

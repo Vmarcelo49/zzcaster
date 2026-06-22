@@ -17,11 +17,11 @@
 // live in sibling files — see the imports below.
 
 const std = @import("std");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
 const launcher = @import("launcher.zig");
-const ipc = @import("ipc.zig");
-const mapper = @import("controller_mapper.zig");
+const ipc = @import("common").ipc;
+const mapper = @import("dll").controller_mapper;
 const session = @import("session.zig");
 
 // Split-out modules — see file headers for what each one owns.

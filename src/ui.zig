@@ -1182,6 +1182,7 @@ fn startHostSession(
     s.config.rollback = cfg.default_rollback;
     s.config.win_count = cfg.versus_win_count;
     s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
     s.lookupHostAddresses();
     np_session.* = s;
 
@@ -1223,6 +1224,7 @@ fn startJoinSession(
     s.config.rollback = cfg.default_rollback;
     s.config.win_count = cfg.versus_win_count;
     s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
     np_session.* = s;
 
     np_session.*.?.startJoin(host_part, port, false) catch |err| {
@@ -1330,6 +1332,16 @@ fn drawWaitingForPeer(
                 c.igText("%.*s connected!", @as(c_int, @intCast(remote.len)), remote.ptr);
             } else {
                 c.igText("Opponent connected!");
+            }
+            c.igSpacing();
+            // Show connection type for both players.
+            const local_ct = s.localConnectionType();
+            const remote_ct = s.remoteConnectionType();
+            if (remote_ct.len > 0) {
+                c.igText("Opponent connection: %.*s", @as(c_int, @intCast(remote_ct.len)), remote_ct.ptr);
+            }
+            if (local_ct.len > 0) {
+                c.igText("Your connection: %.*s", @as(c_int, @intCast(local_ct.len)), local_ct.ptr);
             }
             c.igSpacing();
             c.igText("Ping: avg=%.0fms  min=%.0fms  max=%.0fms", s.stats.avg_ms, s.stats.min_ms, s.stats.max_ms);
@@ -1699,6 +1711,7 @@ fn runCliNetplay(
     s.config.rollback = cfg.default_rollback;
     s.config.win_count = cfg.versus_win_count;
     s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
 
     if (peer_host == null) {
         // Host: look up public IP, listen, handshake, then auto-confirm.

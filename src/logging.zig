@@ -1,11 +1,6 @@
 const std = @import("std");
 
-// Win32 externs for thread-safe file I/O. We use these instead of
-// std.Io.File.writeStreamingAll because the Io backend may be
-// single-threaded (init_single_threaded), and using it from a different
-// thread (e.g. the session thread) causes a null pointer dereference in
-// Zig's thread-local I/O state. Win32 WriteFile is thread-safe and
-// doesn't depend on any Io handle.
+// Win32 externs for thread-safe file I/O and thread identification.
 const win32 = struct {
     extern "kernel32" fn CreateFileA(
         lpFileName: [*:0]const u8,
@@ -26,7 +21,7 @@ const win32 = struct {
     ) callconv(.winapi) i32;
 
     extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
-    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetCurrentThreadId() callconv(.winapi) u32;
 };
 
 const GENERIC_WRITE: u32 = 0x40000000;
@@ -38,24 +33,24 @@ const FILE_APPEND_DATA: u32 = 0x0004;
 pub const Logger = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    // Win32 file handle (HANDLE). Null if the log file couldn't be opened.
-    // Stored as ?*anyopaque to avoid importing Windows type defs.
     file_handle: ?*anyopaque = null,
     stdout: bool = false,
+    // Thread ID of the thread that created this Logger. Only that thread
+    // is allowed to write log entries. Other threads (e.g. the netplay
+    // session thread) silently skip logging — their log calls would crash
+    // under Wine because std.fmt / std.Io access thread-local state that
+    // doesn't exist on non-main threads.
+    main_thread_id: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Logger {
-        // Ensure directory exists using std.Io (runs on main thread — safe).
         const dir_path = std.fs.path.dirname(path) orelse ".";
         std.Io.Dir.cwd().createDirPath(io, dir_path) catch {};
 
-        // Open the log file with Win32 CreateFileA directly. This gives us
-        // a HANDLE we can use with WriteFile from any thread, without
-        // depending on the (potentially single-threaded) std.Io backend.
-        // FILE_APPEND_DATA ensures writes append to the end of the file.
         var path_buf: [512]u8 = undefined;
         const path_z = std.fmt.bufPrintZ(&path_buf, "{s}", .{path}) catch return Logger{
             .allocator = allocator,
             .io = io,
+            .main_thread_id = win32.GetCurrentThreadId(),
         };
 
         const handle = win32.CreateFileA(
@@ -72,6 +67,7 @@ pub const Logger = struct {
             .allocator = allocator,
             .io = io,
             .file_handle = handle,
+            .main_thread_id = win32.GetCurrentThreadId(),
         };
     }
 
@@ -95,6 +91,19 @@ pub const Logger = struct {
     }
 
     fn log(self: *Logger, level: []const u8, comptime fmt: []const u8, args: anytype) void {
+        // THREAD SAFETY: Only log from the thread that created this Logger.
+        // The launcher spawns a background session thread for host()/join()
+        // which calls self.log.info() throughout. Under Wine's wow64 layer,
+        // std.fmt.bufPrint and std.Io access thread-local state that only
+        // exists on the main thread, causing null pointer dereferences:
+        //   'page fault on read access to 0x00000010'
+        //   instruction: movl 0x10(%esi), %eax with ESI=0
+        // By checking the thread ID, we ensure all formatting + I/O happens
+        // only on the main thread. The session thread's log calls are
+        // silently dropped — the session's .state field communicates results
+        // to the UI thread, not the log.
+        if (win32.GetCurrentThreadId() != self.main_thread_id) return;
+
         var buf: [1024]u8 = undefined;
         const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
 
@@ -102,7 +111,6 @@ pub const Logger = struct {
         var line_buf: [1200]u8 = undefined;
         var line_len: usize = 0;
 
-        // Copy level prefix
         if (level.len + 1 <= line_buf.len - line_len) {
             @memcpy(line_buf[line_len..][0..level.len], level);
             line_len += level.len;
@@ -110,24 +118,20 @@ pub const Logger = struct {
             line_len += 1;
         }
 
-        // Copy message
         const copy_len = @min(msg.len, line_buf.len - line_len);
         @memcpy(line_buf[line_len..][0..copy_len], msg[0..copy_len]);
         line_len += copy_len;
 
-        // Newline
         if (line_len < line_buf.len) {
             line_buf[line_len] = '\n';
             line_len += 1;
         }
 
-        // Write to file using Win32 WriteFile (thread-safe, no Io handle needed).
         if (self.file_handle) |h| {
             var written: u32 = 0;
             _ = win32.WriteFile(h, line_buf[0..line_len].ptr, @intCast(line_len), &written, null);
         }
 
-        // Write to stdout if enabled.
         if (self.stdout) {
             const sout = std.Io.File.stdout();
             sout.writeStreamingAll(self.io, line_buf[0..line_len]) catch {};

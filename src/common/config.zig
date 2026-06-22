@@ -44,7 +44,40 @@ pub fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !Config {
     var buf: [4096]u8 = undefined;
     var reader = file.reader(io, &buf);
     const len = reader.interface.readSliceShort(&buf) catch return cfg;
-    var lines = std.mem.splitScalar(u8, buf[0..len], '\n');
+    parseConfig(&cfg, buf[0..len]);
+
+    // Fallback: if no display name was configured, read it from the game's own
+    // network config file (System/NetConnect.dat) — matches the legacy
+    // CCCaster behavior (MainUi.cpp:1523: _config.setString("displayName",
+    // ProcessManager::fetchGameUserName())).
+    if (cfg.display_name.len == 0) {
+        var name_buf: [64]u8 = undefined;
+        if (fetchGameUserName(io, cfg.game_dir, &name_buf)) |name| {
+            cfg.display_name = allocator.dupe(u8, name) catch &.{};
+        }
+    }
+
+    return cfg;
+}
+
+/// Parse an INI-format config string into the given Config. Pure (no I/O) so
+/// it can be unit-tested without touching the filesystem. The caller owns
+/// `cfg.display_name` — this function allocates it via `cfg.allocator` and
+/// frees any previous value first (so duplicate keys in the file replace).
+///
+/// Keys (matches saveConfig's output format):
+///   versusWinCount=<u8>        default 2
+///   defaultRollback=<u8>       default 4
+///   maxRealDelay=<u8>          default 254
+///   highCpuPriority=true|1     default true
+///   autoReplaySave=true|1      default true
+///   autoCheckUpdates=true|1    default true
+///   displayName=<string>       default "" (empty)
+/// Lines starting with '#' and blank lines are ignored. Invalid integer
+/// values fall back to the field default.
+pub fn parseConfig(cfg: *Config, content: []const u8) void {
+    const allocator = cfg.allocator;
+    var lines = std.mem.splitScalar(u8, content, '\n');
 
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r\t");
@@ -72,19 +105,6 @@ pub fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !Config {
             cfg.display_name = allocator.dupe(u8, val) catch &.{};
         }
     }
-
-    // Fallback: if no display name was configured, read it from the game's own
-    // network config file (System/NetConnect.dat) — matches the legacy
-    // CCCaster behavior (MainUi.cpp:1523: _config.setString("displayName",
-    // ProcessManager::fetchGameUserName())).
-    if (cfg.display_name.len == 0) {
-        var name_buf: [64]u8 = undefined;
-        if (fetchGameUserName(io, cfg.game_dir, &name_buf)) |name| {
-            cfg.display_name = allocator.dupe(u8, name) catch &.{};
-        }
-    }
-
-    return cfg;
 }
 
 pub fn saveConfig(cfg: *const Config, io: std.Io) !void {
@@ -146,4 +166,106 @@ pub fn fetchGameUserName(io: std.Io, game_dir: []const u8, buf: []u8) ?[]const u
         return buf[0..copy_len];
     }
     return null;
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+//
+// Run with: zig build test
+//
+// These cover parseConfig (the pure INI-parsing logic extracted from
+// loadConfig). loadConfig itself isn't tested directly because it touches the
+// filesystem — parseConfig is the testable seam.
+
+fn defaultConfig(allocator: std.mem.Allocator) Config {
+    return .{
+        .allocator = allocator,
+        .app_dir = allocator.dupe(u8, ".") catch unreachable,
+        .game_dir = allocator.dupe(u8, ".") catch unreachable,
+    };
+}
+
+test "parseConfig reads versusWinCount" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "versusWinCount=5\n");
+    try std.testing.expectEqual(@as(u8, 5), cfg.versus_win_count);
+}
+
+test "parseConfig reads displayName" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "displayName=Bob\n");
+    try std.testing.expectEqualStrings("Bob", cfg.display_name);
+}
+
+test "parseConfig reads all boolean keys with true/1" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg,
+        \\highCpuPriority=true
+        \\autoReplaySave=1
+        \\autoCheckUpdates=true
+        \\
+    );
+    try std.testing.expect(cfg.high_cpu_priority);
+    try std.testing.expect(cfg.auto_replay_save);
+    try std.testing.expect(cfg.auto_check_updates);
+}
+
+test "parseConfig ignores comments and blank lines" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg,
+        \\# this is a comment
+        \\
+        \\versusWinCount=3
+        \\   # indented comment
+        \\displayName=Alice
+        \\
+    );
+    try std.testing.expectEqual(@as(u8, 3), cfg.versus_win_count);
+    try std.testing.expectEqualStrings("Alice", cfg.display_name);
+}
+
+test "parseConfig defaults when key absent" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "# empty config\n");
+    try std.testing.expectEqual(@as(u8, 2), cfg.versus_win_count);
+    try std.testing.expectEqual(@as(u8, 4), cfg.default_rollback);
+    try std.testing.expectEqual(@as(u8, 254), cfg.max_real_delay);
+    try std.testing.expect(cfg.high_cpu_priority);
+    try std.testing.expect(cfg.auto_replay_save);
+    try std.testing.expect(cfg.auto_check_updates);
+    try std.testing.expectEqual(@as(usize, 0), cfg.display_name.len);
+}
+
+test "parseConfig invalid integer falls back to default" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "versusWinCount=notanumber\n");
+    try std.testing.expectEqual(@as(u8, 2), cfg.versus_win_count);
+}
+
+test "parseConfig duplicate key keeps last value" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "displayName=First\ndisplayName=Second\n");
+    try std.testing.expectEqualStrings("Second", cfg.display_name);
 }

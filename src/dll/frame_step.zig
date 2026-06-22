@@ -16,14 +16,13 @@
 //        - frameStepOffline   — both players' inputs read locally (no nm).
 //
 // All shared state (log, nm, reader, reader2, app_io_backend, alive_flag,
-// skip_frames, input_log_frame) lives in dllmain.zig and is reached via
-// `@import("dllmain.zig")`. Zig resolves circular imports at compile time,
-// so the back-reference is safe.
+// skip_frames, input_log_frame) lives in dll_state.zig and is reached via
+// `@import("dll_state.zig")` — one-directional, no circular import.
 const std = @import("std");
 const netman = @import("netplay_manager.zig");
 const keyboard = @import("keyboard.zig");
 const gamepad = @import("gamepad.zig");
-const dm = @import("dllmain.zig");
+const state = @import("dll_state.zig");
 
 // === In-game dispatch (called from dllmain.frameStep at end) ===
 //
@@ -33,9 +32,9 @@ const dm = @import("dllmain.zig");
 // inline `return`s from frameStep — frameStep has no code after this
 // helper returns, so exiting the helper == exiting frameStep.
 pub fn frameStepInGame(world_timer: u32, game_mode: u32) void {
-    dm.skip_frames_addr.* = 0;
+    state.skip_frames_addr.* = 0;
 
-    if (dm.nm) |*n| {
+    if (state.nm) |*n| {
         // If ENet isn't connected yet (connection setup was deferred from
         // DllMain so the main thread can keep ticking), poll for the
         // connect event here with a short timeout.
@@ -47,7 +46,7 @@ pub fn frameStepInGame(world_timer: u32, game_mode: u32) void {
         // killed the post-launch UDP path, or the peer's game crashed).
         if (!n.enet_connected and !n.connect_attempts_exhausted) {
             if (n.connect_attempts == 0) {
-                dm.log.?.info("ENet reconnecting (peer already confirmed by launcher)...", .{});
+                state.log.?.info("ENet reconnecting (peer already confirmed by launcher)...", .{});
             }
             n.connect_attempts += 1;
             n.pollAndDispatch(50);
@@ -60,11 +59,11 @@ pub fn frameStepInGame(world_timer: u32, game_mode: u32) void {
                 // only on a successful connect — so their values here are
                 // exactly what we saw across the ~15s connect window.
                 if (n.diag_connect_disconnects > 0) {
-                    dm.log.?.err("No opponent reconnected after ~15s — peer REFUSED/disconnected (disconnects={d}, stray_packets={d})", .{
+                    state.log.?.err("No opponent reconnected after ~15s — peer REFUSED/disconnected (disconnects={d}, stray_packets={d})", .{
                         n.diag_connect_disconnects, n.diag_connect_receives,
                     });
                 } else {
-                    dm.log.?.err("No opponent reconnected after ~15s — silent timeout (no CONNECT/REFUSE event; stray_packets={d})", .{
+                    state.log.?.err("No opponent reconnected after ~15s — silent timeout (no CONNECT/REFUSE event; stray_packets={d})", .{
                         n.diag_connect_receives,
                     });
                 }
@@ -103,8 +102,8 @@ fn frameStepSpectator(n: *netman.NetplayManager) void {
 
     // Check for disconnect
     if (!n.enet_connected) {
-        dm.log.?.err("Host disconnected — spectator exiting", .{});
-        dm.alive_flag_addr.* = 0;
+        state.log.?.err("Host disconnected — spectator exiting", .{});
+        state.alive_flag_addr.* = 0;
         return;
     }
 
@@ -116,7 +115,7 @@ fn frameStepSpectator(n: *netman.NetplayManager) void {
 fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // Read local input
     const raw_input: u16 = blk: {
-        if (dm.reader) |*r| {
+        if (state.reader) |*r| {
             r.update();
             if (r.hasGamepad()) break :blk r.readInput();
         }
@@ -150,24 +149,24 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     n.maybeSendSyncHash();
     n.checkSyncHashDesync();
     if (n.desync_detected) {
-        dm.log.?.err("Desync detected — force-exiting match", .{});
-        dm.alive_flag_addr.* = 0;
+        state.log.?.err("Desync detected — force-exiting match", .{});
+        state.alive_flag_addr.* = 0;
         return;
     }
 
     // Check for disconnect — only if we WERE connected and now aren't.
     if (n.was_connected and !n.enet_connected and n.config.is_netplay) {
-        dm.log.?.err("Peer disconnected during game!", .{});
-        dm.alive_flag_addr.* = 0; // force exit
+        state.log.?.err("Peer disconnected during game!", .{});
+        state.alive_flag_addr.* = 0; // force exit
         return;
     }
 
     // Heartbeat check: if no packet received in 20s, the peer is dead.
     // This catches crashes/kills that don't generate a DISCONNECT event.
     if (n.enet_connected and n.checkHeartbeat()) {
-        dm.log.?.err("Peer heartbeat timeout (20s no packets) — forcing disconnect", .{});
+        state.log.?.err("Peer heartbeat timeout (20s no packets) — forcing disconnect", .{});
         n.enet_connected = false;
-        dm.alive_flag_addr.* = 0;
+        state.alive_flag_addr.* = 0;
         return;
     }
 
@@ -201,12 +200,12 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     }
 
     if (!n.isRemoteInputReady()) {
-        const wait_start = std.Io.Clock.now(.real, dm.app_io_backend.io()).toMilliseconds();
+        const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
         var last_resend = wait_start;
         var warned = false;
         while (!n.isRemoteInputReady()) {
             n.pollAndDispatch(10);
-            const now = std.Io.Clock.now(.real, dm.app_io_backend.io()).toMilliseconds();
+            const now = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
 
             // Resend inputs every 100ms while waiting (matches
             // legacy RESEND_INPUTS_INTERVAL).
@@ -217,29 +216,29 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
             // Check for disconnect during wait
             if (n.was_connected and !n.enet_connected) {
-                dm.log.?.err("Peer disconnected while waiting for input!", .{});
-                dm.alive_flag_addr.* = 0;
+                state.log.?.err("Peer disconnected while waiting for input!", .{});
+                state.alive_flag_addr.* = 0;
                 return;
             }
 
             // Heartbeat check during wait
             if (n.enet_connected and n.checkHeartbeat()) {
-                dm.log.?.err("Peer heartbeat timeout during input wait", .{});
+                state.log.?.err("Peer heartbeat timeout during input wait", .{});
                 n.enet_connected = false;
-                dm.alive_flag_addr.* = 0;
+                state.alive_flag_addr.* = 0;
                 return;
             }
 
             // Log after 5s but keep waiting
             if (!warned and now - wait_start > 5000) {
-                dm.log.?.warn("Waiting for remote input... (5s elapsed)", .{});
+                state.log.?.warn("Waiting for remote input... (5s elapsed)", .{});
                 warned = true;
             }
 
             // TIMEOUT after 10s — force exit (matches CCCaster)
             if (now - wait_start > 10000) {
-                dm.log.?.err("Timed out waiting for remote input (10s) — forcing exit", .{});
-                dm.alive_flag_addr.* = 0;
+                state.log.?.err("Timed out waiting for remote input (10s) — forcing exit", .{});
+                state.alive_flag_addr.* = 0;
                 return;
             }
         }
@@ -247,7 +246,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     // Check rollback
     if (n.checkRollback()) {
-        dm.skip_frames_addr.* = 1;
+        state.skip_frames_addr.* = 1;
         return;
     }
 
@@ -277,7 +276,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             n.indexed_frame.index,
             n.indexed_frame.frame,
             world_timer,
-            dm.fillBothInputsCallback,
+            state.fillBothInputsCallback,
         );
     }
 }
@@ -297,21 +296,21 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 // because MBAA.exe's config table is single-player.
 fn frameStepOffline(game_mode: u32) void {
     const p1_input: u16 = blk: {
-        if (dm.reader) |*r| {
+        if (state.reader) |*r| {
             r.update();
             if (r.hasGamepad()) break :blk r.readInput();
         }
         break :blk keyboard.readInput();
     };
     const p2_input: u16 = blk: {
-        if (dm.reader2) |*r| {
+        if (state.reader2) |*r| {
             r.update();
             if (r.hasGamepad()) break :blk r.readInput();
         }
         break :blk 0;
     };
-    dm.writeInput(1, p1_input);
-    dm.writeInput(2, p2_input);
+    state.writeInput(1, p1_input);
+    state.writeInput(2, p2_input);
 
     // Periodic diagnostic: log P1/P2 input values every 300 frames
     // (~5s at 60fps). If p1_input is always 0 even when the user
@@ -320,16 +319,16 @@ fn frameStepOffline(game_mode: u32) void {
     // If p1_input is non-zero but the game still doesn't respond,
     // the issue is in writeInput (wrong base ptr, wrong offsets, or
     // MBAA's own polling clobbering our writes).
-    dm.input_log_frame +%= 1;
-    if (dm.input_log_frame % 300 == 0) {
-        dm.log.?.info("InputFrame {d}: P1=0x{x:0>4} P2=0x{x:0>4} mode={d}", .{
-            dm.input_log_frame, p1_input, p2_input, game_mode,
+    state.input_log_frame +%= 1;
+    if (state.input_log_frame % 300 == 0) {
+        state.log.?.info("InputFrame {d}: P1=0x{x:0>4} P2=0x{x:0>4} mode={d}", .{
+            state.input_log_frame, p1_input, p2_input, game_mode,
         });
     }
 }
 
 // Suppress unused-import warning for gamepad — the type is referenced
-// indirectly through `dm.reader` (which is `?gamepad.GamepadReader`), but
+// indirectly through `state.reader` (which is `?gamepad.GamepadReader`), but
 // Zig's import graph still wants to see a direct use when the module is
 // pulled in via `@import`. Keep the import alive with a comptime noop.
 comptime {

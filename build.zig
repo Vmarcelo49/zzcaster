@@ -113,6 +113,7 @@ pub fn build(b: *std.Build) void {
     exe_mod.linkSystemLibrary("wininet", .{});
     exe_mod.linkSystemLibrary("advapi32", .{});
     exe_mod.linkSystemLibrary("kernel32", .{});
+    exe_mod.linkSystemLibrary("iphlpapi", .{}); // GetAdaptersAddresses for net_util.zig
     // SDL2 MinGW import lib pulls in these Win32 APIs transitively.
     exe_mod.linkSystemLibrary("winmm", .{});
     exe_mod.linkSystemLibrary("setupapi", .{});

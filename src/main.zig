@@ -26,11 +26,17 @@ pub fn main(init: std.process.Init.Minimal) !void {
     defer _ = gpa_storage.deinit();
     const allocator = gpa_storage.allocator();
 
-    // Zig 0.16: every file/stdout operation needs an explicit Io handle. We
-    // create the single-threaded variant in the launcher to avoid spawning
-    // worker threads — the launcher is a thin UI/CLI driver that does only a
-    // handful of config/log reads and writes.
-    var io_backend: std.Io.Threaded = .init_single_threaded;
+    // Zig 0.16: every file/stdout operation needs an explicit Io handle.
+    // We MUST use the multi-threaded variant (not init_single_threaded)
+    // because the launcher spawns a background session thread (for
+    // host()/join() netplay handshake) that calls self.log.info() from
+    // a different thread. With init_single_threaded, those cross-thread
+    // log calls crash with a null pointer dereference in Zig's
+    // thread-local I/O state:
+    //   'page fault on read access to 0x00000010'
+    // The multi-threaded variant properly supports cross-thread I/O.
+    var io_backend: std.Io.Threaded = std.Io.Threaded.init(allocator, .{});
+    defer io_backend.deinit();
     const io = io_backend.io();
 
     // Parse CLI args (very minimal — just enough for non-interactive launch).

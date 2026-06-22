@@ -150,6 +150,33 @@ pub const NetplaySession = struct {
         return self.error_buf[0..self.error_len];
     }
 
+    /// Returns the remaining seconds for the current phase's timeout, or
+    /// null if the current state has no timeout. Used by the UI to show
+    /// a countdown. Approximate — based on phase_attempts / 60fps.
+    pub fn remainingSeconds(self: *const NetplaySession) ?u32 {
+        const fps: u32 = 60;
+        return switch (self.state) {
+            .listening => blk: {
+                const max: u32 = 216000; // 1 hour
+                if (self.phase_attempts >= max) break :blk 0;
+                break :blk (max - self.phase_attempts) / fps;
+            },
+            .connecting => blk: {
+                const max: u32 = 1800; // 30s
+                if (self.phase_attempts >= max) break :blk 0;
+                break :blk (max - self.phase_attempts) / fps;
+            },
+            .handshaking => blk: {
+                // Version + name + config phases all use 300 frames (5s).
+                // Config confirm (host) uses 1800 frames (30s).
+                const max: u32 = if (self.handshake_subphase == 3 and self.config.is_host) 1800 else 300;
+                if (self.phase_attempts >= max) break :blk 0;
+                break :blk (max - self.phase_attempts) / fps;
+            },
+            else => null,
+        };
+    }
+
     fn setError(self: *NetplaySession, msg: []const u8) void {
         const n = @min(msg.len, self.error_buf.len - 1);
         @memcpy(self.error_buf[0..n], msg[0..n]);
@@ -234,11 +261,10 @@ pub const NetplaySession = struct {
     }
 
     fn stepListening(self: *NetplaySession) void {
-        // 60s timeout = 600 attempts × 100ms. Since step() is called per
-        // frame (~16ms at 60fps), we increment by ~6 per real second.
-        // Use a frame-based approximation: 60s × 60fps = 3600 frames.
-        if (self.phase_attempts >= 3600) {
-            self.setError("Connection timed out (no opponent connected in 60s)");
+        // 1 hour timeout = 216000 frames at 60fps. The host may wait a long
+        // time for an opponent — 60s was too short for arranging matches.
+        if (self.phase_attempts >= 216000) {
+            self.setError("Connection timed out (no opponent connected in 1 hour)");
             self.state = .failed;
             return;
         }
@@ -256,9 +282,9 @@ pub const NetplaySession = struct {
     }
 
     fn stepConnecting(self: *NetplaySession) void {
-        // 10s timeout = 600 frames at 60fps.
-        if (self.phase_attempts >= 600) {
-            self.setError("Failed to connect to host (10s timeout)");
+        // 30s timeout = 1800 frames at 60fps.
+        if (self.phase_attempts >= 1800) {
+            self.setError("Failed to connect to host (30s timeout)");
             self.state = .failed;
             return;
         }

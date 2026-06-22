@@ -228,11 +228,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var ipc_server: ?ipc.IpcServer = null;
 
     // Netplay session (launcher-side handshake before the game opens).
-    // Owned by the UI thread; the background session thread only reads/writes
-    // fields on the NetplaySession itself (state, stats, etc.) which are
-    // single-reader/single-writer between the two threads.
+    // Runs entirely on the main thread — the UI calls session.step() each
+    // frame to drive the handshake forward. No background thread.
     var np_session: ?session.NetplaySession = null;
-    var np_thread: ?std.Thread = null;
     // Host-mode wait screen: has the user clicked "Start"?
     var host_start_clicked: bool = false;
 
@@ -365,7 +363,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         c.igSpacing();
 
                         if (c.igButton("Host Game", .{ .x = 160, .y = 36 })) {
-                            startHostSession(allocator, io, cfg, log, parsePort(&port_buf), &np_session, &np_thread);
+                            startHostSession(allocator, io, cfg, log, parsePort(&port_buf), &np_session);
                             if (np_session != null) {
                                 host_start_clicked = false;
                                 ui_state = .waiting_for_peer;
@@ -373,7 +371,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         }
                         c.igSpacing();
                         if (c.igButton("Join Game", .{ .x = 160, .y = 36 })) {
-                            startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(@as([*:0]u8, @ptrCast(&peer_buf)), 0), pipe_name, &np_session, &np_thread);
+                            startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(@as([*:0]u8, @ptrCast(&peer_buf)), 0), &np_session);
                             if (np_session != null) {
                                 ui_state = .waiting_for_peer;
                             }
@@ -552,7 +550,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
             .waiting_for_peer => {
                 drawWaitingForPeer(
                     allocator, io, cfg, log, pipe_name,
-                    &np_session, &np_thread,
+                    &np_session,
                     &win_launcher, &game_pid, &ipc_server,
                     &ui_state, &error_msg, &error_msg_len,
                     &host_start_clicked,
@@ -602,7 +600,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     }
 
     // Cleanup on quit
-    cleanupSession(&np_session, &np_thread);
+    cleanupSession(&np_session);
     cleanupGame(&win_launcher, &game_pid, &ipc_server);
 }
 
@@ -626,20 +624,14 @@ fn cleanupGame(
     game_pid.* = 0;
 }
 
-/// Tear down any in-progress netplay session (background thread + transport).
-/// Called when leaving the waiting_for_peer screen (cancel, success, or quit).
+/// Tear down any in-progress netplay session. Since the session now runs
+/// entirely on the main thread (no background thread), this just cancels
+/// + deinits the session. Safe to call at any point.
 fn cleanupSession(
     np_session: *?session.NetplaySession,
-    np_thread: *?std.Thread,
 ) void {
     if (np_session.*) |*s| {
-        s.cancel(); // signals the background thread + closes transport
-    }
-    if (np_thread.*) |t| {
-        t.join();
-        np_thread.* = null;
-    }
-    if (np_session.*) |*s| {
+        s.cancel();
         s.deinit();
     }
     np_session.* = null;
@@ -1168,35 +1160,8 @@ fn launchNetplayImpl(
 // Netplay session (launcher-side handshake before the game opens)
 // ============================================================================
 
-const SessionThreadCtx = struct {
-    s: *session.NetplaySession,
-    port: u16,
-    training: bool,
-    is_host: bool,
-    peer_addr: ?[]const u8 = null, // only for join
-};
-
-/// Background thread entry point: runs the blocking host()/join() call.
-/// The NetplaySession's state field is the communication channel back to
-/// the UI thread.
-fn sessionThreadMain(ctx: SessionThreadCtx) void {
-    if (ctx.is_host) {
-        ctx.s.host(ctx.port, ctx.training) catch |err| {
-            if (err != error.Cancelled) {
-                ctx.s.log.warn("host() failed: {s}", .{@errorName(err)});
-            }
-        };
-    } else {
-        const addr = ctx.peer_addr orelse return;
-        ctx.s.join(addr, ctx.port, ctx.training) catch |err| {
-            if (err != error.Cancelled) {
-                ctx.s.log.warn("join() failed: {s}", .{@errorName(err)});
-            }
-        };
-    }
-}
-
-/// Start the host-side handshake session in a background thread.
+/// Start the host-side handshake session. Runs on the main thread — the UI
+/// calls session.step() each frame to drive the handshake forward.
 fn startHostSession(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1204,50 +1169,40 @@ fn startHostSession(
     log: *logging.Logger,
     port: u16,
     np_session: *?session.NetplaySession,
-    np_thread: *?std.Thread,
 ) void {
-    // Tear down any previous session first.
-    cleanupSession(np_session, np_thread);
+    cleanupSession(np_session);
 
     var s = session.NetplaySession.init(allocator, io, log);
     s.config.rollback = cfg.default_rollback;
     s.config.win_count = cfg.versus_win_count;
     s.setLocalName(cfg.display_name);
-    // Look up public + local IPs for the host display screen. Synchronous but
-    // fast (wininet uses system timeout).
     s.lookupHostAddresses();
     np_session.* = s;
 
-    const ctx = SessionThreadCtx{
-        .s = &np_session.*.?,
-        .port = port,
-        .training = false,
-        .is_host = true,
+    np_session.*.?.startHost(port, false) catch |err| {
+        log.err("startHost failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
     };
-    np_thread.* = std.Thread.spawn(.{}, sessionThreadMain, .{ctx}) catch null;
     log.info("Host session started on port {d} (pub={s} local={s} name='{s}')", .{
         port,
-        s.publicIp() orelse "?",
-        s.localIp() orelse "?",
-        s.localName(),
+        np_session.*.?.publicIp() orelse "?",
+        np_session.*.?.localIp() orelse "?",
+        np_session.*.?.localName(),
     });
 }
 
-/// Start the client-side handshake session in a background thread.
+/// Start the client-side handshake session. Runs on the main thread.
 fn startJoinSession(
     allocator: std.mem.Allocator,
     io: std.Io,
     cfg: *config.Config,
     log: *logging.Logger,
     addr_str: []const u8,
-    pipe_name: []const u8,
     np_session: *?session.NetplaySession,
-    np_thread: *?std.Thread,
 ) void {
-    _ = pipe_name;
-    cleanupSession(np_session, np_thread);
+    cleanupSession(np_session);
 
-    // Validate ip:port format up front.
     const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse {
         log.err("Invalid address (no colon): {s}", .{addr_str});
         return;
@@ -1256,14 +1211,7 @@ fn startJoinSession(
         log.err("Invalid port in: {s}", .{addr_str});
         return;
     };
-    // Copy the host part into a stable buffer the thread can outlive the
-    // stack frame that holds addr_str. The session also stores it in
-    // config.peer_addr, but we need a separate owned slice for the thread ctx.
     const host_part = addr_str[0..colon];
-    const host_owned = allocator.dupe(u8, host_part) catch {
-        log.err("OOM duplicating host addr", .{});
-        return;
-    };
 
     var s = session.NetplaySession.init(allocator, io, log);
     s.config.rollback = cfg.default_rollback;
@@ -1271,22 +1219,16 @@ fn startJoinSession(
     s.setLocalName(cfg.display_name);
     np_session.* = s;
 
-    const ctx = SessionThreadCtx{
-        .s = &np_session.*.?,
-        .port = port,
-        .training = false,
-        .is_host = false,
-        .peer_addr = host_owned,
+    np_session.*.?.startJoin(host_part, port, false) catch |err| {
+        log.err("startJoin failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
     };
-    np_thread.* = std.Thread.spawn(.{}, sessionThreadMain, .{ctx}) catch blk: {
-        allocator.free(host_owned);
-        break :blk null;
-    };
-    log.info("Join session started -> {s}:{d} (name='{s}')", .{ host_part, port, s.localName() });
+    log.info("Join session started -> {s}:{d} (name='{s}')", .{ host_part, port, np_session.*.?.localName() });
 }
 
-/// Draw the waiting-for-peer screen. Polls the session state each frame and
-/// either shows progress, a confirmation prompt, or transitions to the game.
+/// Draw the waiting-for-peer screen. Calls session.step() each frame to
+/// drive the handshake forward, then shows progress / confirmation / launch.
 fn drawWaitingForPeer(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -1294,7 +1236,6 @@ fn drawWaitingForPeer(
     log: *logging.Logger,
     pipe_name: []const u8,
     np_session: *?session.NetplaySession,
-    np_thread: *?std.Thread,
     win_launcher: *?launcher.WindowsLauncher,
     game_pid: *u32,
     ipc_server: *?ipc.IpcServer,
@@ -1303,14 +1244,16 @@ fn drawWaitingForPeer(
     error_msg_len: *usize,
     host_start_clicked: *bool,
 ) void {
-    // Take a mutable pointer directly into the optional storage so we can
-    // call mutating methods (hostConfirm) and read live state updated by the
-    // background thread.
     if (np_session.* == null) {
         ui_state.* = .idle;
         return;
     }
     const s = &np_session.*.?;
+
+    // Drive the handshake forward by one step each frame. This is non-blocking
+    // (ENet poll timeout=0) and runs entirely on the main thread.
+    s.step();
+
     const is_host = s.config.is_host;
 
     c.igText("%s", @as([*:0]const u8, @ptrCast(if (is_host) "Hosting — waiting for opponent" else "Connecting to host")));
@@ -1353,7 +1296,7 @@ fn drawWaitingForPeer(
             c.igSeparator();
             c.igSpacing();
             if (c.igButton("Cancel", .{ .x = 120, .y = 30 })) {
-                cleanupSession(np_session, np_thread);
+                cleanupSession(np_session);
                 ui_state.* = .idle;
             }
         },
@@ -1378,7 +1321,7 @@ fn drawWaitingForPeer(
             }
             c.igSameLine(0, 16);
             if (c.igButton("Cancel", .{ .x = 120, .y = 36 })) {
-                cleanupSession(np_session, np_thread);
+                cleanupSession(np_session);
                 ui_state.* = .idle;
             }
         },
@@ -1389,7 +1332,7 @@ fn drawWaitingForPeer(
             // client it's reached right after waitForConfig().
             launchGameAfterHandshake(
                 allocator, io, cfg, log, pipe_name,
-                np_session, np_thread,
+                np_session,
                 win_launcher, game_pid, ipc_server,
                 error_msg, error_msg_len,
             );
@@ -1404,7 +1347,7 @@ fn drawWaitingForPeer(
             c.igText("Session completed.");
             c.igSpacing();
             if (c.igButton("OK", .{ .x = 120, .y = 30 })) {
-                cleanupSession(np_session, np_thread);
+                cleanupSession(np_session);
                 ui_state.* = .idle;
             }
         },
@@ -1412,12 +1355,12 @@ fn drawWaitingForPeer(
         .failed => {
             const msg = s.errorMessage();
             setErr(error_msg, error_msg_len, if (msg.len > 0) msg else "Connection failed");
-            cleanupSession(np_session, np_thread);
+            cleanupSession(np_session);
             ui_state.* = .error_state;
         },
 
         .cancelled => {
-            cleanupSession(np_session, np_thread);
+            cleanupSession(np_session);
             ui_state.* = .idle;
         },
     }
@@ -1446,7 +1389,6 @@ fn launchGameAfterHandshake(
     log: *logging.Logger,
     pipe_name: []const u8,
     np_session: *?session.NetplaySession,
-    np_thread: *?std.Thread,
     win_launcher: *?launcher.WindowsLauncher,
     game_pid: *u32,
     ipc_server: *?ipc.IpcServer,
@@ -1467,12 +1409,8 @@ fn launchGameAfterHandshake(
     const host_player = snap.host_player;
     var peer_addr: [64]u8 = snap.peer_addr;
 
-    // Join the session thread (it has finished its work by now — state is
-    // .launching) and tear down the transport so the OS frees the UDP port.
-    if (np_thread.*) |t| {
-        t.join();
-        np_thread.* = null;
-    }
+    // Tear down the transport so the OS frees the UDP port. No thread to
+    // join — the session runs on the main thread.
     if (np_session.*) |*s| {
         s.deinit();
     }
@@ -1709,12 +1647,21 @@ fn runCliNetplay(
     if (peer_host == null) {
         // Host: look up public IP, listen, handshake, then auto-confirm.
         s.lookupHostAddresses();
-        try s.host(port, false);
-        // host() leaves us in waiting_confirmation — auto-confirm like the
-        // legacy --dummy path does.
-        s.hostConfirm();
+        try s.startHost(port, false);
     } else {
-        try s.join(peer_host.?, port, false);
+        try s.startJoin(peer_host.?, port, false);
+    }
+
+    // Run the handshake on the main thread. step() is non-blocking, so we
+    // sleep ~16ms between steps to approximate 60fps. The handshake will
+    // complete in a few seconds (or time out / fail).
+    while (s.state != .launching and s.state != .failed and s.state != .cancelled) {
+        s.step();
+        if (s.state == .waiting_confirmation) {
+            // CLI host mode: auto-confirm like the legacy --dummy path.
+            s.hostConfirm();
+        }
+        std.Io.sleep(io, .{ .nanoseconds = 16 * std.time.ns_per_ms }, .real) catch {};
     }
 
     if (s.state != .launching) {

@@ -3,10 +3,7 @@ const logging = @import("logging.zig");
 const net = @import("net.zig");
 
 // Re-use NetplayManager.NetplayConfig so the launcher and the DLL see the same
-// struct layout (avoids drift when new fields are added). We don't import the
-// whole netplay_manager module (it pulls in game memory addresses etc.) — we
-// just re-declare a struct here that mirrors it byte-for-byte for the fields
-// the DLL's IPC config parser reads.
+// struct layout (avoids drift when new fields are added).
 //
 // Fields kept in sync with src/netplay_manager.zig:NetplayConfig.
 pub const NetplayConfig = struct {
@@ -24,11 +21,6 @@ pub const NetplayConfig = struct {
     peer_port: u16 = 0,
     is_netplay: bool = false,
     spectator_listen_port: u16 = 0,
-    // Player display names exchanged during the handshake. Null-terminated
-    // fixed-size buffers (31 chars + null) so they don't need allocation and
-    // can be read directly by the UI thread. The game itself does NOT receive
-    // these — MBAA reads its own name from System/NetConnect.dat. These are
-    // launcher-side display only (connection screen + logs).
     local_name: [32]u8 = [_]u8{0} ** 32,
     remote_name: [32]u8 = [_]u8{0} ** 32,
 };
@@ -39,8 +31,8 @@ pub const SessionState = enum {
     connecting,
     handshaking,
     ping_exchanging,
-    waiting_confirmation, // host: handshake done, waiting for user to click "Start"
-    launching, // user confirmed (or auto-confirmed) — about to open the game
+    waiting_confirmation,
+    launching,
     completed,
     failed,
     cancelled,
@@ -54,17 +46,19 @@ pub const PingStats = struct {
     packet_loss: u8 = 0,
 };
 
-/// Handshake protocol message tags (1-byte prefix). Matches the legacy
-/// CCCaster Protocol.cpp byte layout where applicable; we keep it minimal but
-/// compatible with the existing EnetTransport message framing.
 const Msg = enum(u8) {
     version = 1,
     config = 2,
     confirm = 3,
     ping = 4,
-    name = 6, // player display name exchange
+    name = 6,
 };
 
+/// NetplaySession runs entirely on the main thread. The UI calls step() once
+/// per frame; step() does one non-blocking ENet poll (timeout=0) and advances
+/// the internal handshake state machine by one iteration. This avoids all
+/// cross-thread std.Io issues — no background thread, no thread-local state,
+/// no races.
 pub const NetplaySession = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -75,33 +69,28 @@ pub const NetplaySession = struct {
     stats: PingStats = .{},
     local_version: []const u8 = "4.0-zig",
 
-    // Address of the remote peer as actually connected (host:port string for
-    // display; populated once the CONNECT event fires).
     peer_address_buf: [80]u8 = [_]u8{0} ** 80,
     peer_address_len: usize = 0,
 
-    // Host-screen display IPs — looked up by the launcher when the user clicks
-    // "Host Game", stored here so drawWaitingForPeer can read them without
-    // extra plumbing.
     public_ip_buf: [64]u8 = [_]u8{0} ** 64,
     public_ip_len: usize = 0,
     local_ip_buf: [64]u8 = [_]u8{0} ** 64,
     local_ip_len: usize = 0,
 
-    // Cancellation flag — set by cancel(), polled by the host/join loops.
-    // Atomic-free volatile read/write is fine here: there's exactly one writer
-    // (the UI thread) and one reader (the session thread), and a missed wake
-    // just means one more 100ms poll iteration.
-    cancel_requested: std.atomic.Value(bool) = .init(false),
-
-    // Host-only: set true when the UI tells us to proceed after
-    // waiting_confirmation. hostConfirm() sends the final ConfirmConfig and
-    // moves state to launching.
+    cancel_requested: bool = false,
     host_confirmed: bool = false,
 
-    // Error message buffer for failed states (displayed by the UI).
     error_buf: [128]u8 = [_]u8{0} ** 128,
     error_len: usize = 0,
+
+    // --- Internal sub-state for the step-based handshake state machine ---
+    // Each handshake phase tracks its own attempt counter + timeout.
+    // The UI calls step() every frame; step() dispatches based on `state`.
+    phase_attempts: u32 = 0,
+    ping_index: u32 = 0,
+    ping_start_ms: i64 = 0,
+    ping_waited: u32 = 0,
+    handshake_subphase: u8 = 0, // 0=version, 1=names, 2=pings, 3=config
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, log: *logging.Logger) NetplaySession {
         return .{
@@ -116,21 +105,8 @@ pub const NetplaySession = struct {
         self.transport.deinit();
     }
 
-    /// User-facing: abort the in-progress host()/join(). Safe to call from
-    /// the UI thread while the session thread is blocked inside host()/join().
-    ///
-    /// This only sets the cancel flag — it does NOT tear down the transport.
-    /// The session thread checks cancel_requested every poll iteration (at
-    /// most 100ms apart) and breaks out of its loop. The transport is then
-    /// safely torn down by deinit() AFTER the thread has joined (see
-    /// cleanupSession in ui.zig).
-    ///
-    /// Calling transport.deinit() here would destroy the ENet host while
-    /// the session thread is still inside enet_host_service() — a
-    /// use-after-free that crashes Wine with a null pointer dereference
-    /// (issue: "cancel hosting crashes caster").
     pub fn cancel(self: *NetplaySession) void {
-        self.cancel_requested.store(true, .release);
+        self.cancel_requested = true;
     }
 
     pub fn peerAddress(self: *const NetplaySession) []const u8 {
@@ -147,8 +123,6 @@ pub const NetplaySession = struct {
         return self.local_ip_buf[0..self.local_ip_len];
     }
 
-    /// Look up public + local IPs and stash them in the session buffers.
-    /// Called by the launcher when the user clicks "Host Game".
     pub fn lookupHostAddresses(self: *NetplaySession) void {
         if (net.getPublicIp(&self.public_ip_buf)) |ip| {
             self.public_ip_len = ip.len;
@@ -158,20 +132,16 @@ pub const NetplaySession = struct {
         }
     }
 
-    /// Set the local display name (truncated to 31 chars + null). Called by
-    /// the launcher before host()/join() so the handshake can exchange it.
     pub fn setLocalName(self: *NetplaySession, name: []const u8) void {
         const copy_len = @min(name.len, self.config.local_name.len - 1);
         @memcpy(self.config.local_name[0..copy_len], name[0..copy_len]);
         self.config.local_name[copy_len] = 0;
     }
 
-    /// Null-terminated local name slice (empty if unset).
     pub fn localName(self: *const NetplaySession) []const u8 {
         return std.mem.sliceTo(&self.config.local_name, 0);
     }
 
-    /// Null-terminated remote name slice (empty until the handshake exchanges it).
     pub fn remoteName(self: *const NetplaySession) []const u8 {
         return std.mem.sliceTo(&self.config.remote_name, 0);
     }
@@ -187,10 +157,12 @@ pub const NetplaySession = struct {
         self.error_len = n;
     }
 
-    /// Host entry point: listen on `port`, run the full handshake, then block
-    /// in waiting_confirmation until hostConfirm() is called (or the session
-    /// is cancelled / peer disconnects).
-    pub fn host(self: *NetplaySession, port: u16, training: bool) !void {
+    // ====================================================================
+    // Host / Join entry points — set up the session, then the UI calls
+    // step() each frame to drive the handshake forward.
+    // ====================================================================
+
+    pub fn startHost(self: *NetplaySession, port: u16, training: bool) !void {
         self.config.is_host = true;
         self.config.is_training = training;
         self.config.is_netplay = true;
@@ -199,122 +171,100 @@ pub const NetplaySession = struct {
         self.config.remote_player = 2;
         self.config.peer_port = port;
         self.state = .listening;
+        self.phase_attempts = 0;
         try self.transport.listen(port, self.log);
-
-        // Wait for the client's CONNECT (60s timeout, cancellable).
         self.log.info("Waiting for opponent to connect on port {d}...", .{port});
-        var attempts: u32 = 0;
-        while (attempts < 600 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
-            if (self.transport.poll(100)) |event| {
-                if (event == .connected) {
-                    self.log.info("Opponent connected!", .{});
-                    self.recordPeerAddress();
-                    try self.doHandshake();
-                    return;
-                }
-            }
-        }
-        if (self.cancel_requested.load(.acquire)) {
-            self.state = .cancelled;
-            return error.Cancelled;
-        }
-        self.setError("Connection timed out (no opponent connected in 60s)");
-        self.state = .failed;
-        return error.Timeout;
     }
 
-    /// Client entry point: connect to host_str:port, run the handshake, and
-    /// transition straight to launching (the client auto-confirms — only the
-    /// host gatekeeps via waiting_confirmation).
-    pub fn join(self: *NetplaySession, host_str: []const u8, port: u16, training: bool) !void {
+    pub fn startJoin(self: *NetplaySession, host_str: []const u8, port: u16, training: bool) !void {
         self.config.is_host = false;
         self.config.is_training = training;
         self.config.is_netplay = true;
-        self.config.host_player = 1; // host is always player 1
-        self.config.local_player = 2; // we are player 2
+        self.config.host_player = 1;
+        self.config.local_player = 2;
         self.config.remote_player = 1;
         self.config.peer_port = port;
-        // Stash the peer address for the DLL (which will reconnect to it).
         const addr_copy_len = @min(host_str.len, self.config.peer_addr.len);
         @memcpy(self.config.peer_addr[0..addr_copy_len], host_str[0..addr_copy_len]);
-
         self.state = .connecting;
+        self.phase_attempts = 0;
         try self.transport.connect(host_str, port, self.log);
+    }
 
-        // Wait for CONNECT event (10s timeout, cancellable).
-        var attempts: u32 = 0;
-        while (attempts < 100 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
-            if (self.transport.poll(100)) |event| {
-                if (event == .connected) {
-                    self.log.info("Connected to host!", .{});
-                    self.recordPeerAddress();
-                    try self.doHandshake();
-                    return;
-                }
+    // ====================================================================
+    // step() — called once per UI frame. Does one non-blocking ENet poll
+    // and advances the handshake state machine. Returns when the state
+    // changes (or after one poll iteration if still in progress).
+    // ====================================================================
+
+    pub fn step(self: *NetplaySession) void {
+        if (self.cancel_requested) {
+            if (self.state != .launching and self.state != .failed and self.state != .cancelled) {
+                self.state = .cancelled;
+            }
+            return;
+        }
+
+        switch (self.state) {
+            .idle, .launching, .completed, .failed, .cancelled, .waiting_confirmation => return,
+
+            .listening => self.stepListening(),
+            .connecting => self.stepConnecting(),
+            .handshaking => self.stepHandshaking(),
+            .ping_exchanging => self.stepPingExchanging(),
+        }
+    }
+
+    fn stepListening(self: *NetplaySession) void {
+        // 60s timeout = 600 attempts × 100ms. Since step() is called per
+        // frame (~16ms at 60fps), we increment by ~6 per real second.
+        // Use a frame-based approximation: 60s × 60fps = 3600 frames.
+        if (self.phase_attempts >= 3600) {
+            self.setError("Connection timed out (no opponent connected in 60s)");
+            self.state = .failed;
+            return;
+        }
+        self.phase_attempts += 1;
+
+        if (self.transport.poll(0)) |event| {
+            if (event == .connected) {
+                self.log.info("Opponent connected!", .{});
+                self.recordPeerAddress();
+                self.state = .handshaking;
+                self.phase_attempts = 0;
+                self.startVersionExchange();
             }
         }
-        if (self.cancel_requested.load(.acquire)) {
-            self.state = .cancelled;
-            return error.Cancelled;
-        }
-        self.setError("Failed to connect to host (10s timeout)");
-        self.state = .failed;
-        return error.Timeout;
     }
 
-    fn recordPeerAddress(self: *NetplaySession) void {
-        // For display purposes only.
-        const is_host = self.config.is_host;
-        const label = if (is_host) "connected-client" else "host";
-        const printed = std.fmt.bufPrint(
-            &self.peer_address_buf,
-            "{s}",
-            .{label},
-        ) catch return;
-        self.peer_address_len = printed.len;
-    }
-
-    fn doHandshake(self: *NetplaySession) !void {
-        self.state = .handshaking;
-
-        // 1. Exchange version strings (strict — bail on mismatch).
-        try self.exchangeVersion();
-        if (self.cancel_requested.load(.acquire)) {
-            self.state = .cancelled;
-            return error.Cancelled;
+    fn stepConnecting(self: *NetplaySession) void {
+        // 10s timeout = 600 frames at 60fps.
+        if (self.phase_attempts >= 600) {
+            self.setError("Failed to connect to host (10s timeout)");
+            self.state = .failed;
+            return;
         }
+        self.phase_attempts += 1;
 
-        // 2. Exchange display names (for the connection screen + logs).
-        try self.exchangeNames();
-        if (self.cancel_requested.load(.acquire)) {
-            self.state = .cancelled;
-            return error.Cancelled;
-        }
-
-        // 3. Exchange ping stats (drives auto input-delay).
-        self.state = .ping_exchanging;
-        try self.exchangePings();
-        if (self.cancel_requested.load(.acquire)) {
-            self.state = .cancelled;
-            return error.Cancelled;
-        }
-
-        // 4. Host sends config (with auto delay), client confirms.
-        if (self.config.is_host) {
-            try self.sendConfig();
-            // Host now waits for the user to confirm before launching.
-            // The UI thread will call hostConfirm() when the user clicks "Start".
-            self.state = .waiting_confirmation;
-            self.log.info("Handshake complete — waiting for host to confirm start", .{});
-        } else {
-            try self.waitForConfig();
-            // Client is ready to launch.
-            self.state = .launching;
-            self.log.info("Handshake complete — ready to launch", .{});
+        if (self.transport.poll(0)) |event| {
+            if (event == .connected) {
+                self.log.info("Connected to host!", .{});
+                self.recordPeerAddress();
+                self.state = .handshaking;
+                self.phase_attempts = 0;
+                self.startVersionExchange();
+            }
         }
     }
 
-    fn exchangeVersion(self: *NetplaySession) !void {
+    // --- Handshake sub-phases ---
+    // We use a single `handshaking` state with an internal sub-phase tracker
+    // stored in `handshake_subphase` (declared with the other fields above).
+    // This keeps the public SessionState enum simple while allowing multi-step
+    // handshake progression.
+
+    fn startVersionExchange(self: *NetplaySession) void {
+        self.handshake_subphase = 0;
         // Send our version: [1=version][len byte][version bytes]
         var ver_buf: [128]u8 = undefined;
         ver_buf[0] = @intFromEnum(Msg.version);
@@ -323,41 +273,56 @@ pub const NetplaySession = struct {
         @memcpy(ver_buf[2 .. 2 + ver_len], self.local_version[0..ver_len]);
         _ = self.transport.sendReliable(ver_buf[0 .. 2 + ver_len]);
         self.log.info("Sent version: {s}", .{self.local_version});
-
-        // Wait for peer's version.
-        var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
-            if (self.transport.poll(100)) |event| {
-                if (event == .message_received) {
-                    const msg = self.transport.getLastMessage();
-                    if (msg.len >= 2 and msg[0] == @intFromEnum(Msg.version)) {
-                        const peer_ver_len: usize = @min(msg[1], msg.len - 2);
-                        const peer_ver = msg[2 .. 2 + peer_ver_len];
-                        self.log.info("Peer version: {s}", .{peer_ver});
-                        // Strict version check.
-                        if (!std.mem.eql(u8, peer_ver, self.local_version)) {
-                            const err_msg = std.fmt.bufPrint(&self.error_buf, "Version mismatch: local={s} remote={s}", .{ self.local_version, peer_ver }) catch "Version mismatch";
-                            self.error_len = err_msg.len;
-                            self.state = .failed;
-                            return error.VersionMismatch;
-                        }
-                        return;
-                    }
-                }
-                if (event == .disconnected) {
-                    self.setError("Peer disconnected during handshake");
-                    self.state = .failed;
-                    return error.Disconnected;
-                }
-            }
-        }
-        self.setError("Version exchange timed out");
-        self.state = .failed;
-        return error.Timeout;
+        self.phase_attempts = 0;
     }
 
-    fn exchangeNames(self: *NetplaySession) !void {
-        // Send our name: [6=name][len byte][name bytes]
+    fn stepHandshaking(self: *NetplaySession) void {
+        switch (self.handshake_subphase) {
+            0 => self.stepExchangeVersion(),
+            1 => self.stepExchangeNames(),
+            // Subphase 2 (pings) uses the .ping_exchanging state, not
+            // .handshaking — see stepPingExchanging() below.
+            3 => self.stepExchangeConfig(),
+            else => self.state = .failed,
+        }
+    }
+
+    fn stepExchangeVersion(self: *NetplaySession) void {
+        // 5s timeout = 300 frames.
+        if (self.phase_attempts >= 300) {
+            self.setError("Version exchange timed out");
+            self.state = .failed;
+            return;
+        }
+        self.phase_attempts += 1;
+
+        if (self.transport.poll(0)) |event| {
+            if (event == .message_received) {
+                const msg = self.transport.getLastMessage();
+                if (msg.len >= 2 and msg[0] == @intFromEnum(Msg.version)) {
+                    const peer_ver_len: usize = @min(msg[1], msg.len - 2);
+                    const peer_ver = msg[2 .. 2 + peer_ver_len];
+                    self.log.info("Peer version: {s}", .{peer_ver});
+                    if (!std.mem.eql(u8, peer_ver, self.local_version)) {
+                        const err_msg = std.fmt.bufPrint(&self.error_buf, "Version mismatch: local={s} remote={s}", .{ self.local_version, peer_ver }) catch "Version mismatch";
+                        self.error_len = err_msg.len;
+                        self.state = .failed;
+                        return;
+                    }
+                    // Move to name exchange.
+                    self.handshake_subphase = 1;
+                    self.phase_attempts = 0;
+                    self.startNameExchange();
+                }
+            }
+            if (event == .disconnected) {
+                self.setError("Peer disconnected during handshake");
+                self.state = .failed;
+            }
+        }
+    }
+
+    fn startNameExchange(self: *NetplaySession) void {
         const local = self.localName();
         var name_buf: [34]u8 = undefined;
         name_buf[0] = @intFromEnum(Msg.name);
@@ -366,107 +331,123 @@ pub const NetplaySession = struct {
         @memcpy(name_buf[2 .. 2 + name_len], local[0..name_len]);
         _ = self.transport.sendReliable(name_buf[0 .. 2 + name_len]);
         self.log.info("Sent display name: '{s}'", .{local});
-
-        // Wait for peer's name.
-        var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
-            if (self.transport.poll(100)) |event| {
-                if (event == .message_received) {
-                    const msg = self.transport.getLastMessage();
-                    if (msg.len >= 2 and msg[0] == @intFromEnum(Msg.name)) {
-                        const peer_name_len: usize = @min(msg[1], msg.len - 2);
-                        const peer_name = msg[2 .. 2 + peer_name_len];
-                        const copy_len = @min(peer_name.len, self.config.remote_name.len - 1);
-                        @memcpy(self.config.remote_name[0..copy_len], peer_name[0..copy_len]);
-                        self.config.remote_name[copy_len] = 0;
-                        self.log.info("Peer display name: '{s}'", .{self.remoteName()});
-                        return;
-                    }
-                    // Ignore other message types here — they'll be handled in
-                    // their own exchange phase.
-                }
-                if (event == .disconnected) {
-                    self.setError("Peer disconnected during name exchange");
-                    self.state = .failed;
-                    return error.Disconnected;
-                }
-            }
-        }
-        // Name exchange is best-effort: if the peer didn't send one, leave
-        // remote_name empty and continue (we still know they connected).
-        self.log.warn("Name exchange timed out — continuing with empty remote name", .{});
     }
 
-    fn exchangePings(self: *NetplaySession) !void {
-        // Send N ping packets and measure RTT.
-        const num_pings: u32 = 5;
-        var i: u32 = 0;
-        while (i < num_pings and !self.cancel_requested.load(.acquire)) : (i += 1) {
-            const start = std.Io.Clock.now(.real, self.io).toMilliseconds();
-            var ping_msg: [9]u8 = undefined;
-            ping_msg[0] = @intFromEnum(Msg.ping);
-            std.mem.writeInt(u64, ping_msg[1..9], @intCast(start), .little);
-            _ = self.transport.sendReliable(&ping_msg);
+    fn stepExchangeNames(self: *NetplaySession) void {
+        // 5s timeout = 300 frames. Name exchange is best-effort.
+        if (self.phase_attempts >= 300) {
+            self.log.warn("Name exchange timed out — continuing with empty remote name", .{});
+            self.handshake_subphase = 2;
+            self.phase_attempts = 0;
+            self.startPingExchange();
+            return;
+        }
+        self.phase_attempts += 1;
 
-            // Wait for pong (echo of the same packet).
-            var waited: u32 = 0;
-            while (waited < 50 and !self.cancel_requested.load(.acquire)) : (waited += 1) {
-                if (self.transport.poll(10)) |event| {
-                    if (event == .message_received) {
-                        const msg = self.transport.getLastMessage();
-                        if (msg.len >= 9 and msg[0] == @intFromEnum(Msg.ping)) {
-                            const rtt = std.Io.Clock.now(.real, self.io).toMilliseconds() - start;
-                            self.stats.count += 1;
-                            const c = @as(f64, @floatFromInt(self.stats.count));
-                            const r = @as(f64, @floatFromInt(rtt));
-                            self.stats.avg_ms = (self.stats.avg_ms * (c - 1) + r) / c;
-                            if (self.stats.min_ms == 0 or r < self.stats.min_ms) self.stats.min_ms = r;
-                            if (r > self.stats.max_ms) self.stats.max_ms = r;
-                            break;
-                        }
-                        // Echo any stray ping the peer sent.
-                        if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.ping)) {
-                            _ = self.transport.sendReliable(msg);
-                        }
-                    }
-                    if (event == .disconnected) {
-                        self.setError("Peer disconnected during ping exchange");
-                        self.state = .failed;
-                        return error.Disconnected;
-                    }
+        if (self.transport.poll(0)) |event| {
+            if (event == .message_received) {
+                const msg = self.transport.getLastMessage();
+                if (msg.len >= 2 and msg[0] == @intFromEnum(Msg.name)) {
+                    const peer_name_len: usize = @min(msg[1], msg.len - 2);
+                    const peer_name = msg[2 .. 2 + peer_name_len];
+                    const copy_len = @min(peer_name.len, self.config.remote_name.len - 1);
+                    @memcpy(self.config.remote_name[0..copy_len], peer_name[0..copy_len]);
+                    self.config.remote_name[copy_len] = 0;
+                    self.log.info("Peer display name: '{s}'", .{self.remoteName()});
+                    self.handshake_subphase = 2;
+                    self.phase_attempts = 0;
+                    self.startPingExchange();
                 }
             }
+            if (event == .disconnected) {
+                self.setError("Peer disconnected during name exchange");
+                self.state = .failed;
+            }
         }
+    }
 
-        // Echo any trailing pings the peer has queued.
-        var extra: u32 = 0;
-        while (extra < 10) : (extra += 1) {
-            if (self.transport.poll(10)) |event| {
-                if (event == .message_received) {
-                    const msg = self.transport.getLastMessage();
-                    if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.ping)) {
-                        _ = self.transport.sendReliable(msg);
+    fn startPingExchange(self: *NetplaySession) void {
+        self.state = .ping_exchanging;
+        self.ping_index = 0;
+        self.ping_waited = 0;
+        self.sendOnePing();
+    }
+
+    fn sendOnePing(self: *NetplaySession) void {
+        self.ping_start_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        var ping_msg: [9]u8 = undefined;
+        ping_msg[0] = @intFromEnum(Msg.ping);
+        std.mem.writeInt(u64, ping_msg[1..9], @intCast(self.ping_start_ms), .little);
+        _ = self.transport.sendReliable(&ping_msg);
+        self.ping_waited = 0;
+    }
+
+    fn stepPingExchanging(self: *NetplaySession) void {
+        // Each ping waits up to 50 frames (~833ms) for a pong.
+        if (self.ping_waited >= 50) {
+            // Timeout on this ping — move to next.
+            self.ping_index += 1;
+            if (self.ping_index >= 5) {
+                self.finishPingExchange();
+                return;
+            }
+            self.sendOnePing();
+            return;
+        }
+        self.ping_waited += 1;
+
+        if (self.transport.poll(0)) |event| {
+            if (event == .message_received) {
+                const msg = self.transport.getLastMessage();
+                if (msg.len >= 9 and msg[0] == @intFromEnum(Msg.ping)) {
+                    const rtt = std.Io.Clock.now(.real, self.io).toMilliseconds() - self.ping_start_ms;
+                    self.stats.count += 1;
+                    const c = @as(f64, @floatFromInt(self.stats.count));
+                    const r = @as(f64, @floatFromInt(rtt));
+                    self.stats.avg_ms = (self.stats.avg_ms * (c - 1) + r) / c;
+                    if (self.stats.min_ms == 0 or r < self.stats.min_ms) self.stats.min_ms = r;
+                    if (r > self.stats.max_ms) self.stats.max_ms = r;
+
+                    self.ping_index += 1;
+                    if (self.ping_index >= 5) {
+                        self.finishPingExchange();
+                        return;
                     }
-                } else break;
-            } else break;
+                    self.sendOnePing();
+                } else if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.ping)) {
+                    // Echo stray pings from peer.
+                    _ = self.transport.sendReliable(msg);
+                }
+            }
+            if (event == .disconnected) {
+                self.setError("Peer disconnected during ping exchange");
+                self.state = .failed;
+            }
         }
+    }
 
+    fn finishPingExchange(self: *NetplaySession) void {
         const stats = self.transport.getStats();
         self.stats.packet_loss = @intCast(stats.packet_loss_pct);
         self.log.info("Ping: avg={d:.0}ms min={d:.0}ms max={d:.0}ms loss={d}%", .{
             self.stats.avg_ms, self.stats.min_ms, self.stats.max_ms, self.stats.packet_loss,
         });
 
-        // Auto-compute input delay from RTT (one frame per ~16.67ms of RTT,
-        // clamped to [0, max_real_delay]). Matches legacy computeDelay().
         const avg_rtt = if (self.stats.avg_ms > 0) self.stats.avg_ms else 50;
         const computed: u8 = @intFromFloat(@ceil(avg_rtt / (1000.0 / 60.0)));
-        self.config.delay = @min(computed, 8); // sane cap; the DLL clamps further
+        self.config.delay = @min(computed, 8);
         self.log.info("Auto delay: {d}", .{self.config.delay});
+
+        // Move to config exchange.
+        self.handshake_subphase = 3;
+        self.phase_attempts = 0;
+        self.state = .handshaking;
+        if (self.config.is_host) {
+            self.sendConfigMessage();
+        }
     }
 
-    fn sendConfig(self: *NetplaySession) !void {
-        // Host → client: [2=config][delay][rollback][win_count][host_player]
+    fn sendConfigMessage(self: *NetplaySession) void {
         var cfg_buf: [8]u8 = undefined;
         cfg_buf[0] = @intFromEnum(Msg.config);
         cfg_buf[1] = self.config.delay;
@@ -477,36 +458,33 @@ pub const NetplaySession = struct {
         self.log.info("Sent config: delay={d} rollback={d} winCount={d} hostPlayer={d}", .{
             self.config.delay, self.config.rollback, self.config.win_count, self.config.host_player,
         });
-
-        // Wait for the client's ConfirmConfig.
-        var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
-            if (self.transport.poll(100)) |event| {
-                if (event == .message_received) {
-                    const msg = self.transport.getLastMessage();
-                    if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.confirm)) {
-                        self.log.info("Client confirmed config", .{});
-                        return;
-                    }
-                }
-                if (event == .disconnected) {
-                    self.setError("Peer disconnected waiting for confirm");
-                    self.state = .failed;
-                    return error.Disconnected;
-                }
-            }
-        }
-        self.setError("Client never confirmed config (5s timeout)");
-        self.state = .failed;
-        return error.NoConfirm;
     }
 
-    fn waitForConfig(self: *NetplaySession) !void {
-        var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
-            if (self.transport.poll(100)) |event| {
-                if (event == .message_received) {
-                    const msg = self.transport.getLastMessage();
+    fn stepExchangeConfig(self: *NetplaySession) void {
+        // 5s timeout = 300 frames.
+        if (self.phase_attempts >= 300) {
+            if (self.config.is_host) {
+                self.setError("Client never confirmed config (5s timeout)");
+            } else {
+                self.setError("Never received config from host (5s timeout)");
+            }
+            self.state = .failed;
+            return;
+        }
+        self.phase_attempts += 1;
+
+        if (self.transport.poll(0)) |event| {
+            if (event == .message_received) {
+                const msg = self.transport.getLastMessage();
+                if (self.config.is_host) {
+                    // Host waits for client's ConfirmConfig.
+                    if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.confirm)) {
+                        self.log.info("Client confirmed config", .{});
+                        self.state = .waiting_confirmation;
+                        self.log.info("Handshake complete — waiting for host to confirm start", .{});
+                    }
+                } else {
+                    // Client waits for config, then sends confirm.
                     if (msg.len >= 5 and msg[0] == @intFromEnum(Msg.config)) {
                         self.config.delay = msg[1];
                         self.config.rollback = msg[2];
@@ -515,36 +493,41 @@ pub const NetplaySession = struct {
                         self.log.info("Received config: delay={d} rollback={d} winCount={d} hostPlayer={d}", .{
                             self.config.delay, self.config.rollback, self.config.win_count, self.config.host_player,
                         });
-
-                        // Echo confirm back to host.
                         const confirm = [_]u8{@intFromEnum(Msg.confirm)};
                         _ = self.transport.sendReliable(&confirm);
                         self.log.info("Sent confirm", .{});
-                        return;
+                        self.state = .launching;
+                        self.log.info("Handshake complete — ready to launch", .{});
                     }
                 }
-                if (event == .disconnected) {
+            }
+            if (event == .disconnected) {
+                if (self.config.is_host) {
+                    self.setError("Peer disconnected waiting for confirm");
+                } else {
                     self.setError("Host disconnected during config exchange");
-                    self.state = .failed;
-                    return error.Disconnected;
                 }
+                self.state = .failed;
             }
         }
-        self.setError("Never received config from host (5s timeout)");
-        self.state = .failed;
-        return error.NoConfig;
     }
 
-    /// Host-only: called by the UI thread once the user clicks "Start match".
-    /// Closes the handshake socket and moves to launching state. The caller
-    /// (UI) then opens the game.
+    fn recordPeerAddress(self: *NetplaySession) void {
+        const is_host = self.config.is_host;
+        const label = if (is_host) "connected-client" else "host";
+        const printed = std.fmt.bufPrint(
+            &self.peer_address_buf,
+            "{s}",
+            .{label},
+        ) catch return;
+        self.peer_address_len = printed.len;
+    }
+
+    /// Host-only: called by the UI once the user clicks "Start match".
     pub fn hostConfirm(self: *NetplaySession) void {
         if (self.state != .waiting_confirmation) return;
         self.host_confirmed = true;
         self.state = .launching;
-        // Note: we do NOT close the transport here. The UI's
-        // launchGameAfterHandshake() calls session.deinit() (which closes the
-        // socket) right before CreateProcess, matching MainApp.cpp:1271-1274.
         self.log.info("Host confirmed — ready to launch", .{});
     }
 };

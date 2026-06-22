@@ -118,10 +118,19 @@ pub const NetplaySession = struct {
 
     /// User-facing: abort the in-progress host()/join(). Safe to call from
     /// the UI thread while the session thread is blocked inside host()/join().
+    ///
+    /// This only sets the cancel flag — it does NOT tear down the transport.
+    /// The session thread checks cancel_requested every poll iteration (at
+    /// most 100ms apart) and breaks out of its loop. The transport is then
+    /// safely torn down by deinit() AFTER the thread has joined (see
+    /// cleanupSession in ui.zig).
+    ///
+    /// Calling transport.deinit() here would destroy the ENet host while
+    /// the session thread is still inside enet_host_service() — a
+    /// use-after-free that crashes Wine with a null pointer dereference
+    /// (issue: "cancel hosting crashes caster").
     pub fn cancel(self: *NetplaySession) void {
         self.cancel_requested = true;
-        // Tear down the socket so any blocked poll() returns immediately.
-        self.transport.deinit();
     }
 
     pub fn peerAddress(self: *const NetplaySession) []const u8 {

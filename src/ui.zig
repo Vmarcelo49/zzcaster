@@ -1300,6 +1300,20 @@ fn drawWaitingForPeer(
             c.igSpacing();
             c.igText("(make sure the port is open / forwarded on the host's router)");
 
+            // Show remaining time for the current phase's timeout.
+            if (s.remainingSeconds()) |remaining| {
+                var timer_buf: [64]u8 = undefined;
+                if (remaining >= 60) {
+                    const mins = remaining / 60;
+                    const secs = remaining % 60;
+                    const timer_z = std.fmt.bufPrintZ(&timer_buf, "Timeout in: {d}m {d:0>2}s", .{ mins, secs }) catch "Timeout in: ...";
+                    c.igText("%s", @as([*:0]const u8, @ptrCast(timer_z.ptr)));
+                } else {
+                    const timer_z = std.fmt.bufPrintZ(&timer_buf, "Timeout in: {d}s", .{remaining}) catch "Timeout in: ...";
+                    c.igText("%s", @as([*:0]const u8, @ptrCast(timer_z.ptr)));
+                }
+            }
+
             c.igSpacing();
             c.igSeparator();
             c.igSpacing();

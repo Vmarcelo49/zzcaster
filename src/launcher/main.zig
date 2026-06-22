@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
-const ipc = @import("ipc.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
+const ipc = @import("common").ipc;
 const ui = @import("ui.zig");
 const launcher = @import("launcher.zig");
 

@@ -1,5 +1,5 @@
 const std = @import("std");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 
 // SDL2 via @cImport — shared with controller_mapper.zig
 pub const c = @cImport({

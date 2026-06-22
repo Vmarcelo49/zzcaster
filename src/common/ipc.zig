@@ -1,7 +1,6 @@
 const std = @import("std");
 const config = @import("config.zig");
 const logging = @import("logging.zig");
-const launcher = @import("launcher.zig");
 
 // Win32 externs for IPC (named pipe)
 const win32 = struct {

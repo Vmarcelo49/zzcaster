@@ -16,10 +16,10 @@
 // Zig — both modules see the same enum value at compile time).
 
 const std = @import("std");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
 const launcher = @import("launcher.zig");
-const ipc = @import("ipc.zig");
+const ipc = @import("common").ipc;
 const session = @import("session.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui = @import("ui.zig");

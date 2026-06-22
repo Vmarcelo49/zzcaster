@@ -1,8 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
-const ipc = @import("ipc.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
+const ipc = @import("common").ipc;
 const ui = @import("ui.zig");
 const launcher = @import("launcher.zig");
 
@@ -15,25 +15,14 @@ pub const CliMode = enum {
     spectate,
 };
 
-// Zig 0.16: main() now receives args + environ via std.process.Init.Minimal
-// (or can stay zero-arg). We take Minimal so we can iterate argv without
-// needing std.process.argsWithAllocator (removed in 0.16).
-pub fn main(init: std.process.Init.Minimal) !void {
-    const args_vector = init.args;
-
-    // Zig 0.16: GeneralPurposeAllocator → DebugAllocator (drop-in).
-    var gpa_storage: std.heap.DebugAllocator(.{}) = .init;
-    defer _ = gpa_storage.deinit();
-    const allocator = gpa_storage.allocator();
-
-    // Zig 0.16: every file/stdout operation needs an explicit Io handle. We
-    // use init_single_threaded because the launcher runs all logic on the
-    // main thread — the netplay handshake is driven by step() calls from
-    // the UI event loop, not a background thread. Using init_single_threaded
-    // avoids the overhead of worker threads and is safe because there are
-    // no cross-thread Io operations.
-    var io_backend: std.Io.Threaded = .init_single_threaded;
-    const io = io_backend.io();
+// Zig 0.16: main() receives the full std.process.Init — the runtime provides a
+// ready-to-use general purpose allocator (init.gpa, leak-checked in Debug) and
+// I/O backend (init.io), so we no longer construct those manually. Args live
+// under init.minimal.args (Init wraps Minimal).
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
+    const io = init.io;
+    const args_vector = init.minimal.args;
 
     // Parse CLI args (very minimal — just enough for non-interactive launch).
     //   zzcaster.exe                  → interactive ImGui menu (default)

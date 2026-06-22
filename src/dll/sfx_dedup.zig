@@ -1,5 +1,5 @@
 const std = @import("std");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 
 // ============================================================================
 // SfxDedup — sound-effect deduplication during rollback re-runs.

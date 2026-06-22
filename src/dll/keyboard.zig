@@ -1,5 +1,5 @@
 const std = @import("std");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 
 // Win32 keyboard input
 const win32 = struct {

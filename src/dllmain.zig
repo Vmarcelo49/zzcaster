@@ -875,6 +875,25 @@ fn frameStep() callconv(.c) void {
         prev_game_mode = game_mode;
     }
 
+    // Watch the intro-state flag every frame for the chara_intro → in_game
+    // transition (the second sync barrier). game_mode alone fires during the
+    // intro cutscene; the intro flag (CC_INTRO_STATE_ADDR) drops to 0 only
+    // when players can actually move. Also enables RNG sync on the
+    // intro-done edge. Matches legacy DllMain.cpp:1266 + 1179.
+    if (nm) |*n| {
+        n.checkIntroDone();
+        // Round-over detection: tick the countdown, then check. Drives the
+        // InGame→Skippable transition via the no_input_flags (KO/time over),
+        // matching legacy checkRoundOver (DllMain.cpp:1200). Only acts while
+        // in_game; harmless otherwise.
+        n.tickRoundOverTimer();
+        n.checkRoundOver();
+        // During a rollback re-run past the pre-game intro window, force the
+        // intro-state flag to 0 so the re-run stays on the gameplay path.
+        // Matches DllMain.cpp:975-976.
+        n.clearIntroStateDuringRollback();
+    }
+
     // Clear inputs
     writeInput(1, 0);
     writeInput(2, 0);
@@ -1014,6 +1033,18 @@ fn frameStep() callconv(.c) void {
             // Poll for remote messages (inputs, RNG, TransitionIndex)
             n.pollAndDispatch(3);
 
+            // SyncHash desync detection. Snapshot + send on the legacy cadence,
+            // then compare any paired local/remote hashes. If a mismatch is
+            // found, the game force-exits (matches legacy delayedStop).
+            // Additive only — does not affect input/state handling.
+            n.maybeSendSyncHash();
+            n.checkSyncHashDesync();
+            if (n.desync_detected) {
+                log.?.err("Desync detected — force-exiting match", .{});
+                alive_flag_addr.* = 0;
+                return;
+            }
+
             // Check for disconnect — only if we WERE connected and now aren't.
             if (n.was_connected and !n.enet_connected and n.config.is_netplay) {
                 log.?.err("Peer disconnected during game!", .{});
@@ -1037,12 +1068,28 @@ fn frameStep() callconv(.c) void {
             //
             // This blocks the game's main thread — that's intentional and
             // correct for lockstep netcode. On localhost the wait is
-            // sub-frame; over the internet it introduces jitter equal to
-            // the ping.
+            // sub-frame; over the internet it introduces jitter equal to the
+            // ping.
             //
-            // TIMEOUT: if the remote doesn't respond within 10s (matching
-            // CCCaster's MAX_WAIT_INPUTS_INTERVAL), we force-exit the game
+            // CONNECTING: if ENet isn't connected yet, skip the input-wait
+            // entirely. The lazy-reconnect block above (with its own 15s
+            // timeout) handles the connect phase. Without this guard, the
+            // 10s input-wait timeout fires while we're still waiting for the
+            // peer's DLL to load+bind, force-exiting the game before the
+            // reconnect ever completes. frameStep will loop back and do
+            // another 50ms reconnect poll next frame.
+            //
+            // TIMEOUT: once connected, if the remote doesn't respond within
+            // 10s (matching CCCaster's MAX_WAIT_INPUTS_INTERVAL), we force-exit
             // instead of hanging forever.
+            if (!n.enet_connected) {
+                // Still connecting — don't enter the input-wait loop. Just
+                // write our (zeroed) inputs and return so the next frameStep
+                // iteration does another reconnect poll.
+                n.writeGameInputs();
+                return;
+            }
+
             if (!n.isRemoteInputReady()) {
                 const wait_start = std.Io.Clock.now(.real, app_io_backend.io()).toMilliseconds();
                 var last_resend = wait_start;

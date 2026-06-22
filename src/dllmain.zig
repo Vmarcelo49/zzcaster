@@ -986,13 +986,18 @@ fn frameStep() callconv(.c) void {
 
             // === NORMAL NETPLAY MODE (player 1 host or player 2 client) ===
             // Read local input
-            const local_input: u16 = blk: {
+            const raw_input: u16 = blk: {
                 if (reader) |*r| {
                     r.update();
                     if (r.hasGamepad()) break :blk r.readInput();
                 }
                 break :blk keyboard.readInput();
             };
+
+            // Apply per-state input filtering (catch-up mash, mask Cancel in
+            // chara-select, only Confirm/Cancel in loading/intro/skippable).
+            // This is the Zig equivalent of CCCaster's getInput(player) dispatch.
+            const local_input: u16 = n.getNetplayInput(raw_input);
 
             n.updateFrame();
 
@@ -1016,6 +1021,15 @@ fn frameStep() callconv(.c) void {
                 return;
             }
 
+            // Heartbeat check: if no packet received in 20s, the peer is dead.
+            // This catches crashes/kills that don't generate a DISCONNECT event.
+            if (n.enet_connected and n.checkHeartbeat()) {
+                log.?.err("Peer heartbeat timeout (20s no packets) — forcing disconnect", .{});
+                n.enet_connected = false;
+                alive_flag_addr.* = 0;
+                return;
+            }
+
             // Wait for remote inputs. This is the lockstep gate: the game
             // frame cannot advance until we have the remote's input for
             // (our_index, our_frame + delay). While waiting, we keep polling
@@ -1025,8 +1039,11 @@ fn frameStep() callconv(.c) void {
             // correct for lockstep netcode. On localhost the wait is
             // sub-frame; over the internet it introduces jitter equal to
             // the ping.
+            //
+            // TIMEOUT: if the remote doesn't respond within 10s (matching
+            // CCCaster's MAX_WAIT_INPUTS_INTERVAL), we force-exit the game
+            // instead of hanging forever.
             if (!n.isRemoteInputReady()) {
-                // Zig 0.16: std.time.milliTimestamp() is gone — use Io.Clock.
                 const wait_start = std.Io.Clock.now(.real, app_io_backend.io()).toMilliseconds();
                 var last_resend = wait_start;
                 var warned = false;
@@ -1048,10 +1065,25 @@ fn frameStep() callconv(.c) void {
                         return;
                     }
 
-                    // Log after 5s but keep waiting (don't kill the game)
+                    // Heartbeat check during wait
+                    if (n.enet_connected and n.checkHeartbeat()) {
+                        log.?.err("Peer heartbeat timeout during input wait", .{});
+                        n.enet_connected = false;
+                        alive_flag_addr.* = 0;
+                        return;
+                    }
+
+                    // Log after 5s but keep waiting
                     if (!warned and now - wait_start > 5000) {
                         log.?.warn("Waiting for remote input... (5s elapsed)", .{});
                         warned = true;
+                    }
+
+                    // TIMEOUT after 10s — force exit (matches CCCaster)
+                    if (now - wait_start > 10000) {
+                        log.?.err("Timed out waiting for remote input (10s) — forcing exit", .{});
+                        alive_flag_addr.* = 0;
+                        return;
                     }
                 }
             }

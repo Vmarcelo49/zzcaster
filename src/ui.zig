@@ -211,6 +211,11 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     // InputText with manual parse so the user can type freely)
     var wincount_buf: [8]u8 = "2\x00\x00\x00\x00\x00\x00\x00".*;
     var rollback_buf: [8]u8 = "4\x00\x00\x00\x00\x00\x00\x00".*;
+    // Delay override buffer for the host confirmation screen. Initialized
+    // empty — when the host reaches waiting_confirmation, the auto-computed
+    // delay is loaded into this buffer so the host can edit it.
+    var delay_buf: [4]u8 = [_]u8{0} ** 4;
+    var delay_override_active: bool = false;
 
     // Display name input buffer (sentinel-terminated for ImGui). Initialized
     // from cfg.display_name on startup; saved back when the user clicks Apply.
@@ -554,6 +559,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                     &win_launcher, &game_pid, &ipc_server,
                     &ui_state, &error_msg, &error_msg_len,
                     &host_start_clicked,
+                    &delay_buf, &delay_override_active,
                 );
             },
             .in_game => {
@@ -1243,6 +1249,8 @@ fn drawWaitingForPeer(
     error_msg: *[256]u8,
     error_msg_len: *usize,
     host_start_clicked: *bool,
+    delay_buf: *[4]u8,
+    delay_override_active: *bool,
 ) void {
     if (np_session.* == null) {
         ui_state.* = .idle;
@@ -1302,7 +1310,7 @@ fn drawWaitingForPeer(
         },
 
         .waiting_confirmation => {
-            // Host: handshake done, show ping + a Start button.
+            // Host: handshake done, show ping + delay override + Start button.
             const remote = s.remoteName();
             if (remote.len > 0) {
                 c.igText("%.*s connected!", @as(c_int, @intCast(remote.len)), remote.ptr);
@@ -1312,6 +1320,40 @@ fn drawWaitingForPeer(
             c.igSpacing();
             c.igText("Ping: avg=%.0fms  min=%.0fms  max=%.0fms", s.stats.avg_ms, s.stats.min_ms, s.stats.max_ms);
             c.igText("Auto input delay: %d", s.config.delay);
+            c.igSpacing();
+
+            // Delay override: the host can manually set the input delay
+            // instead of using the auto-computed value. The override is
+            // applied to s.config.delay before hostConfirm() sends the
+            // config to the client.
+            c.igText("Override delay:");
+            c.igSameLine(0, 8);
+            _ = c.igInputText("##delay_override", delay_buf, delay_buf.len, 0, null, null);
+            c.igSameLine(0, 8);
+            if (c.igButton("Apply##delay", .{ .x = 60, .y = 0 })) {
+                const delay_str = std.mem.sliceTo(@as([*:0]u8, @ptrCast(delay_buf)), 0);
+                if (delay_str.len > 0) {
+                    const val = std.fmt.parseInt(u8, delay_str, 10) catch s.config.delay;
+                    // Clamp to [0, 15] — anything higher is unplayable.
+                    s.config.delay = @min(val, 15);
+                    delay_override_active.* = true;
+                    log.info("Delay overridden to {d}", .{s.config.delay});
+                }
+            }
+            if (delay_override_active.*) {
+                c.igSameLine(0, 8);
+                c.igText("(overridden: %d)", s.config.delay);
+                c.igSameLine(0, 8);
+                if (c.igButton("Reset##delay", .{ .x = 50, .y = 0 })) {
+                    // Recompute auto delay from ping.
+                    const avg_rtt = if (s.stats.avg_ms > 0) s.stats.avg_ms else 50;
+                    const computed: u8 = @intFromFloat(@ceil(avg_rtt / (1000.0 / 60.0)));
+                    s.config.delay = @min(computed, 8);
+                    delay_override_active.* = false;
+                    log.info("Delay reset to auto: {d}", .{s.config.delay});
+                }
+            }
+
             c.igSpacing();
             c.igSeparator();
             c.igSpacing();

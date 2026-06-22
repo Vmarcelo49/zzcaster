@@ -92,7 +92,7 @@ pub const NetplaySession = struct {
     // Atomic-free volatile read/write is fine here: there's exactly one writer
     // (the UI thread) and one reader (the session thread), and a missed wake
     // just means one more 100ms poll iteration.
-    cancel_requested: bool = false,
+    cancel_requested: std.atomic.Value(bool) = .init(false),
 
     // Host-only: set true when the UI tells us to proceed after
     // waiting_confirmation. hostConfirm() sends the final ConfirmConfig and
@@ -130,7 +130,7 @@ pub const NetplaySession = struct {
     /// use-after-free that crashes Wine with a null pointer dereference
     /// (issue: "cancel hosting crashes caster").
     pub fn cancel(self: *NetplaySession) void {
-        self.cancel_requested = true;
+        self.cancel_requested.store(true, .release);
     }
 
     pub fn peerAddress(self: *const NetplaySession) []const u8 {
@@ -204,7 +204,7 @@ pub const NetplaySession = struct {
         // Wait for the client's CONNECT (60s timeout, cancellable).
         self.log.info("Waiting for opponent to connect on port {d}...", .{port});
         var attempts: u32 = 0;
-        while (attempts < 600 and !self.cancel_requested) : (attempts += 1) {
+        while (attempts < 600 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
             if (self.transport.poll(100)) |event| {
                 if (event == .connected) {
                     self.log.info("Opponent connected!", .{});
@@ -214,7 +214,7 @@ pub const NetplaySession = struct {
                 }
             }
         }
-        if (self.cancel_requested) {
+        if (self.cancel_requested.load(.acquire)) {
             self.state = .cancelled;
             return error.Cancelled;
         }
@@ -243,7 +243,7 @@ pub const NetplaySession = struct {
 
         // Wait for CONNECT event (10s timeout, cancellable).
         var attempts: u32 = 0;
-        while (attempts < 100 and !self.cancel_requested) : (attempts += 1) {
+        while (attempts < 100 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
             if (self.transport.poll(100)) |event| {
                 if (event == .connected) {
                     self.log.info("Connected to host!", .{});
@@ -253,7 +253,7 @@ pub const NetplaySession = struct {
                 }
             }
         }
-        if (self.cancel_requested) {
+        if (self.cancel_requested.load(.acquire)) {
             self.state = .cancelled;
             return error.Cancelled;
         }
@@ -279,14 +279,14 @@ pub const NetplaySession = struct {
 
         // 1. Exchange version strings (strict — bail on mismatch).
         try self.exchangeVersion();
-        if (self.cancel_requested) {
+        if (self.cancel_requested.load(.acquire)) {
             self.state = .cancelled;
             return error.Cancelled;
         }
 
         // 2. Exchange display names (for the connection screen + logs).
         try self.exchangeNames();
-        if (self.cancel_requested) {
+        if (self.cancel_requested.load(.acquire)) {
             self.state = .cancelled;
             return error.Cancelled;
         }
@@ -294,7 +294,7 @@ pub const NetplaySession = struct {
         // 3. Exchange ping stats (drives auto input-delay).
         self.state = .ping_exchanging;
         try self.exchangePings();
-        if (self.cancel_requested) {
+        if (self.cancel_requested.load(.acquire)) {
             self.state = .cancelled;
             return error.Cancelled;
         }
@@ -326,7 +326,7 @@ pub const NetplaySession = struct {
 
         // Wait for peer's version.
         var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested) : (attempts += 1) {
+        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
             if (self.transport.poll(100)) |event| {
                 if (event == .message_received) {
                     const msg = self.transport.getLastMessage();
@@ -369,7 +369,7 @@ pub const NetplaySession = struct {
 
         // Wait for peer's name.
         var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested) : (attempts += 1) {
+        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
             if (self.transport.poll(100)) |event| {
                 if (event == .message_received) {
                     const msg = self.transport.getLastMessage();
@@ -401,7 +401,7 @@ pub const NetplaySession = struct {
         // Send N ping packets and measure RTT.
         const num_pings: u32 = 5;
         var i: u32 = 0;
-        while (i < num_pings and !self.cancel_requested) : (i += 1) {
+        while (i < num_pings and !self.cancel_requested.load(.acquire)) : (i += 1) {
             const start = std.Io.Clock.now(.real, self.io).toMilliseconds();
             var ping_msg: [9]u8 = undefined;
             ping_msg[0] = @intFromEnum(Msg.ping);
@@ -410,7 +410,7 @@ pub const NetplaySession = struct {
 
             // Wait for pong (echo of the same packet).
             var waited: u32 = 0;
-            while (waited < 50 and !self.cancel_requested) : (waited += 1) {
+            while (waited < 50 and !self.cancel_requested.load(.acquire)) : (waited += 1) {
                 if (self.transport.poll(10)) |event| {
                     if (event == .message_received) {
                         const msg = self.transport.getLastMessage();
@@ -480,7 +480,7 @@ pub const NetplaySession = struct {
 
         // Wait for the client's ConfirmConfig.
         var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested) : (attempts += 1) {
+        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
             if (self.transport.poll(100)) |event| {
                 if (event == .message_received) {
                     const msg = self.transport.getLastMessage();
@@ -503,7 +503,7 @@ pub const NetplaySession = struct {
 
     fn waitForConfig(self: *NetplaySession) !void {
         var attempts: u32 = 0;
-        while (attempts < 50 and !self.cancel_requested) : (attempts += 1) {
+        while (attempts < 50 and !self.cancel_requested.load(.acquire)) : (attempts += 1) {
             if (self.transport.poll(100)) |event| {
                 if (event == .message_received) {
                     const msg = self.transport.getLastMessage();

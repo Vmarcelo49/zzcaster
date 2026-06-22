@@ -1,6 +1,6 @@
 const std = @import("std");
 const gamepad = @import("gamepad.zig");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 
 const c = gamepad.c;
 

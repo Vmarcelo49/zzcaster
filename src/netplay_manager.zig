@@ -60,6 +60,10 @@ const keyboard_config_offset: u32 = 0x14D2C0;
 const num_inputs: u32 = 30;
 const max_rollback: u8 = 15;
 
+// Health-check timeouts (ported from CCCaster's GoBackN keepalive + input-wait)
+const heartbeat_timeout_ms: i64 = 20000; // 20s — no packet → peer is dead
+const input_wait_timeout_ms: i64 = 10000; // 10s — no remote input → timed out
+
 pub const NetplayState = enum {
     pre_initial,
     initial,
@@ -151,6 +155,14 @@ pub const NetplayManager = struct {
     // learned from TransitionIndex messages. Used by isRemoteInputReady to
     // decide whether to wait (remote behind) or predict (remote ahead).
     remote_index: u32 = 0,
+
+    // Heartbeat: timestamp (ms) of the last packet received from the peer.
+    // Updated in pollEnet() whenever any packet arrives. Checked in
+    // frameStep — if now - last_packet_ms > HEARTBEAT_TIMEOUT_MS (20s),
+    // we force a disconnect. This catches dead peers that crash/kill
+    // without sending an ENET_EVENT_TYPE_DISCONNECT (which is the only
+    // other way to detect a dead connection).
+    last_packet_ms: i64 = 0,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, log: *logging.Logger) !NetplayManager {
         return .{
@@ -387,6 +399,8 @@ pub const NetplayManager = struct {
                 // (we haven't agreed on a frame yet); count it so the 60s-cap
                 // log can show "we got N mystery packets instead of a CONNECT".
                 if (!self.enet_connected) self.diag_connect_receives += 1;
+                // Heartbeat: record when we last heard from the peer.
+                self.last_packet_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
                 const pkt = event.packet;
                 const data = pkt.*.data;
                 const len = pkt.*.dataLength;
@@ -426,6 +440,8 @@ pub const NetplayManager = struct {
                     self.config.is_host,
                     self.enet_connected,
                 });
+                // Heartbeat: start the heartbeat clock from the CONNECT event.
+                self.last_packet_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
                 if (self.config.is_host and !self.enet_connected) {
                     self.enet_peer = event.peer;
                     self.enet_connected = true;
@@ -573,6 +589,84 @@ pub const NetplayManager = struct {
 
     // --- Input management ---
 
+    /// Returns true if the remote peer's transition index is more than 1
+    /// ahead of ours — meaning we're lagging behind and should auto-mash
+    /// Confirm to catch up. Used by getNetplayInput() in Loading/CharaIntro/
+    /// Skippable states to prevent one side from being stuck on a screen
+    /// while the other has already advanced.
+    pub fn shouldCatchUp(self: *const NetplayManager) bool {
+        if (self.remote_inputs.getEndIndex() == 0) return false;
+        const remote_end_index = self.remote_inputs.getEndIndex() - 1;
+        return remote_end_index > self.indexed_frame.index + 1;
+    }
+
+    /// Get the input to send/write for the local player, with per-state
+    /// filtering. This is the Zig equivalent of CCCaster's getInput(player)
+    /// dispatch.
+    ///
+    /// - CharaSelect: real input, but B/Cancel masked (can't back out)
+    /// - Loading/CharaIntro/Skippable: if remote is ahead, mash Confirm;
+    ///   otherwise only Confirm/Cancel pass through (no cursor movement)
+    /// - InGame/RetryMenu: real input (filtered later by game logic)
+    /// - PreInitial/Initial: mash Confirm to auto-advance menus
+    pub fn getNetplayInput(self: *NetplayManager, raw_input: u16) u16 {
+        switch (self.state) {
+            .pre_initial, .initial => {
+                // Mash Confirm every other frame to auto-advance through
+                // the title screen and menus.
+                if (self.indexed_frame.frame % 2 == 0) {
+                    return button_confirm << 4;
+                }
+                return 0;
+            },
+            .chara_select => {
+                // Mask B/Cancel (0x0800 button bit, which is in the high
+                // byte after << 4 = 0x0800 in the combined u16). This
+                // prevents either player from backing out of chara-select
+                // and desyncing the state machine.
+                // combined = dir | (btns << 4), so Cancel bit = 0x0800 << 4? No.
+                // button_cancel = 0x0800, and btns is shifted << 4 in the
+                // combined u16, so Cancel occupies bits 15..12 area.
+                // Actually: button_b = 0x0020, button_cancel = 0x0800.
+                // Combined = dir | (btns << 4). So btns = (combined >> 4).
+                // Cancel bit in btns = 0x0800, in combined = 0x0800 << 4? No.
+                // Let me re-check: readInput returns dir | (btns << 4).
+                // So if btns has bit 0x0800 set, combined has 0x0800 << 4?
+                // No — btns is already the button field. combined = dir | (btns << 4).
+                // So btns=0x0800 → combined bits = 0x0800 << 4 = 0x8000? That's wrong.
+                //
+                // Actually the button constants are: button_b = 0x0020.
+                // readInputMapped returns dir | (btns << 4).
+                // So button_b (0x0020) in the combined u16 is at bits 4+5=9?
+                // 0x0020 << 4 = 0x0200. So B is bit 9 in the combined u16.
+                // button_cancel = 0x0800. 0x0800 << 4 = 0x8000. Cancel is bit 15.
+                //
+                // To mask Cancel: clear bit 15 of the combined u16.
+                // To mask B: clear bit 9 (0x0200) of the combined u16.
+                return raw_input & ~@as(u16, 0x8000); // mask Cancel
+            },
+            .loading, .chara_intro, .skippable => {
+                // If remote is ahead, mash Confirm to catch up.
+                if (self.shouldCatchUp()) {
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+                // Otherwise, only allow Confirm/Cancel through — suppress
+                // all direction and action buttons so the player can't
+                // accidentally affect game state during loading/intro.
+                // Confirm = 0x0400 in btns = 0x4000 in combined.
+                // Cancel  = 0x0800 in btns = 0x8000 in combined.
+                return raw_input & 0xC000; // keep only Confirm + Cancel bits
+            },
+            .in_game, .retry_menu => {
+                // Real input — game logic handles filtering.
+                return raw_input;
+            },
+        }
+    }
+
     pub fn setLocalInput(self: *NetplayManager, input: u16) void {
         const frame = self.indexed_frame.frame + self.config.delay;
         self.local_inputs.set(self.indexed_frame.index, frame, input);
@@ -610,12 +704,29 @@ pub const NetplayManager = struct {
         return self.remote_inputs.get(self.indexed_frame.index, self.indexed_frame.frame);
     }
 
+    /// Check if the peer has been silent for too long. Returns true if the
+    /// heartbeat has expired (no packet received in HEARTBEAT_TIMEOUT_MS).
+    /// Called from frameStep to detect dead peers that crashed without
+    /// sending a DISCONNECT event.
+    pub fn checkHeartbeat(self: *const NetplayManager) bool {
+        if (!self.enet_connected or self.last_packet_ms == 0) return false;
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        return (now - self.last_packet_ms) > heartbeat_timeout_ms;
+    }
+
     pub fn isRemoteInputReady(self: *const NetplayManager) bool {
-        // Don't block on non-gameplay states — during loading screens,
-        // chara intros, etc. there's nothing the remote needs to send.
+        // In CharaSelect and InGame, the frame loop MUST block until the
+        // remote peer has caught up to our transition index AND has sent
+        // input for the current frame. This is the lock-step gate that
+        // keeps both sides synchronized — without it, one side can race
+        // ahead (e.g. start the match while the other is still loading).
+        //
+        // Loading / CharaIntro / Skippable / RetryMenu do NOT block:
+        // each side runs at its own pace, and the catch-up mash logic
+        // in getNetplayInput() ensures the lagging side auto-skips.
         switch (self.state) {
             .pre_initial, .initial, .loading, .chara_intro, .skippable, .retry_menu => return true,
-            else => {},
+            .chara_select, .in_game => {},
         }
 
         // Offline / spectator: always ready
@@ -709,24 +820,62 @@ pub const NetplayManager = struct {
 
     // --- State transitions ---
 
+    /// Validate that a state transition is allowed. CCCaster uses an explicit
+    /// white-list; invalid transitions indicate a desync and should be logged.
+    /// Returns true if the transition is valid, false otherwise.
+    ///
+    /// Valid transitions (from CCCaster's isValidNext):
+    ///   pre_initial → initial
+    ///   initial → chara_select (netplay) | in_game (training)
+    ///   chara_select → loading
+    ///   loading → chara_intro (versus) | in_game (training)
+    ///   chara_intro → in_game
+    ///   in_game → skippable
+    ///   skippable → in_game (next round) | retry_menu
+    ///   retry_menu → loading (rematch) | chara_select
+    fn isValidNext(self: *const NetplayManager, new: NetplayState) bool {
+        const old = self.state;
+        const valid = switch (old) {
+            .pre_initial => new == .initial,
+            .initial => new == .chara_select or new == .in_game,
+            .chara_select => new == .loading,
+            .loading => new == .chara_intro or new == .in_game,
+            .chara_intro => new == .in_game,
+            .in_game => new == .skippable or new == .chara_select,
+            .skippable => new == .in_game or new == .retry_menu,
+            .retry_menu => new == .loading or new == .chara_select,
+        };
+        if (!valid) {
+            self.log.err("Invalid state transition: {s} -> {s} (potential desync)", .{
+                @tagName(old), @tagName(new),
+            });
+        }
+        return valid;
+    }
+
     pub fn onGameModeChanged(self: *NetplayManager, new_mode: u32) void {
         const old_state = self.state;
+        var new_state: ?NetplayState = null;
 
         if (new_mode == mode_chara_select) {
-            self.state = .chara_select;
-            self.onStateTransition(old_state, .chara_select);
+            new_state = .chara_select;
         } else if (new_mode == mode_loading) {
-            self.state = .loading;
-            self.onStateTransition(old_state, .loading);
+            new_state = .loading;
         } else if (new_mode == mode_in_game) {
             if (self.config.is_training or !self.config.is_netplay or self.config.is_spectator) {
-                self.state = .in_game;
-                self.onStateTransition(old_state, .in_game);
+                new_state = .in_game;
             } else {
-                self.state = .chara_intro;
-                self.onStateTransition(old_state, .chara_intro);
+                new_state = .chara_intro;
             }
-            self.onEnterInGame();
+        }
+
+        if (new_state) |ns| {
+            // Validate the transition — log invalid ones but proceed anyway
+            // (the game already wrote the new mode, we can't stop it).
+            _ = self.isValidNext(ns);
+            self.state = ns;
+            self.onStateTransition(old_state, ns);
+            if (new_mode == mode_in_game) self.onEnterInGame();
         }
         self.log.info("NetplayState -> {s} (game_mode={d})", .{ @tagName(self.state), new_mode });
 

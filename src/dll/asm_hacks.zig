@@ -19,12 +19,11 @@
 //
 // Extracted from dllmain.zig (task 2b) to keep the DLL entry-point file
 // focused on init / frame-loop control. The shared `log` logger and the
-// `zzcasterFrameCallback` trampoline live in dllmain.zig and are reached via
-// `@import("dllmain.zig")` — Zig resolves circular imports at compile time,
-// so the back-reference is safe.
+// `zzcasterFrameCallback` trampoline live in dll_state.zig and are reached
+// via `@import("dll_state.zig")` — one-directional, no circular import.
 const std = @import("std");
 const sfx_dedup = @import("sfx_dedup.zig");
-const dm = @import("dllmain.zig");
+const state = @import("dll_state.zig");
 
 // ASM patch addresses — used only by the installers in this file.
 const loop_start_addr: u32 = 0x40D330;
@@ -33,8 +32,8 @@ const hook_call2_addr: u32 = 0x40D411;
 const multiple_melty_addr: *u8 = @ptrFromInt(0x40D25A);
 
 pub fn applyPreLoadHacks() void {
-    if (dm.log == null) return;
-    dm.log.?.info("Applying pre-load ASM hacks...", .{});
+    if (state.log == null) return;
+    state.log.?.info("Applying pre-load ASM hacks...", .{});
     applyHookMainLoop();
     var multi_melty: [1]u8 = .{0xEB};
     writeBytes(@intFromPtr(multiple_melty_addr), &multi_melty);
@@ -43,11 +42,11 @@ pub fn applyPreLoadHacks() void {
     // These wire the game's SFX play path into our sfx_filter_array /
     // sfx_mute_array so that rollback re-runs don't replay stale sounds.
     applySfxAsmHacks();
-    dm.log.?.info("Pre-load hacks applied", .{});
+    state.log.?.info("Pre-load hacks applied", .{});
 }
 
 pub fn applyHookMainLoop() void {
-    const callback_addr: u32 = @intCast(@intFromPtr(&dm.zzcasterFrameCallback));
+    const callback_addr: u32 = @intCast(@intFromPtr(&state.zzcasterFrameCallback));
 
     // Patch 1 (at hook_call1_addr):
     //   E8 <rel32>   call zzcasterFrameCallback  (5 bytes)
@@ -77,7 +76,7 @@ pub fn applyHookMainLoop() void {
     // The E9 sits at hook_call2_addr + 6. next_ip = hook_call2_addr + 11.
     std.mem.writeInt(u32, p2[7..11], rel32(loop_start_addr + 6, hook_call2_addr + 6, 5), .little);
     writeBytes(hook_call2_addr, &p2);
-    dm.log.?.info("hookCall2 bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
+    state.log.?.info("hookCall2 bytes: {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2} {x:0>2}", .{
         p2[0], p2[1], p2[2], p2[3], p2[4], p2[5], p2[6], p2[7], p2[8], p2[9], p2[10],
     });
 
@@ -89,7 +88,7 @@ pub fn applyHookMainLoop() void {
     std.mem.writeInt(u32, p3[1..5], rel32(hook_call1_addr, loop_start_addr + 0, 5), .little);
     writeBytes(loop_start_addr, &p3);
 
-    dm.log.?.info("hookMainLoop applied (callback=0x{x:0>8})", .{callback_addr});
+    state.log.?.info("hookMainLoop applied (callback=0x{x:0>8})", .{callback_addr});
 }
 
 pub fn applyHijackControls() void {
@@ -119,7 +118,7 @@ pub fn applyHijackControls() void {
 // 1 to CC_SFX_ARRAY[i] AND 1 to sfxMuteArray[i] — the play hook fires but
 // produces no audio, dequeuing the sound without artifact.
 pub fn applySfxAsmHacks() void {
-    if (dm.log == null) return;
+    if (state.log == null) return;
     const filter_arr = @intFromPtr(&sfx_dedup.sfx_filter_array);
     const mute_arr = @intFromPtr(&sfx_dedup.sfx_mute_array);
     const sfx_len = sfx_dedup.sfx_array_len;
@@ -280,7 +279,7 @@ pub fn applySfxAsmHacks() void {
     std.mem.writeInt(u32, m6[1..5], @as(u32, 0x40EEA1) -% (@as(u32, 0x40F3D5) + 5), .little);
     writeBytes(0x40F3D5, &m6);
 
-    dm.log.?.info("SFX dedup ASM hooks applied (filter_array=0x{x:0>8} mute_array=0x{x:0>8})", .{
+    state.log.?.info("SFX dedup ASM hooks applied (filter_array=0x{x:0>8} mute_array=0x{x:0>8})", .{
         filter_arr, mute_arr,
     });
 }

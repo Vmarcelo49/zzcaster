@@ -7,6 +7,20 @@ const sfx_dedup = @import("sfx_dedup.zig");
 const mapper = @import("controller_mapper.zig");
 const asm_hacks = @import("asm_hacks.zig");
 const frame_step = @import("frame_step.zig");
+const state = @import("dll_state.zig");
+
+// Comptime-constant addresses and functions can be aliased directly — they
+// have no mutation, so a local const copy is identical to the original.
+// Mutable runtime vars (log, nm, reader, reader2, input_log_frame) are
+// accessed through `state.X` because they're assigned during the DLL
+// lifecycle and a local copy would go stale.
+const game_mode_addr = state.game_mode_addr;
+const world_timer_addr = state.world_timer_addr;
+const skip_frames_addr = state.skip_frames_addr;
+const alive_flag_addr = state.alive_flag_addr;
+const app_io_backend = &state.app_io_backend;
+const writeInput = state.writeInput;
+const fillBothInputsCallback = state.fillBothInputsCallback;
 
 // SDL2
 const c = @cImport({
@@ -86,25 +100,14 @@ fn resolvePipeName() [:0]const u8 {
 
 const default_pipe_name_z: [:0]const u8 = "\\\\.\\pipe\\zzcaster_pipe";
 
-// Game memory addresses. Published for cross-file access (asm_hacks.zig
-// and frame_step.zig reach these via @import("dllmain.zig")).
-pub const game_mode_addr: *u32 = @ptrFromInt(0x54EEE8);
-pub const world_timer_addr: *u32 = @ptrFromInt(0x55D1D4);
-pub const skip_frames_addr: *u32 = @ptrFromInt(0x55D25C);
-pub const alive_flag_addr: *u8 = @ptrFromInt(0x76E650);
+// Game memory addresses, the input-write layout, and the I/O backend moved
+// to dll_state.zig (aliased into locals above) so asm_hacks.zig and
+// frame_step.zig can reach them without importing dllmain.zig (which would
+// create a circular import). The addresses below are PRIVATE to dllmain —
+// they're used only by applyPostLoadHacks and never accessed cross-file.
 const damage_level_addr: *u32 = @ptrFromInt(0x553FCC);
 const timer_speed_addr: *u32 = @ptrFromInt(0x553FD0);
 const win_count_vs_addr: *u32 = @ptrFromInt(0x553FDC);
-// Zig 0.16: 64-bit alignment check rejects `@ptrFromInt(0x76E6AC)` for `*usize`
-// (4-byte aligned, but *usize needs 8 on 64-bit). Cast through a [*]u8
-// pointer instead — the legacy game memory address is 4-byte aligned by
-// design (MBAA is a 32-bit process) so we read a usize via @ptrFromInt on
-// a u8 pointer.
-const ptr_to_write_input_addr: [*]u8 = @ptrFromInt(0x76E6AC);
-const p1_off_dir: u32 = 0x18;
-const p1_off_btn: u32 = 0x24;
-const p2_off_dir: u32 = 0x2C;
-const p2_off_btn: u32 = 0x38;
 
 const mode_startup: u32 = 65535;
 const mode_opening: u32 = 3;
@@ -120,14 +123,7 @@ const button_confirm: u16 = 0x0400;
 // installers that use them.
 const force_goto_addr: *u8 = @ptrFromInt(0x42B475);
 
-// Zig 0.16: every file/stdout operation needs an Io handle. The DLL runs
-// inside the game's process, so we use init_single_threaded to avoid
-// spawning worker threads that could interfere with the game.
-pub var app_io_backend: std.Io.Threaded = .init_single_threaded;
-
-var frame_callback: ?*const fn () callconv(.c) void = null;
 var log_storage: logging.Logger = undefined;
-pub var log: ?*logging.Logger = null;
 var ipc_pipe: ?*anyopaque = null;
 var ipc_connected: bool = false;
 var last_world_timer: u32 = 0;
@@ -139,29 +135,18 @@ var prev_game_mode: u32 = 0;
 // path "zzcaster/mapping.ini" resolves against MBAA.exe's CWD, which may
 // not be the MBAACC root (e.g. if launched from a shortcut).
 var dll_module_handle: ?*anyopaque = null;
-pub var reader: ?gamepad.GamepadReader = null;
 // Diagnostic: one-shot flag so frameStep logs the input pipeline state on
 // the first frame where config_received becomes true. Lets the user
 // verify from the log that reader / reader2 / keyboard were set up.
 var input_diag_logged: bool = false;
-// Periodic input-value logging frame counter.
-pub var input_log_frame: u32 = 0;
 // SDL must be initialized on the SAME thread that polls it. lazyInit runs
 // on a worker thread, so we defer SDL_Init + controller open to the first
 // frameStep call (which runs on MBAA's main thread). Without this, all
 // SDL_GameControllerGetButton / SDL_JoystickGetButton calls return 0
 // because SDL's internal state is thread-local.
 var sdl_init_done: bool = false;
-// Second reader for offline Versus P2. Null in netplay/spectator modes
-// (P2 input comes from the network there). Built in applyPostLoadHacks
-// from the [Player2] section of zzcaster/mapping.ini. Without this, P2
-// in offline Versus is hard-locked to neutral every frame — the GUI
-// saves P2 bindings but the DLL threw them away.
-pub var reader2: ?gamepad.GamepadReader = null;
 var sdl_initialized: bool = false;
 
-// Netplay
-pub var nm: ?netman.NetplayManager = null;
 var config_received: bool = false;
 var is_training: bool = false;
 var is_netplay: bool = false;
@@ -176,14 +161,6 @@ var is_spectator: bool = false;
 // (logger, IPC pipe, ASM hacks, config wait) runs lazily on the first
 // frameStep — on MBAA.exe's main thread, which has a full-size stack.
 var dll_initialized: bool = false;
-
-// `pub export` so asm_hacks.applyHookMainLoop can take this function's
-// address via `&dllmain.zzcasterFrameCallback` when wiring the main-loop
-// patches. The `export` also keeps the symbol in the DLL's export table
-// (matches the legacy layout).
-pub export fn zzcasterFrameCallback() callconv(.c) void {
-    if (frame_callback) |cb| cb();
-}
 
 // Zig 0.16: DllMain must return std.os.windows.BOOL (was `callconv(.c) i32`
 // before — the standard library now expects the proper Win32 BOOL type).
@@ -204,7 +181,7 @@ pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) call
             //   (b) spawn a worker thread with a 256KB stack to run lazyInit,
             //       which installs the ASM hooks; after that the game's main
             //       loop calls frameStep, which waits on dll_initialized.
-            frame_callback = frameStep;
+            state.setFrameCallback(frameStep);
             dll_initialized = false;
             // 8MB stack: Zig 0.16's std.Io call chain (Logger.init →
             // createDirPath → openFile → …) is deep enough to blow a smaller
@@ -213,11 +190,11 @@ pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) call
             _ = win32.CreateThread(null, 8 * 1024 * 1024, initThread, null, 0, null);
         },
         0 => { // DLL_PROCESS_DETACH
-            if (log) |l| {
+            if (state.log) |l| {
                 l.info("hook.dll: DLL_PROCESS_DETACH", .{});
-                if (nm) |*n| n.deinit();
+                if (state.nm) |*n| n.deinit();
                 if (ipc_connected) _ = win32.CloseHandle(ipc_pipe);
-                if (reader) |*r| r.deinit();
+                if (state.reader) |*r| r.deinit();
                 if (sdl_initialized) c.SDL_Quit();
                 l.deinit();
             }
@@ -229,25 +206,25 @@ pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) call
 }
 
 fn connectPipe() void {
-    if (log == null) return;
+    if (state.log == null) return;
     const name = resolvePipeName();
-    log.?.info("Connecting to IPC pipe: {s}", .{name});
+    state.log.?.info("Connecting to IPC pipe: {s}", .{name});
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
         ipc_pipe = win32.CreateFileA(name.ptr, win32.GENERIC_READ | win32.GENERIC_WRITE, 0, null, win32.OPEN_EXISTING, 0, null);
         if (ipc_pipe != win32.INVALID_HANDLE_VALUE) {
             ipc_connected = true;
-            log.?.info("Connected to IPC pipe", .{});
+            state.log.?.info("Connected to IPC pipe", .{});
             return;
         }
         win32.Sleep(100);
     }
-    log.?.err("Failed to connect to IPC pipe", .{});
+    state.log.?.err("Failed to connect to IPC pipe", .{});
 }
 
 fn waitForConfig() void {
-    if (log == null or !ipc_connected) return;
-    log.?.info("Waiting for config...", .{});
+    if (state.log == null or !ipc_connected) return;
+    state.log.?.info("Waiting for config...", .{});
 
     // Use PeekNamedPipe to check if the launcher has sent anything yet.
     // If we just called ReadFile here we'd block the DLL_PROCESS_ATTACH
@@ -286,8 +263,8 @@ fn waitForConfig() void {
 
         if (is_netplay and read >= 7) {
             // Initialize NetplayManager with config
-            nm = netman.NetplayManager.init(std.heap.page_allocator, app_io_backend.io(), log.?) catch {
-                log.?.err("NetplayManager init failed", .{});
+            state.nm = netman.NetplayManager.init(std.heap.page_allocator, app_io_backend.io(), state.log.?) catch {
+                state.log.?.err("NetplayManager init failed", .{});
                 is_netplay = false;
                 config_received = true;
                 return;
@@ -309,15 +286,15 @@ fn waitForConfig() void {
             const addr_len = @min(read - 7, cfg.peer_addr.len);
             @memcpy(cfg.peer_addr[0..addr_len], payload[7..7 + addr_len]);
 
-            nm.?.configure(cfg);
+            state.nm.?.configure(cfg);
             config_received = true;
-            log.?.info("Config: netplay={} host={} training={} spectator={} delay={d} rollback={d} port={d}", .{
+            state.log.?.info("Config: netplay={} host={} training={} spectator={} delay={d} rollback={d} port={d}", .{
                 is_netplay, cfg.is_host, is_training, is_spectator,
                 cfg.delay, cfg.rollback, cfg.peer_port,
             });
         } else {
             is_training = (flags & 0x01) != 0;
-            log.?.info("Config: offline training={}", .{is_training});
+            state.log.?.info("Config: offline training={}", .{is_training});
         }
     }
     config_received = true;
@@ -326,7 +303,7 @@ fn waitForConfig() void {
 // applyPreLoadHacks / applyHookMainLoop / applyHijackControls /
 // applySfxAsmHacks / writeBytes / rel32 moved to asm_hacks.zig (task 2b).
 // They're reached via the `asm_hacks` import below. Shared `log` logger is
-// accessed by asm_hacks.zig through @import("dllmain.zig").log.
+// accessed by asm_hacks.zig through @import("dll_state.zig").log.
 
 /// Resolve the path to mapping.ini relative to the DLL's own directory.
 ///
@@ -365,17 +342,17 @@ fn resolveMappingIniPath(buf: []u8) ?[]const u8 {
 }
 
 fn applyPostLoadHacks() void {
-    if (log == null) return;
-    log.?.info("Applying post-load hacks...", .{});
+    if (state.log == null) return;
+    state.log.?.info("Applying post-load hacks...", .{});
 
     if (is_training) {
         var fg: [2]u8 = .{ 0xEB, 0x22 };
         asm_hacks.writeBytes(@intFromPtr(force_goto_addr), &fg);
-        log.?.info("forceGotoTraining", .{});
+        state.log.?.info("forceGotoTraining", .{});
     } else {
         var fg: [2]u8 = .{ 0xEB, 0x3F };
         asm_hacks.writeBytes(@intFromPtr(force_goto_addr), &fg);
-        log.?.info("forceGotoVersus", .{});
+        state.log.?.info("forceGotoVersus", .{});
     }
     damage_level_addr.* = 2;
     timer_speed_addr.* = 2;
@@ -388,16 +365,16 @@ fn applyPostLoadHacks() void {
     // return 0, making controllers appear dead.
 
     // Init keyboard (reads MBAA.exe file, no threading concerns)
-    keyboard.init(log.?, app_io_backend.io());
+    keyboard.init(state.log.?, app_io_backend.io());
 
     // Init ENet connection for netplay
-    if (is_netplay and nm != null) {
+    if (is_netplay and state.nm != null) {
         // Don't block in DllMain waiting for the peer — under Wine that
         // appears to stall the game's main thread. Instead, ENet setup
         // runs to completion synchronously here, but the wait-for-connect
         // happens lazily in frameStep (see NetplayManager.connect_attempts).
-        nm.?.initEnet() catch {
-            log.?.err("ENet init failed — netplay disabled", .{});
+        state.nm.?.initEnet() catch {
+            state.log.?.err("ENet init failed — netplay disabled", .{});
             is_netplay = false;
         };
     }
@@ -414,7 +391,7 @@ fn initSdlOnMainThread() void {
 
     if (c.SDL_Init(c.SDL_INIT_GAMECONTROLLER | c.SDL_INIT_JOYSTICK) == 0) {
         sdl_initialized = true;
-        reader = gamepad.GamepadReader.init(log.?);
+        state.reader = gamepad.GamepadReader.init(state.log.?);
 
         // Load custom controller mappings if available. If no mapping.ini
         // exists, fall back to the SDL_GameController API with built-in
@@ -424,18 +401,18 @@ fn initSdlOnMainThread() void {
         // CWD mismatches), falling back to "zzcaster/mapping.ini".
         var mapping_path_buf: [600]u8 = undefined;
         const mapping_path = resolveMappingIniPath(&mapping_path_buf) orelse "zzcaster/mapping.ini";
-        log.?.info("Looking for mapping.ini at: {s}", .{mapping_path});
+        state.log.?.info("Looking for mapping.ini at: {s}", .{mapping_path});
 
         var p1_mapping: mapper.ControllerMapping = undefined;
         var p2_mapping: mapper.ControllerMapping = undefined;
         var have_mappings: bool = false;
-        if (mapper.loadMapping(mapping_path, app_io_backend.io(), log.?)) |mappings| {
+        if (mapper.loadMapping(mapping_path, app_io_backend.io(), state.log.?)) |mappings| {
             p1_mapping = mappings.p1;
             p2_mapping = mappings.p2;
             have_mappings = true;
-            log.?.info("Custom mapping loaded successfully", .{});
+            state.log.?.info("Custom mapping loaded successfully", .{});
         } else {
-            log.?.info("No custom mapping found — using GameController API with built-in button layout", .{});
+            state.log.?.info("No custom mapping found — using GameController API with built-in button layout", .{});
             p1_mapping = mapper.defaultXboxMapping();
             p2_mapping = mapper.defaultXboxMapping();
             p2_mapping.device_index = -1;
@@ -446,22 +423,22 @@ fn initSdlOnMainThread() void {
         // saved mapping, leave reader.custom_mapping = null so
         // readGameController() handles input via the GameController API.
         if (have_mappings) {
-            reader.?.custom_mapping = p1_mapping;
-            openMappedJoystick(&reader.?, p1_mapping, "P1");
+            state.reader.?.custom_mapping = p1_mapping;
+            openMappedJoystick(&state.reader.?, p1_mapping, "P1");
         } else {
-            log.?.info("P1: using GameController API (no custom mapping)", .{});
+            state.log.?.info("P1: using GameController API (no custom mapping)", .{});
         }
 
         // Apply P2 mapping.
         if (have_mappings or p2_mapping.device_index >= 0) {
-            reader2 = gamepad.GamepadReader{};
-            reader2.?.custom_mapping = p2_mapping;
-            openMappedJoystick(&reader2.?, p2_mapping, "P2");
+            state.reader2 = gamepad.GamepadReader{};
+            state.reader2.?.custom_mapping = p2_mapping;
+            openMappedJoystick(&state.reader2.?, p2_mapping, "P2");
         } else {
-            log.?.info("P2: keyboard-only default, no reader2 allocated", .{});
+            state.log.?.info("P2: keyboard-only default, no reader2 allocated", .{});
         }
     } else {
-        log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
+        state.log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
     }
 }
 
@@ -476,17 +453,17 @@ fn initSdlOnMainThread() void {
 /// having both APIs open on the same device produces duplicate input.
 fn openMappedJoystick(r: *gamepad.GamepadReader, m: mapper.ControllerMapping, label: []const u8) void {
     if (m.device_index < 0) {
-        log.?.info("{s}: mapping uses keyboard (device=-1)", .{label});
+        state.log.?.info("{s}: mapping uses keyboard (device=-1)", .{label});
         return;
     }
     var opened: ?*c.SDL_Joystick = c.SDL_JoystickOpen(m.device_index);
     if (opened == null) {
-        log.?.warn("{s}: joystick {d} not available, trying index 0", .{ label, m.device_index });
+        state.log.?.warn("{s}: joystick {d} not available, trying index 0", .{ label, m.device_index });
         opened = c.SDL_JoystickOpen(0);
     }
     r.mapped_joystick = @ptrCast(opened);
     if (r.mapped_joystick != null) {
-        log.?.info("{s}: opened joystick for mapping", .{label});
+        state.log.?.info("{s}: opened joystick for mapping", .{label});
         // Close any GameController that GamepadReader.init() opened for
         // this same physical device — we're using raw joystick API now.
         if (r.controller != null) {
@@ -494,7 +471,7 @@ fn openMappedJoystick(r: *gamepad.GamepadReader, m: mapper.ControllerMapping, la
             r.controller = null;
         }
     } else {
-        log.?.err("{s}: no joystick available for mapping — input will not work", .{label});
+        state.log.?.err("{s}: no joystick available for mapping — input will not work", .{label});
     }
 }
 
@@ -549,8 +526,8 @@ fn lazyInit() void {
         }
         break :init logging.Logger{ .allocator = std.heap.page_allocator, .io = io };
     };
-    log = &log_storage;
-    log.?.info("hook.dll: lazyInit (Zig) pid={d}", .{pid});
+    state.log = &log_storage;
+    state.log.?.info("hook.dll: lazyInit (Zig) pid={d}", .{pid});
 
     _ = win32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002 | 0x00000004);
 
@@ -571,7 +548,7 @@ fn frameStep() callconv(.c) void {
     // during it, bail out until dll_initialized is set. (We deliberately do
     // NOT call lazyInit() here — it must not run on two threads at once.)
     if (!dll_initialized) return;
-    if (log == null) return;
+    if (state.log == null) return;
 
     // If DllMain returned before the launcher sent the config (the
     // non-blocking waitForConfig path), pick it up here and apply the
@@ -598,25 +575,30 @@ fn frameStep() callconv(.c) void {
     // keyboard.readInput() which uses MBAA's built-in config.
     if (config_received and sdl_init_done and !input_diag_logged) {
         input_diag_logged = true;
-        const base_ptr_val = @as(usize, @bitCast(ptr_to_write_input_addr[0..@sizeOf(usize)].*));
-        log.?.info("InputDiag: reader={} reader2={} keyboard.init={} base_ptr=0x{x:0>8} game_mode={d} is_netplay={}", .{
-            reader != null,
-            reader2 != null,
+        // Read the game's input-struct base pointer the same way
+        // dll_state.writeInput does (via the 0x76E6AC address). This is
+        // purely diagnostic — the value is logged so the user can verify
+        // the game allocated its input struct.
+        const input_base_ptr: [*]u8 = @ptrFromInt(0x76E6AC);
+        const base_ptr_val = @as(usize, @bitCast(input_base_ptr[0..@sizeOf(usize)].*));
+        state.log.?.info("InputDiag: reader={} reader2={} keyboard.init={} base_ptr=0x{x:0>8} game_mode={d} is_netplay={}", .{
+            state.reader != null,
+            state.reader2 != null,
             keyboard.isInitialized(),
             base_ptr_val,
             game_mode_addr.*,
             is_netplay,
         });
-        if (reader) |*r| {
+        if (state.reader) |*r| {
             if (r.custom_mapping) |m| {
-                log.?.info("InputDiag: P1 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
+                state.log.?.info("InputDiag: P1 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
             } else {
-                log.?.info("InputDiag: P1 no custom_mapping (will use default Xbox or legacy keyboard)", .{});
+                state.log.?.info("InputDiag: P1 no custom_mapping (will use default Xbox or legacy keyboard)", .{});
             }
         }
-        if (reader2) |*r| {
+        if (state.reader2) |*r| {
             if (r.custom_mapping) |m| {
-                log.?.info("InputDiag: P2 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
+                state.log.?.info("InputDiag: P2 mapping device={d} a.type={s}", .{ m.device_index, @tagName(m.a.type) });
             }
         }
     }
@@ -629,7 +611,7 @@ fn frameStep() callconv(.c) void {
 
     // Detect game mode changes → state transitions
     if (game_mode != prev_game_mode) {
-        if (nm) |*n| n.onGameModeChanged(game_mode);
+        if (state.nm) |*n| n.onGameModeChanged(game_mode);
         prev_game_mode = game_mode;
     }
 
@@ -638,7 +620,7 @@ fn frameStep() callconv(.c) void {
     // intro cutscene; the intro flag (CC_INTRO_STATE_ADDR) drops to 0 only
     // when players can actually move. Also enables RNG sync on the
     // intro-done edge. Matches legacy DllMain.cpp:1266 + 1179.
-    if (nm) |*n| {
+    if (state.nm) |*n| {
         n.checkIntroDone();
         // Round-over detection: tick the countdown, then check. Drives the
         // InGame→Skippable transition via the no_input_flags (KO/time over),
@@ -670,7 +652,7 @@ fn frameStep() callconv(.c) void {
     //
     // In offline mode (nm == null), there is no rollback, so we always
     // clear. In netplay mode, we clear only when not re-running.
-    if (nm) |*n| {
+    if (state.nm) |*n| {
         if (!n.isRerunning()) {
             @memset(&sfx_dedup.sfx_filter_array, 0);
             @memset(&sfx_dedup.sfx_mute_array, 0);
@@ -706,40 +688,11 @@ fn frameStep() callconv(.c) void {
     frame_step.frameStepInGame(world_timer, game_mode);
 }
 
-// Callback used by SpectatorManager.frameStepSpectators to fill a BothInputs
-// packet for a given (index, frame) — we route it back into NetplayManager.
-// `pub` so frame_step.frameStepNetplay can pass it to
-// n.spectators.?.frameStepSpectators (the host-side BothInputs broadcast).
-pub fn fillBothInputsCallback(index: u32, frame: u32, out: []u8) usize {
-    if (nm) |*n| {
-        return n.fillBothInputsForBroadcast(index, frame, out);
-    }
-    return 0;
-}
-
-// writeInput — `pub` so frame_step.frameStepOffline can call it (it lives
-// here rather than in frame_step.zig because it owns the input-struct base
-// pointer layout, which is closely tied to the game-mode constants above).
-pub fn writeInput(player: u8, input: u16) void {
-    // ptr_to_write_input_addr points to a usize holding the base address of
-    // the game's input struct. On 64-bit targets the host address is
-    // 4-byte aligned but usize wants 8, so we read through a u8 pointer
-    // and bit-cast the result.
-    const base_ptr = @as(usize, @bitCast(ptr_to_write_input_addr[0..@sizeOf(usize)].*));
-    if (base_ptr == 0) return;
-    const base: [*]u8 = @ptrFromInt(base_ptr);
-    const dir_off: u32 = if (player == 1) p1_off_dir else p2_off_dir;
-    const btn_off: u32 = if (player == 1) p1_off_btn else p2_off_btn;
-    // COMBINE_INPUT(dir, btn) = dir | (btn << 4); write both halves as u16
-    // to match the legacy C++ DLL (see DllProcessManager.cpp::writeGameInput).
-    // Writing u8 here leaves the high byte of each u16 slot at whatever
-    // the game last stored there, which flips unrelated button bits.
-    const dir_ptr: *u16 = @ptrCast(@alignCast(base + dir_off));
-    const btn_ptr: *u16 = @ptrCast(@alignCast(base + btn_off));
-    dir_ptr.* = input & 0x0F;
-    btn_ptr.* = (input >> 4) & 0x0FFF;
-}
-
+// writeInput / fillBothInputsCallback / zzcasterFrameCallback moved to
+// dll_state.zig (task: break circular imports). They're reached via the
+// `state` import at the top of this file, and via `@import("dll_state.zig")`
+// from asm_hacks.zig and frame_step.zig.
+//
 // writeBytes / rel32 moved to asm_hacks.zig (task 2b). They're reached via
 // `asm_hacks.writeBytes(...)` and `asm_hacks.rel32(...)` from the patch
 // installers in that file, and from applyPostLoadHacks above.

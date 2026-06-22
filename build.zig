@@ -142,11 +142,15 @@ pub fn build(b: *std.Build) void {
     dll_mod.addIncludePath(b.path("libs/enet/include"));
     dll_mod.linkLibrary(enet);
 
-    // --- dll export module (root = mod.zig, re-exports all dll files) ---
-    // Used by the launcher to import dll types (controller_mapper, gamepad, etc.)
-    // without pulling in dllmain.zig (which has DLL-specific DllMain export).
+    // --- dll export module (root = exports.zig, re-exports only the symbols
+    // external consumers need) ---
+    // Used by the launcher to import dll types (currently just
+    // controller_mapper) without pulling in dllmain.zig (which has the
+    // DLL-specific DllMain export) or the full DLL surface. Keeping this
+    // narrow avoids recompiling netplay_manager/rollback/etc. into the
+    // launcher when they're dead code there.
     const dll_export_mod = b.createModule(.{
-        .root_source_file = b.path("src/dll/mod.zig"),
+        .root_source_file = b.path("src/dll/exports.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
@@ -247,4 +251,28 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run zzcaster");
     run_step.dependOn(&run_cmd.step);
+
+    // === Test step ===
+    // Runs `test` blocks on the HOST (not cross-compiled) — the common module
+    // (config, logging, ipc) is pure logic with no Win32/SDL deps, so it tests
+    // cleanly on Linux. The dll/launcher modules pull in Windows-only linkage
+    // (ws2_32, SDL2, game-memory addresses) and aren't host-testable; they're
+    // verified via the cross-compile build above instead.
+    //
+    // We build a fresh test module (not common_mod itself, which is already
+    // wired for cross-compilation) so `zig build test` works on the native
+    // host without a -Dtarget flag.
+    const common_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/common/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const common_tests = b.addTest(.{
+        .root_module = common_test_mod,
+    });
+    const run_common_tests = b.addRunArtifact(common_tests);
+
+    const test_step = b.step("test", "Run unit tests (host)");
+    test_step.dependOn(&run_common_tests.step);
 }

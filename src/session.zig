@@ -1,6 +1,7 @@
 const std = @import("std");
 const logging = @import("logging.zig");
-const net = @import("net.zig");
+const net = @import("enet_transport.zig");
+const ip_discovery = @import("ip_discovery.zig");
 const net_util = @import("net_util.zig");
 
 // Re-use NetplayManager.NetplayConfig so the launcher and the DLL see the same
@@ -129,10 +130,10 @@ pub const NetplaySession = struct {
     }
 
     pub fn lookupHostAddresses(self: *NetplaySession) void {
-        if (net.getPublicIp(&self.public_ip_buf)) |ip| {
+        if (ip_discovery.getPublicIp(&self.public_ip_buf)) |ip| {
             self.public_ip_len = ip.len;
         }
-        if (net.getLocalIp(&self.local_ip_buf)) |ip| {
+        if (ip_discovery.getLocalIp(&self.local_ip_buf)) |ip| {
             self.local_ip_len = ip.len;
         }
     }

@@ -3,13 +3,13 @@ const logging = @import("logging.zig");
 const rollback = @import("rollback.zig");
 const sfx_dedup = @import("sfx_dedup.zig");
 const spectator_manager_mod = @import("spectator_manager.zig");
-const net = @import("net.zig");
+const net = @import("enet_transport.zig");
 const rollback_regions = @import("rollback_regions.zig");
 
 const Md5 = std.crypto.hash.Md5;
 
-// Use the shared ENet cimport from net.zig so all files see the same
-// `cimport.struct__ENetPeer` / `cimport.struct__ENetHost` types.
+// Use the shared ENet cimport from enet_transport.zig so all files see the
+// same `cimport.struct__ENetPeer` / `cimport.struct__ENetHost` types.
 const enet = net.enet;
 
 // Game memory addresses

@@ -273,6 +273,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_common_tests = b.addRunArtifact(common_tests);
 
+    // air_dash_macro.zig is pure std (no Win32/SDL/game-memory deps), so like
+    // the common module it host-tests cleanly. Build a fresh test module
+    // rather than reusing the cross-compiled dll module.
+    const air_dash_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/dll/air_dash_macro.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const air_dash_tests = b.addTest(.{
+        .root_module = air_dash_test_mod,
+    });
+    const run_air_dash_tests = b.addRunArtifact(air_dash_tests);
+
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_common_tests.step);
+    test_step.dependOn(&run_air_dash_tests.step);
 }

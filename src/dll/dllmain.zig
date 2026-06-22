@@ -437,6 +437,25 @@ fn initSdlOnMainThread() void {
         } else {
             state.log.?.info("P2: keyboard-only default, no reader2 allocated", .{});
         }
+
+        // Wire Air Dash Macro enable flags from the per-player mappings.
+        // The macro state machines themselves live in dll_state (offline P1/P2)
+        // and NetplayManager (netplay local player); we just flip `enabled`
+        // here from mapping.ini. Default mappings leave it false (struct
+        // default), so this is a no-op unless the user opted in via the
+        // Controllers tab.
+        state.air_dash_macro_p1.enabled = p1_mapping.air_dash_macro;
+        state.air_dash_macro_p2.enabled = p2_mapping.air_dash_macro;
+        if (p1_mapping.air_dash_macro or p2_mapping.air_dash_macro) {
+            state.log.?.info("Air Dash Macro: P1={} P2={}", .{
+                p1_mapping.air_dash_macro, p2_mapping.air_dash_macro,
+            });
+        }
+        if (state.nm) |*n| {
+            // Netplay local input always uses the P1 (reader) mapping in the
+            // current frame_step path, so the netplay macro follows P1.
+            n.air_dash_macro.enabled = p1_mapping.air_dash_macro;
+        }
     } else {
         state.log.?.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
     }

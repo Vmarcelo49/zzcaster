@@ -201,6 +201,14 @@ pub fn drawPlayerPanel(
 
     c.igSpacing();
 
+    // Air Dash Macro toggle. Per-player input option (see
+    // docs/air-dash-macro-design.md). When enabled, pressing 9AB/7AB is
+    // expanded into a 2-frame jump→air-dash sequence before the input reaches
+    // the game / network. Off by default.
+    _ = c.igCheckbox("Air Dash Macro (9AB/7AB)", &m.air_dash_macro);
+
+    c.igSpacing();
+
     // Analog Deadzone as a 0.0-1.0 float slider.
     // Internally stored as u32 (0-32767, matching SDL axis range), but
     // displayed as a normalized float for user-friendliness.
@@ -343,6 +351,11 @@ pub fn drawListPanel(
     c.igSameLine(0, 8);
     if (c.igRadioButton_Bool("Both neg", m.socd_mode == 3)) m.socd_mode = 3;
     if (m.socd_mode == 0) m.socd_mode = 1;
+
+    c.igSpacing();
+
+    // Air Dash Macro toggle (per-player; see drawPlayerPanel for details).
+    _ = c.igCheckbox("Air Dash Macro (9AB/7AB)", &m.air_dash_macro);
 
     c.igSpacing();
 

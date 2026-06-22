@@ -1,7 +1,7 @@
 # Air Dash Macro — Technical Design Document
 
 **Issue:** Feature request — optional "Air Dash Macro" input transformation
-**Status:** Design phase (not yet implemented)
+**Status:** Implemented (branch `feat/air-dash-macro`)
 **Date:** 2026-06-22
 
 ---
@@ -469,7 +469,9 @@ The DLL loads `mapping.ini` in `applyPostLoadHacks` / `initSdlOnMainThread`. The
 ## 8. Implementation Plan
 
 ### Phase 1: Core macro logic (offline only)
-1. Add `AirDashMacro` struct to a new file `src/air_dash_macro.zig`
+1. Add `AirDashMacro` struct to a new file `src/dll/air_dash_macro.zig`
+   (moved under `src/dll/` to match the post-restructure layout; the
+   original design said `src/air_dash_macro.zig`)
 2. Add `air_dash_macro: bool = false` to `ControllerMapping`
 3. Add `air_dash_macro` serialization to `saveMapping` / `loadMapping`
 4. In `dllmain.zig` offline branch: instantiate per-player macro state, call `applyAirDashMacro` before `writeInput`

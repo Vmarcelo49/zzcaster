@@ -125,7 +125,27 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // Apply per-state input filtering (catch-up mash, mask Cancel in
     // chara-select, only Confirm/Cancel in loading/intro/skippable).
     // This is the Zig equivalent of CCCaster's getInput(player) dispatch.
-    const local_input: u16 = n.getNetplayInput(raw_input);
+    var local_input: u16 = n.getNetplayInput(raw_input);
+
+    // Air Dash Macro: runs AFTER state filtering and BEFORE setLocalInput, so
+    // the expanded jump→dash sequence is what enters the InputBuffer, gets sent
+    // to the peer, and is replayed by rollback re-runs (design doc §3, §5).
+    // Only active in-game; outside of in-game we reset so a pending dash can't
+    // fire on the first frame of the next round.
+    if (n.state == .in_game) {
+        const r = n.air_dash_macro.step(local_input);
+        if (r.triggered) {
+            // r.output is the bare jump diagonal (9 or 7); dash_dir (6 or 4)
+            // is what the macro will inject next frame. Log both for debugging
+            // desync reports (design doc §5.5).
+            state.log.?.info("AirDashMacro: {d}AB -> jump {d} + dash {d}AB at frame {d}", .{
+                r.output, r.output, n.air_dash_macro.dash_dir, n.indexed_frame.frame,
+            });
+        }
+        local_input = r.output;
+    } else {
+        n.air_dash_macro.reset();
+    }
 
     n.updateFrame();
 
@@ -309,8 +329,34 @@ fn frameStepOffline(game_mode: u32) void {
         }
         break :blk 0;
     };
-    state.writeInput(1, p1_input);
-    state.writeInput(2, p2_input);
+
+    // Air Dash Macro (offline): transform each local player's input before it
+    // reaches the game. Only in gameplay; outside of in-game we reset the
+    // state machines so a pending dash can't leak into the next round/match.
+    var p1_out = p1_input;
+    var p2_out = p2_input;
+    if (game_mode == mode_in_game) {
+        const r1 = state.air_dash_macro_p1.step(p1_input);
+        if (r1.triggered) {
+            state.log.?.info("AirDashMacro(P1): {d}AB -> jump {d} + dash {d}AB", .{
+                r1.output, r1.output, state.air_dash_macro_p1.dash_dir,
+            });
+        }
+        const r2 = state.air_dash_macro_p2.step(p2_input);
+        if (r2.triggered) {
+            state.log.?.info("AirDashMacro(P2): {d}AB -> jump {d} + dash {d}AB", .{
+                r2.output, r2.output, state.air_dash_macro_p2.dash_dir,
+            });
+        }
+        p1_out = r1.output;
+        p2_out = r2.output;
+    } else {
+        state.air_dash_macro_p1.reset();
+        state.air_dash_macro_p2.reset();
+    }
+
+    state.writeInput(1, p1_out);
+    state.writeInput(2, p2_out);
 
     // Periodic diagnostic: log P1/P2 input values every 300 frames
     // (~5s at 60fps). If p1_input is always 0 even when the user
@@ -322,7 +368,7 @@ fn frameStepOffline(game_mode: u32) void {
     state.input_log_frame +%= 1;
     if (state.input_log_frame % 300 == 0) {
         state.log.?.info("InputFrame {d}: P1=0x{x:0>4} P2=0x{x:0>4} mode={d}", .{
-            state.input_log_frame, p1_input, p2_input, game_mode,
+            state.input_log_frame, p1_out, p2_out, game_mode,
         });
     }
 }
@@ -334,3 +380,9 @@ fn frameStepOffline(game_mode: u32) void {
 comptime {
     _ = gamepad;
 }
+
+// Game mode code for "in-game" (matches mode_in_game in dllmain.zig /
+// netplay_manager.zig). The offline macro only runs during actual gameplay —
+// in chara-select/menus a 9AB press means nothing and would just corrupt
+// menu navigation if rewritten.
+const mode_in_game: u32 = 1;

@@ -6,6 +6,8 @@ const spectator_manager_mod = @import("spectator_manager.zig");
 const net = @import("net.zig");
 const rollback_regions = @import("rollback_regions.zig");
 
+const Md5 = std.crypto.hash.Md5;
+
 // Use the shared ENet cimport from net.zig so all files see the same
 // `cimport.struct__ENetPeer` / `cimport.struct__ENetHost` types.
 const enet = net.enet;
@@ -30,6 +32,51 @@ const rng_state1_addr: *u32 = @ptrFromInt(0x56377C);
 const rng_state2_addr: *u32 = @ptrFromInt(0x564068);
 const rng_state3_addr: [*]u8 = @ptrFromInt(0x564070);
 const rng_state3_size: u32 = 220;
+
+// Sync-relevant addresses (ported from netplay/Constants.hpp).
+// Used by the SyncHash desync detector and the intro→in-game transition.
+const game_state_addr: *u32 = @ptrFromInt(0x74D598); // CC_GAME_STATE_ADDR (99 = intro done)
+const intro_state_addr: *u8 = @ptrFromInt(0x55D20B); // CC_INTRO_STATE_ADDR (2=chara intro, 1=pre-game, 0=in-game)
+const round_timer_addr: *u32 = @ptrFromInt(0x562A3C); // CC_ROUND_TIMER_ADDR
+const real_timer_addr: *u32 = @ptrFromInt(0x562A40); // CC_REAL_TIMER_ADDR
+const camera_x_addr: *i32 = @ptrFromInt(0x564B14); // CC_CAMERA_X_ADDR
+const camera_y_addr: *i32 = @ptrFromInt(0x564B18); // CC_CAMERA_Y_ADDR
+
+// Player struct layout (CC_PLR_STRUCT_SIZE = 0xAFC). P1 base = 0x555130.
+const player_struct_size: u32 = 0xAFC;
+const p1_base: u32 = 0x555130;
+const p2_base: u32 = 0x555130 + player_struct_size;
+const p3_base: u32 = 0x555130 + 2 * player_struct_size; // P1 puppet
+const p4_base: u32 = 0x555130 + 3 * player_struct_size; // P2 puppet
+// Offsets within a player struct (relative to base).
+const off_enabled: u32 = 0x000; // u8
+const off_sequence: u32 = 0x010; // u32
+const off_seq_state: u32 = 0x014; // u32
+const off_health: u32 = 0x0BC; // u32
+const off_red_health: u32 = 0x0C0; // u32
+const off_guard_bar: u32 = 0x0C4; // f32
+const off_guard_quality: u32 = 0x0D8; // f32
+const off_meter: u32 = 0x0E0; // u32
+const off_heat: u32 = 0x0E4; // u32
+const off_x: u32 = 0x108; // i32
+const off_y: u32 = 0x10C; // i32
+const off_no_input_flag: u32 = 0x177; // u8
+const off_puppet_state: u32 = 0x178; // u8
+
+// Character select selectors (only valid in chara-select state).
+const p1_character_addr: *u32 = @ptrFromInt(0x74D8FC);
+const p2_character_addr: *u32 = @ptrFromInt(0x74D920);
+const p1_moon_addr: *u32 = @ptrFromInt(0x74D900);
+const p2_moon_addr: *u32 = @ptrFromInt(0x74D924);
+
+// Game-state values (CC_GAME_STATE_*).
+const game_state_intro_done: u32 = 99; // CC_GAME_STATE_INTRO_DONE
+
+// Number of frames in the initial movement-only (pre-game) intro phase.
+// Matches CC_PRE_GAME_INTRO_FRAMES in Constants.hpp. During a rollback
+// re-run that advances past this frame, CC_INTRO_STATE_ADDR must be forced
+// to 0 so the re-run doesn't re-trigger intro logic.
+const pre_game_intro_frames: u32 = 224;
 
 // Game modes
 const mode_startup: u32 = 65535;
@@ -60,6 +107,10 @@ const keyboard_config_offset: u32 = 0x14D2C0;
 const num_inputs: u32 = 30;
 const max_rollback: u8 = 15;
 
+// Health-check timeouts (ported from CCCaster's GoBackN keepalive + input-wait)
+const heartbeat_timeout_ms: i64 = 20000; // 20s — no packet → peer is dead
+const input_wait_timeout_ms: i64 = 10000; // 10s — no remote input → timed out
+
 pub const NetplayState = enum {
     pre_initial,
     initial,
@@ -87,6 +138,226 @@ pub const NetplayConfig = struct {
     is_netplay: bool = false,
     spectator_listen_port: u16 = 0, // host: port to also-listen on for spectators (== peer_port)
 };
+
+// --- SyncHash (desync detection) ---
+//
+// Ported from netplay/Messages.hpp SyncHash + targets/DllHacks.cpp SyncHash
+// constructor. Each peer periodically snapshots a compact view of game state
+// and exchanges it; on mismatch, the match aborts. This is the legacy's only
+// desync detector — ZZCaster had none, so desyncs ran silently.
+//
+// The snapshot has two parts:
+//   1. `hash`: MD5 of the RNG state (the determinism root). If this differs,
+//      the RNG has diverged and every subsequent frame will desync.
+//   2. `CharaHash[2]` + timers + camera: detailed per-field state used for
+//      diagnosis (the log dump tells you *which* field diverged).
+//
+// Comparison semantics (from Messages.hpp operator==):
+//   - indexed_frame, hash, round_timer, real_timer, camera must match exactly
+//   - per-chara: everything except `seq == 0`'s seqState (the neutral
+//     sequence's state is allowed to differ — legacy quirk)
+const md5_digest_size: usize = 16;
+
+const CharaHash = extern struct {
+    seq: u32 = 0,
+    seq_state: u32 = 0,
+    health: u32 = 0,
+    red_health: u32 = 0,
+    meter: u32 = 0,
+    heat: u32 = 0,
+    guard_bar: f32 = 0,
+    guard_quality: f32 = 0,
+    x: i32 = 0,
+    y: i32 = 0,
+    chara: u16 = 0,
+    moon: u16 = 0,
+};
+
+const SyncHash = struct {
+    // indexed_frame packed as u64 (frame | (index << 32)) — matches legacy
+    // IndexedFrame.value and makes ordering/comparison trivial.
+    indexed_frame: u64 = 0,
+    hash: [md5_digest_size]u8 = [_]u8{0} ** md5_digest_size,
+    round_timer: u32 = 0,
+    real_timer: u32 = 0,
+    camera_x: i32 = 0,
+    camera_y: i32 = 0,
+    chara: [2]CharaHash = .{ .{}, .{} },
+
+    /// Snapshot the current game state into a SyncHash. Mirrors the legacy
+    /// SyncHash constructor in DllHacks.cpp. When not in-game, only the
+    /// character/moon selectors are captured (matching legacy's early return).
+    fn capture(indexed_frame: u64) SyncHash {
+        var sh: SyncHash = .{ .indexed_frame = indexed_frame };
+
+        // MD5 over RNG state (3 × u32 + 220 bytes), exactly as legacy does.
+        var rng_buf: [12 + rng_state3_size]u8 = undefined;
+        std.mem.writeInt(u32, rng_buf[0..4], rng_state0_addr.*, .little);
+        std.mem.writeInt(u32, rng_buf[4..8], rng_state1_addr.*, .little);
+        std.mem.writeInt(u32, rng_buf[8..12], rng_state2_addr.*, .little);
+        @memcpy(rng_buf[12..][0..rng_state3_size], rng_state3_addr[0..rng_state3_size]);
+        Md5.hash(&rng_buf, &sh.hash, .{});
+
+        if (game_mode_addr.* != mode_in_game) {
+            // Pre-game: only chara/moon selectors are meaningful.
+            sh.chara[0].chara = @truncate(p1_character_addr.*);
+            sh.chara[0].moon = @truncate(p1_moon_addr.*);
+            sh.chara[1].chara = @truncate(p2_character_addr.*);
+            sh.chara[1].moon = @truncate(p2_moon_addr.*);
+            return sh;
+        }
+
+        sh.round_timer = round_timer_addr.*;
+        sh.real_timer = real_timer_addr.*;
+        sh.camera_x = camera_x_addr.*;
+        sh.camera_y = camera_y_addr.*;
+
+        sh.chara[0] = readCharaHash(p1_base);
+        sh.chara[1] = readCharaHash(p2_base);
+        // chara/moon come from the chara-select selector addresses even in-game
+        // (legacy SAVE_CHARA reads CC_Pn_CHARACTER_ADDR / CC_Pn_MOON_SELECTOR_ADDR).
+        sh.chara[0].chara = @truncate(p1_character_addr.*);
+        sh.chara[0].moon = @truncate(p1_moon_addr.*);
+        sh.chara[1].chara = @truncate(p2_character_addr.*);
+        sh.chara[1].moon = @truncate(p2_moon_addr.*);
+        return sh;
+    }
+
+    /// Compare two hashes. Returns true if they match (legacy operator==,
+    /// including the seq==0 seqState exception). The indexed_frame is NOT
+    /// compared here — callers pair entries by indexed_frame before invoking.
+    fn matches(self: SyncHash, other: SyncHash) bool {
+        if (!std.mem.eql(u8, &self.hash, &other.hash)) return false;
+        if (self.round_timer != other.round_timer) return false;
+        if (self.real_timer != other.real_timer) return false;
+        if (self.camera_x != other.camera_x) return false;
+        if (self.camera_y != other.camera_y) return false;
+        return charaMatches(self.chara[0], other.chara[0]) and
+            charaMatches(self.chara[1], other.chara[1]);
+    }
+
+    fn charaMatches(a: CharaHash, b: CharaHash) bool {
+        // Compare everything except the two seq fields first (legacy compares
+        // the byte block from offset 8 onward, i.e. health..moon).
+        if (a.health != b.health) return false;
+        if (a.red_health != b.red_health) return false;
+        if (a.meter != b.meter) return false;
+        if (a.heat != b.heat) return false;
+        if (a.guard_bar != b.guard_bar) return false;
+        if (a.guard_quality != b.guard_quality) return false;
+        if (a.x != b.x) return false;
+        if (a.y != b.y) return false;
+        if (a.seq != b.seq) return false;
+        // Special case: seq 0 (the neutral sequence) is allowed to differ in
+        // seqState — legacy quirk preserved for hash compatibility.
+        if (a.seq != 0 and a.seq_state != b.seq_state) return false;
+        return true;
+    }
+
+    /// Serialize into a flat byte buffer for the wire. Format:
+    ///   [8 indexed_frame][16 md5][4 round_timer][4 real_timer]
+    ///   [4 camera_x][4 camera_y][2 × CharaHash (48 bytes each)]
+    /// Total = 8 + 16 + 16 + 96 = 136 bytes.
+    fn serialize(self: SyncHash, buf: []u8) usize {
+        std.mem.writeInt(u64, buf[0..8], self.indexed_frame, .little);
+        @memcpy(buf[8..24], &self.hash);
+        std.mem.writeInt(u32, buf[24..28], self.round_timer, .little);
+        std.mem.writeInt(u32, buf[28..32], self.real_timer, .little);
+        std.mem.writeInt(i32, buf[32..36], self.camera_x, .little);
+        std.mem.writeInt(i32, buf[36..40], self.camera_y, .little);
+        writeCharaHash(buf[40..88], self.chara[0]);
+        writeCharaHash(buf[88..136], self.chara[1]);
+        return 136;
+    }
+
+    fn deserialize(data: []const u8) ?SyncHash {
+        if (data.len < 136) return null;
+        var sh: SyncHash = .{};
+        sh.indexed_frame = std.mem.readInt(u64, data[0..8], .little);
+        @memcpy(&sh.hash, data[8..24]);
+        sh.round_timer = std.mem.readInt(u32, data[24..28], .little);
+        sh.real_timer = std.mem.readInt(u32, data[28..32], .little);
+        sh.camera_x = std.mem.readInt(i32, data[32..36], .little);
+        sh.camera_y = std.mem.readInt(i32, data[36..40], .little);
+        sh.chara[0] = readCharaHashBuf(data[40..88]);
+        sh.chara[1] = readCharaHashBuf(data[88..136]);
+        return sh;
+    }
+
+    fn writeCharaHash(buf: []u8, c: CharaHash) void {
+        std.mem.writeInt(u32, buf[0..4], c.seq, .little);
+        std.mem.writeInt(u32, buf[4..8], c.seq_state, .little);
+        std.mem.writeInt(u32, buf[8..12], c.health, .little);
+        std.mem.writeInt(u32, buf[12..16], c.red_health, .little);
+        std.mem.writeInt(u32, buf[16..20], c.meter, .little);
+        std.mem.writeInt(u32, buf[20..24], c.heat, .little);
+        std.mem.writeInt(u32, buf[24..28], @bitCast(c.guard_bar), .little);
+        std.mem.writeInt(u32, buf[28..32], @bitCast(c.guard_quality), .little);
+        std.mem.writeInt(i32, buf[32..36], c.x, .little);
+        std.mem.writeInt(i32, buf[36..40], c.y, .little);
+        std.mem.writeInt(u16, buf[40..42], c.chara, .little);
+        std.mem.writeInt(u16, buf[42..44], c.moon, .little);
+        // 44 bytes used; legacy CharaHash struct has padding to 48 (the 16-bit
+        // chara/moon fields force alignment). We pack tightly here and the
+        // 4 trailing bytes are unused — buf[44..48] is scratch.
+    }
+
+    fn readCharaHashBuf(buf: []const u8) CharaHash {
+        return .{
+            .seq = std.mem.readInt(u32, buf[0..4], .little),
+            .seq_state = std.mem.readInt(u32, buf[4..8], .little),
+            .health = std.mem.readInt(u32, buf[8..12], .little),
+            .red_health = std.mem.readInt(u32, buf[12..16], .little),
+            .meter = std.mem.readInt(u32, buf[16..20], .little),
+            .heat = std.mem.readInt(u32, buf[20..24], .little),
+            .guard_bar = @bitCast(std.mem.readInt(u32, buf[24..28], .little)),
+            .guard_quality = @bitCast(std.mem.readInt(u32, buf[28..32], .little)),
+            .x = std.mem.readInt(i32, buf[32..36], .little),
+            .y = std.mem.readInt(i32, buf[36..40], .little),
+            .chara = std.mem.readInt(u16, buf[40..42], .little),
+            .moon = std.mem.readInt(u16, buf[42..44], .little),
+        };
+    }
+};
+
+/// Read a CharaHash from a player struct base address. Mirrors SAVE_CHARA in
+/// DllHacks.cpp, including the guardBar=0-during-intro rule.
+fn readCharaHash(base_addr: u32) CharaHash {
+    const base: [*]u8 = @ptrFromInt(base_addr);
+    return .{
+        .seq = readU32At(base + off_sequence),
+        .seq_state = readU32At(base + off_seq_state),
+        .health = readU32At(base + off_health),
+        .red_health = readU32At(base + off_red_health),
+        .meter = readU32At(base + off_meter),
+        .heat = readU32At(base + off_heat),
+        // Legacy zeroes guardBar while CC_INTRO_STATE_ADDR != 0 — the bar is
+        // not meaningful during the intro. Preserve that for hash parity.
+        .guard_bar = if (intro_state_addr.* != 0) 0.0 else @bitCast(readU32At(base + off_guard_bar)),
+        .guard_quality = @bitCast(readU32At(base + off_guard_quality)),
+        .x = @bitCast(readU32At(base + off_x)),
+        .y = @bitCast(readU32At(base + off_y)),
+        // chara/moon come from the chara-select selectors, not the player
+        // struct. Filled by the caller for in-game too.
+        .chara = 0,
+        .moon = 0,
+    };
+}
+
+fn readU32At(p: [*]u8) u32 {
+    return std.mem.readInt(u32, p[0..4], .little);
+}
+
+// SyncHash cadence/queue sizing. Placed at file scope because Zig disallows
+// declarations between struct fields. Ported from the legacy SyncHash exchange
+// (DllMain.cpp:775-789): send every 5s and at frame 149 of each 150-cycle.
+const sync_send_period: u32 = 5 * 60; // 5 seconds at 60fps
+const sync_queue_len: u8 = 16;
+
+// Round-over: extra frames to wait before committing the InGame→Skippable
+// transition when rollback is enabled. Matches ROLLBACK_ROUND_OVER_DELAY in
+// DllMain.cpp:38.
+const rollback_round_over_delay: i32 = 5;
 
 pub const NetplayManager = struct {
     allocator: std.mem.Allocator,
@@ -117,6 +388,14 @@ pub const NetplayManager = struct {
     min_rollback_spacing: u8 = 2,
     fast_fwd_stop_frame: u32 = 0,
 
+    // Round-over detection (ported from DllMain.cpp checkRoundOver).
+    // Sentinel scheme matches the legacy `roundOverTimer`:
+    //   -1 = armed, waiting for the round-over condition
+    //    0 = fire the InGame→Skippable transition this frame
+    //   >0 = counting down (rollback path only: rollback + delay frames)
+    // The non-rollback path transitions immediately on isOver.
+    round_over_timer: i32 = -1,
+
     // SFX dedup (drives the sfx_filter_array / sfx_mute_array + history ring)
     sfx_dedup: ?sfx_dedup.SfxDedup = null,
 
@@ -126,6 +405,9 @@ pub const NetplayManager = struct {
     // RNG sync
     should_sync_rng: bool = true,
     rng_synced: bool = false,
+    // One-shot latch so the CC_GAME_STATE_INTRO_DONE edge (game_state==99)
+    // enables RNG sync exactly once per round. Reset on state transitions.
+    intro_rng_enabled: bool = false,
 
     // Input resend
     resend_timer_active: bool = false,
@@ -151,6 +433,33 @@ pub const NetplayManager = struct {
     // learned from TransitionIndex messages. Used by isRemoteInputReady to
     // decide whether to wait (remote behind) or predict (remote ahead).
     remote_index: u32 = 0,
+
+    // Heartbeat: timestamp (ms) of the last packet received from the peer.
+    // Updated in pollEnet() whenever any packet arrives. Checked in
+    // frameStep — if now - last_packet_ms > HEARTBEAT_TIMEOUT_MS (20s),
+    // we force a disconnect. This catches dead peers that crash/kill
+    // without sending an ENET_EVENT_TYPE_DISCONNECT (which is the only
+    // other way to detect a dead connection).
+    last_packet_ms: i64 = 0,
+
+    // --- SyncHash desync detection (ported from DllMain.cpp:775-831) ---
+    //
+    // Every sync_send_period frames (5s = 300f at 60fps) and at frame 149 of
+    // each 150-cycle, each peer snapshots game state, sends it, and stores
+    // the local copy. When matching indexed_frame entries exist in both
+    // queues, they're compared; mismatch → set desync_detected and the frame
+    // loop force-exits the game (matches legacy delayedStop("Desync!")).
+    //
+    // The queues are bounded ring buffers: legacy uses std::list and pops from
+    // the front on match; we keep the last sync_queue_len entries, which is
+    // plenty since exchanges complete within a few frames of each other.
+    local_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
+    remote_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
+    local_sync_count: u8 = 0, // entries valid from index 0
+    remote_sync_count: u8 = 0,
+    desync_detected: bool = false,
+    desync_local: ?SyncHash = null,
+    desync_remote: ?SyncHash = null,
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, log: *logging.Logger) !NetplayManager {
         return .{
@@ -387,6 +696,8 @@ pub const NetplayManager = struct {
                 // (we haven't agreed on a frame yet); count it so the 60s-cap
                 // log can show "we got N mystery packets instead of a CONNECT".
                 if (!self.enet_connected) self.diag_connect_receives += 1;
+                // Heartbeat: record when we last heard from the peer.
+                self.last_packet_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
                 const pkt = event.packet;
                 const data = pkt.*.data;
                 const len = pkt.*.dataLength;
@@ -426,6 +737,8 @@ pub const NetplayManager = struct {
                     self.config.is_host,
                     self.enet_connected,
                 });
+                // Heartbeat: start the heartbeat clock from the CONNECT event.
+                self.last_packet_ms = std.Io.Clock.now(.real, self.io).toMilliseconds();
                 if (self.config.is_host and !self.enet_connected) {
                     self.enet_peer = event.peer;
                     self.enet_connected = true;
@@ -461,6 +774,9 @@ pub const NetplayManager = struct {
                     const idx = std.mem.readInt(u32, msg[1..5], .little);
                     self.setRemoteIndex(idx);
                 }
+            },
+            0x04 => { // SyncHash (desync detection)
+                self.applyRemoteSyncHash(msg[1..]);
             },
             0x20 => { // BothInputs (spectator broadcast from host)
                 if (self.config.is_spectator) {
@@ -573,6 +889,84 @@ pub const NetplayManager = struct {
 
     // --- Input management ---
 
+    /// Returns true if the remote peer's transition index is more than 1
+    /// ahead of ours — meaning we're lagging behind and should auto-mash
+    /// Confirm to catch up. Used by getNetplayInput() in Loading/CharaIntro/
+    /// Skippable states to prevent one side from being stuck on a screen
+    /// while the other has already advanced.
+    pub fn shouldCatchUp(self: *const NetplayManager) bool {
+        if (self.remote_inputs.getEndIndex() == 0) return false;
+        const remote_end_index = self.remote_inputs.getEndIndex() - 1;
+        return remote_end_index > self.indexed_frame.index + 1;
+    }
+
+    /// Get the input to send/write for the local player, with per-state
+    /// filtering. This is the Zig equivalent of CCCaster's getInput(player)
+    /// dispatch.
+    ///
+    /// - CharaSelect: real input, but B/Cancel masked (can't back out)
+    /// - Loading/CharaIntro/Skippable: if remote is ahead, mash Confirm;
+    ///   otherwise only Confirm/Cancel pass through (no cursor movement)
+    /// - InGame/RetryMenu: real input (filtered later by game logic)
+    /// - PreInitial/Initial: mash Confirm to auto-advance menus
+    pub fn getNetplayInput(self: *NetplayManager, raw_input: u16) u16 {
+        switch (self.state) {
+            .pre_initial, .initial => {
+                // Mash Confirm every other frame to auto-advance through
+                // the title screen and menus.
+                if (self.indexed_frame.frame % 2 == 0) {
+                    return button_confirm << 4;
+                }
+                return 0;
+            },
+            .chara_select => {
+                // Input layout: combined u16 = dir (low nibble) | (btns << 4).
+                // So a button constant B lives at bit (B << 4) in the combined
+                // u16. Relevant button constants (see Constants.hpp):
+                //   CC_BUTTON_A       = 0x0010 -> combined bit 0x0100
+                //   CC_BUTTON_B       = 0x0020 -> combined bit 0x0200
+                //   CC_BUTTON_CONFIRM = 0x0400 -> combined bit 0x4000
+                //   CC_BUTTON_CANCEL  = 0x0800 -> combined bit 0x8000
+                var input = raw_input;
+
+                // Mask Cancel so neither player can back out of chara-select
+                // and desync the state machine (legacy getCharaSelectInput).
+                input &= ~@as(u16, 0x8000);
+
+                // Moon-selector desync guard (legacy DllNetplayManager.cpp:138):
+                // for the first 150 frames of chara-select, mask A + Confirm.
+                // The moon (Crescent/Full/Half) selector hasn't settled
+                // identically on both sides yet; confirming too early can
+                // lock the two clients into different moon styles and desync
+                // at round start. 150f ≈ 2.5s at 60fps.
+                if (self.config.is_netplay and self.indexed_frame.frame < 150) {
+                    input &= ~@as(u16, 0x0100); // A
+                    input &= ~@as(u16, 0x4000); // Confirm
+                }
+                return input;
+            },
+            .loading, .chara_intro, .skippable => {
+                // If remote is ahead, mash Confirm to catch up.
+                if (self.shouldCatchUp()) {
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+                // Otherwise, only allow Confirm/Cancel through — suppress
+                // all direction and action buttons so the player can't
+                // accidentally affect game state during loading/intro.
+                // Confirm = 0x0400 in btns = 0x4000 in combined.
+                // Cancel  = 0x0800 in btns = 0x8000 in combined.
+                return raw_input & 0xC000; // keep only Confirm + Cancel bits
+            },
+            .in_game, .retry_menu => {
+                // Real input — game logic handles filtering.
+                return raw_input;
+            },
+        }
+    }
+
     pub fn setLocalInput(self: *NetplayManager, input: u16) void {
         const frame = self.indexed_frame.frame + self.config.delay;
         self.local_inputs.set(self.indexed_frame.index, frame, input);
@@ -610,12 +1004,29 @@ pub const NetplayManager = struct {
         return self.remote_inputs.get(self.indexed_frame.index, self.indexed_frame.frame);
     }
 
+    /// Check if the peer has been silent for too long. Returns true if the
+    /// heartbeat has expired (no packet received in HEARTBEAT_TIMEOUT_MS).
+    /// Called from frameStep to detect dead peers that crashed without
+    /// sending a DISCONNECT event.
+    pub fn checkHeartbeat(self: *const NetplayManager) bool {
+        if (!self.enet_connected or self.last_packet_ms == 0) return false;
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        return (now - self.last_packet_ms) > heartbeat_timeout_ms;
+    }
+
     pub fn isRemoteInputReady(self: *const NetplayManager) bool {
-        // Don't block on non-gameplay states — during loading screens,
-        // chara intros, etc. there's nothing the remote needs to send.
+        // In CharaSelect and InGame, the frame loop MUST block until the
+        // remote peer has caught up to our transition index AND has sent
+        // input for the current frame. This is the lock-step gate that
+        // keeps both sides synchronized — without it, one side can race
+        // ahead (e.g. start the match while the other is still loading).
+        //
+        // Loading / CharaIntro / Skippable / RetryMenu do NOT block:
+        // each side runs at its own pace, and the catch-up mash logic
+        // in getNetplayInput() ensures the lagging side auto-skips.
         switch (self.state) {
             .pre_initial, .initial, .loading, .chara_intro, .skippable, .retry_menu => return true,
-            else => {},
+            .chara_select, .in_game => {},
         }
 
         // Offline / spectator: always ready
@@ -709,29 +1120,190 @@ pub const NetplayManager = struct {
 
     // --- State transitions ---
 
+    /// Validate that a state transition is allowed. CCCaster uses an explicit
+    /// white-list; invalid transitions indicate a desync and should be logged.
+    /// Returns true if the transition is valid, false otherwise.
+    ///
+    /// Valid transitions (from CCCaster's isValidNext):
+    ///   pre_initial → initial
+    ///   initial → chara_select (netplay) | in_game (training)
+    ///   chara_select → loading
+    ///   loading → chara_intro (versus) | in_game (training)
+    ///   chara_intro → in_game
+    ///   in_game → skippable
+    ///   skippable → in_game (next round) | retry_menu
+    ///   retry_menu → loading (rematch) | chara_select
+    fn isValidNext(self: *const NetplayManager, new: NetplayState) bool {
+        const old = self.state;
+        const valid = switch (old) {
+            .pre_initial => new == .initial,
+            .initial => new == .chara_select or new == .in_game,
+            .chara_select => new == .loading,
+            .loading => new == .chara_intro or new == .in_game,
+            .chara_intro => new == .in_game,
+            .in_game => new == .skippable or new == .chara_select,
+            .skippable => new == .in_game or new == .retry_menu,
+            .retry_menu => new == .loading or new == .chara_select,
+        };
+        if (!valid) {
+            self.log.err("Invalid state transition: {s} -> {s} (potential desync)", .{
+                @tagName(old), @tagName(new),
+            });
+        }
+        return valid;
+    }
+
     pub fn onGameModeChanged(self: *NetplayManager, new_mode: u32) void {
         const old_state = self.state;
+        var new_state: ?NetplayState = null;
 
         if (new_mode == mode_chara_select) {
-            self.state = .chara_select;
-            self.onStateTransition(old_state, .chara_select);
+            new_state = .chara_select;
         } else if (new_mode == mode_loading) {
-            self.state = .loading;
-            self.onStateTransition(old_state, .loading);
+            new_state = .loading;
         } else if (new_mode == mode_in_game) {
             if (self.config.is_training or !self.config.is_netplay or self.config.is_spectator) {
-                self.state = .in_game;
-                self.onStateTransition(old_state, .in_game);
+                new_state = .in_game;
             } else {
-                self.state = .chara_intro;
-                self.onStateTransition(old_state, .chara_intro);
+                // Versus netplay: enter chara_intro first. The actual
+                // chara_intro → in_game transition is driven by the intro
+                // state flag (CC_INTRO_STATE_ADDR going to 0), watched in
+                // checkIntroDone() — matching the legacy RoundStart variable
+                // watch in DllMain.cpp:1266-1269.
+                new_state = .chara_intro;
             }
-            self.onEnterInGame();
+        }
+
+        if (new_state) |ns| {
+            // Validate the transition — log invalid ones but proceed anyway
+            // (the game already wrote the new mode, we can't stop it).
+            _ = self.isValidNext(ns);
+            self.state = ns;
+            self.onStateTransition(old_state, ns);
+            if (new_mode == mode_in_game) self.onEnterInGame();
         }
         self.log.info("NetplayState -> {s} (game_mode={d})", .{ @tagName(self.state), new_mode });
 
         // Reset SFX dedup on each state transition (legacy clears per round).
         if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+    }
+
+    /// Watched every frame from frameStep. Drives the chara_intro → in_game
+    /// transition (the second sync barrier) by reading CC_INTRO_STATE_ADDR:
+    ///   2 = character intro playing
+    ///   1 = pre-game (intro -> "Round X / Fight!")
+    ///   0 = in-game, players can move
+    ///
+    /// This mirrors the legacy RoundStart variable watch
+    /// (DllMain.cpp:1266-1269), which is the ONLY thing that flips the state
+    /// to InGame during versus netplay — the game_mode change alone is not
+    /// sufficient (it fires during the intro cutscene, before gameplay).
+    ///
+    /// Also enables RNG sync once on the rising edge of CC_GAME_STATE_ADDR
+    /// hitting CC_GAME_STATE_INTRO_DONE (99), mirroring
+    /// DllMain.cpp:1179-1184 gameStateChanged(). Both peers then seed the
+    /// round RNG identically just before play begins.
+    pub fn checkIntroDone(self: *NetplayManager) void {
+        // Track the intro-done edge so we enable RNG exactly once per round.
+        // (game_state_addr isn't a simple monotonic flag — it cycles through
+        // several values — so we watch for the 99 value with a one-shot.)
+        if (!self.intro_rng_enabled and game_state_addr.* == game_state_intro_done) {
+            self.intro_rng_enabled = true;
+            self.should_sync_rng = true;
+            self.rng_synced = false;
+            self.log.info("Intro done (game_state=99) — RNG sync enabled", .{});
+        }
+
+        // chara_intro → in_game: CC_INTRO_STATE_ADDR drops to 0 when players
+        // can move. Only transition out of chara_intro — if we're already
+        // in_game this is a no-op.
+        if (self.state == .chara_intro and intro_state_addr.* == 0) {
+            const old = self.state;
+            _ = self.isValidNext(.in_game);
+            self.state = .in_game;
+            self.onStateTransition(old, .in_game);
+            self.log.info("CharaIntro -> InGame (intro_state=0, players can move)", .{});
+            if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+        }
+    }
+
+    /// Detect round-over (KO / time over) and drive the InGame→Skippable
+    /// transition. Ported from DllMain.cpp:1200-1245 checkRoundOver.
+    ///
+    /// The round is over when BOTH players' no_input_flag is set (the game
+    /// raises it on KO or time-over). With rollback enabled, the transition
+    /// is delayed by `rollback + ROLLBACK_ROUND_OVER_DELAY` frames so a
+    /// rollback re-run that briefly sees the flags can't fire a premature
+    /// transition. Without rollback, it fires immediately (skipping replay
+    /// and training modes, which never end this way).
+    ///
+    /// The puppet-player wrinkle: characters with summons (e.g. Neco-Arc
+    /// clones) have a P3/P4 "puppet" struct. When P1's puppet_state != 0,
+    /// P1's no_input_flag lives on P3 instead — the puppet is the active
+    /// body. Same for P2→P4.
+    pub fn checkRoundOver(self: *NetplayManager) void {
+        // Only meaningful while actively in-game.
+        if (self.state != .in_game) {
+            self.round_over_timer = -1;
+            return;
+        }
+
+        const p1_over = playerRoundOver(p1_base, p3_base);
+        const p2_over = playerRoundOver(p2_base, p4_base);
+        const is_over = p1_over and p2_over;
+
+        if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
+            // Rollback path: count down before committing.
+            if (is_over) {
+                if (self.round_over_timer == 0) {
+                    // Countdown reached zero while still over — fire.
+                    self.round_over_timer = -1;
+                    self.transitionTo(.skippable);
+                } else if (self.round_over_timer < 0) {
+                    // First frame we've seen is_over — arm the countdown.
+                    self.round_over_timer = @as(i32, self.config.rollback) + rollback_round_over_delay;
+                }
+            } else {
+                // Not over (or not anymore) — re-arm.
+                self.round_over_timer = -1;
+            }
+        } else if (is_over and !self.config.is_training) {
+            // Non-rollback path: immediate transition. Legacy also skips
+            // replay mode, but ZZCaster has no replay playback path.
+            self.transitionTo(.skippable);
+        }
+    }
+
+    /// Decrement the round-over countdown once per in-game frame. Mirrors
+    /// the legacy decrement in frameStepNormal (DllMain.cpp:210-211). Called
+    /// from frameStep before checkRoundOver so the timer can reach 0.
+    pub fn tickRoundOverTimer(self: *NetplayManager) void {
+        if (self.round_over_timer > 0) self.round_over_timer -= 1;
+    }
+
+    fn transitionTo(self: *NetplayManager, new: NetplayState) void {
+        if (self.state == new) return;
+        const old = self.state;
+        _ = self.isValidNext(new);
+        self.state = new;
+        self.onStateTransition(old, new);
+        self.round_over_timer = -1; // leaving in-game re-arms the timer
+        self.log.info("Round over -> {s}", .{@tagName(new)});
+        if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+    }
+
+    /// Read a player's round-over flag, accounting for the puppet wrinkle.
+    /// `main_base` is P1/P2, `puppet_base` is P3/P4. When the main struct's
+    /// puppet_state != 0, the active body is the puppet and its no_input_flag
+    /// is authoritative.
+    fn playerRoundOver(main_base: u32, puppet_base: u32) bool {
+        const main: [*]u8 = @ptrFromInt(main_base);
+        const puppet_state = main[off_puppet_state];
+        if (puppet_state == 0) {
+            return main[off_no_input_flag] != 0;
+        }
+        const puppet: [*]u8 = @ptrFromInt(puppet_base);
+        return puppet[off_no_input_flag] != 0;
     }
 
     /// Called on every state transition to a gameplay-relevant state
@@ -759,6 +1331,13 @@ pub const NetplayManager = struct {
             self.rng_synced = false;
             self.should_sync_rng = true;
         }
+        // Re-arm the intro-done RNG latch on new-round transitions. The
+        // chara_intro → in_game transition itself should NOT re-arm (the
+        // latch has already fired by then); loading/chara_select mark the
+        // start of a fresh round.
+        if (new == .loading or new == .chara_select) {
+            self.intro_rng_enabled = false;
+        }
 
         // Send TransitionIndex to peer so they know our current index.
         // The receiver calls setRemoteIndex() to extend their view of our
@@ -781,6 +1360,171 @@ pub const NetplayManager = struct {
     pub fn setRemoteIndex(self: *NetplayManager, remote_idx: u32) void {
         self.remote_index = remote_idx;
         self.log.info("Remote transition index: {d}", .{remote_idx});
+    }
+
+    // --- SyncHash desync detection ---
+    //
+    // Three entry points used by the frame loop:
+    //   * maybeSendSyncHash()  — snapshot + send on the legacy cadence
+    //   * applyRemoteSyncHash() — store a hash received from the peer
+    //   * checkSyncHashDesync() — compare paired entries; set desync_detected
+
+    /// Returns the packed indexed_frame value (frame | index<<32). Matches the
+    /// legacy IndexedFrame.value layout so ordering and equality work across
+    /// both peers regardless of endianness (little-endian wire format).
+    fn packedIndexedFrame(self: *const NetplayManager) u64 {
+        return @as(u64, self.indexed_frame.frame) |
+            (@as(u64, self.indexed_frame.index) << 32);
+    }
+
+    /// Snapshot game state and send a SyncHash to the peer. Called every
+    /// sync_send_period frames and at frame 149 of each 150-cycle. Mirrors
+    /// the legacy condition in DllMain.cpp:775-789 (excluding the states the
+    /// legacy excludes: Loading, CharaIntro, Skippable, RetryMenu).
+    pub fn maybeSendSyncHash(self: *NetplayManager) void {
+        if (!self.enet_connected) return;
+        if (self.config.is_spectator) return; // spectators don't initiate sync
+        // Only meaningful from CharaSelect onward.
+        const state_val = @intFromEnum(self.state);
+        if (state_val < @intFromEnum(NetplayState.chara_select)) return;
+        // Legacy excludes these states: no stable state to hash there.
+        if (self.state == .loading or self.state == .chara_intro or
+            self.state == .skippable or self.state == .retry_menu) return;
+
+        const frame = self.indexed_frame.frame;
+        const due_period = (frame % sync_send_period == 0);
+        const due_149 = (frame % 150 == 149);
+        if (!due_period and !due_149) return;
+
+        // Legacy also gates on "not in rollback, OR frame==0, OR (randomInputs
+        // and frame%150==149)". We have no randomInputs test mode, so the
+        // practical rule is: skip while actively re-running a rollback.
+        if (self.isRerunning()) return;
+
+        const sh = SyncHash.capture(self.packedIndexedFrame());
+
+        // Wire format: [1 type=0x04][136 SyncHash body].
+        var buf: [1 + 136]u8 = undefined;
+        buf[0] = 0x04; // SyncHash
+        _ = sh.serialize(buf[1..137]);
+        self.sendReliable(buf[0..137]);
+
+        self.pushLocalSync(sh);
+    }
+
+    /// Store a SyncHash received from the peer. Called from handleMessage for
+    /// message type 0x04.
+    pub fn applyRemoteSyncHash(self: *NetplayManager, data: []const u8) void {
+        if (SyncHash.deserialize(data)) |sh| {
+            self.pushRemoteSync(sh);
+        }
+    }
+
+    fn pushLocalSync(self: *NetplayManager, sh: SyncHash) void {
+        self.pushSync(&self.local_sync, &self.local_sync_count, sh);
+    }
+
+    fn pushRemoteSync(self: *NetplayManager, sh: SyncHash) void {
+        self.pushSync(&self.remote_sync, &self.remote_sync_count, sh);
+    }
+
+    /// Append to a bounded ring; drop the oldest when full. Matches the
+    /// legacy std::list semantics (front-pop on full) closely enough — since
+    /// exchanges resolve within a handful of frames, the ring never wraps in
+    /// practice.
+    fn pushSync(_: *NetplayManager, buf: *[sync_queue_len]SyncHash, count: *u8, sh: SyncHash) void {
+        if (count.* < sync_queue_len) {
+            buf[count.*] = sh;
+            count.* += 1;
+        } else {
+            // Shift left by one and append (oldest discarded).
+            std.mem.copyForwards(SyncHash, buf[0 .. sync_queue_len - 1], buf[1..sync_queue_len]);
+            buf[sync_queue_len - 1] = sh;
+        }
+    }
+
+    /// Compare paired local/remote hashes. On the first mismatch, record the
+    /// divergent pair and set desync_detected so the frame loop can abort.
+    /// Called once per frame; safe to call when queues are empty.
+    pub fn checkSyncHashDesync(self: *NetplayManager) void {
+        if (self.desync_detected) return; // already flagged
+        if (self.local_sync_count == 0 or self.remote_sync_count == 0) return;
+
+        // Walk both queues in indexed_frame order, dropping entries that have
+        // no counterpart on the other side (legacy pops the higher one first).
+        var li: usize = 0;
+        var ri: usize = 0;
+        while (li < self.local_sync_count and ri < self.remote_sync_count) {
+            const l = self.local_sync[li];
+            const r = self.remote_sync[ri];
+            if (l.indexed_frame > r.indexed_frame) {
+                // Remote is behind — drop the remote entry (legacy pops remote).
+                ri += 1;
+                continue;
+            }
+            if (r.indexed_frame > l.indexed_frame) {
+                // Local is behind — drop the local entry.
+                li += 1;
+                continue;
+            }
+            // Paired. Compare.
+            if (!l.matches(r)) {
+                self.desync_detected = true;
+                self.desync_local = l;
+                self.desync_remote = r;
+                self.logDesync(l, r);
+                return;
+            }
+            // Match — consume both.
+            li += 1;
+            ri += 1;
+        }
+
+        // Compact the queues: drop matched/stale entries from the front.
+        if (li > 0) self.dropFrontLocal(li);
+        if (ri > 0) self.dropFrontRemote(ri);
+    }
+
+    fn dropFrontLocal(self: *NetplayManager, n: usize) void {
+        const keep = self.local_sync_count - @as(u8, @intCast(n));
+        std.mem.copyForwards(SyncHash, self.local_sync[0..keep], self.local_sync[n..self.local_sync_count]);
+        self.local_sync_count = keep;
+    }
+
+    fn dropFrontRemote(self: *NetplayManager, n: usize) void {
+        const keep = self.remote_sync_count - @as(u8, @intCast(n));
+        std.mem.copyForwards(SyncHash, self.remote_sync[0..keep], self.remote_sync[n..self.remote_sync_count]);
+        self.remote_sync_count = keep;
+    }
+
+    fn logDesync(self: *NetplayManager, l: SyncHash, r: SyncHash) void {
+        self.log.err("DESYNC detected at indexed_frame=0x{x:0>16}", .{l.indexed_frame});
+        // Identify which field diverged — this is the diagnostic payoff.
+        if (!std.mem.eql(u8, &l.hash, &r.hash)) {
+            self.log.err("  RNG hash mismatch (determinism root diverged)", .{});
+        }
+        if (l.round_timer != r.round_timer) self.log.err("  round_timer: {d} vs {d}", .{ l.round_timer, r.round_timer });
+        if (l.real_timer != r.real_timer) self.log.err("  real_timer: {d} vs {d}", .{ l.real_timer, r.real_timer });
+        if (l.camera_x != r.camera_x) self.log.err("  camera_x: {d} vs {d}", .{ l.camera_x, r.camera_x });
+        if (l.camera_y != r.camera_y) self.log.err("  camera_y: {d} vs {d}", .{ l.camera_y, r.camera_y });
+        logCharaDiff(self.log, "P1", l.chara[0], r.chara[0]);
+        logCharaDiff(self.log, "P2", l.chara[1], r.chara[1]);
+    }
+
+    fn logCharaDiff(log: *logging.Logger, label: []const u8, a: CharaHash, b: CharaHash) void {
+        if (a.health != b.health) log.err("  {s} health: {d} vs {d}", .{ label, a.health, b.health });
+        if (a.red_health != b.red_health) log.err("  {s} red_health: {d} vs {d}", .{ label, a.red_health, b.red_health });
+        if (a.meter != b.meter) log.err("  {s} meter: {d} vs {d}", .{ label, a.meter, b.meter });
+        if (a.heat != b.heat) log.err("  {s} heat: {d} vs {d}", .{ label, a.heat, b.heat });
+        if (a.guard_bar != b.guard_bar) log.err("  {s} guard_bar: {d} vs {d}", .{ label, a.guard_bar, b.guard_bar });
+        if (a.guard_quality != b.guard_quality) log.err("  {s} guard_quality: {d} vs {d}", .{ label, a.guard_quality, b.guard_quality });
+        if (a.x != b.x) log.err("  {s} x: {d} vs {d}", .{ label, a.x, b.x });
+        if (a.y != b.y) log.err("  {s} y: {d} vs {d}", .{ label, a.y, b.y });
+        if (a.seq != b.seq) log.err("  {s} seq: {d} vs {d}", .{ label, a.seq, b.seq });
+        if (a.seq != 0 and a.seq_state != b.seq_state)
+            log.err("  {s} seq_state: {d} vs {d}", .{ label, a.seq_state, b.seq_state });
+        if (a.chara != b.chara) log.err("  {s} chara: {d} vs {d}", .{ label, a.chara, b.chara });
+        if (a.moon != b.moon) log.err("  {s} moon: {d} vs {d}", .{ label, a.moon, b.moon });
     }
 
     fn onEnterInGame(self: *NetplayManager) void {
@@ -855,6 +1599,25 @@ pub const NetplayManager = struct {
 
     pub fn isRerunning(self: *const NetplayManager) bool {
         return self.fast_fwd_stop_frame != 0;
+    }
+
+    /// Force CC_INTRO_STATE_ADDR to 0 during a rollback re-run that has
+    /// advanced past the pre-game intro window (CC_PRE_GAME_INTRO_FRAMES).
+    /// Ported from DllMain.cpp:975-976:
+    ///   if ( isInRollback() && getFrame() > CC_PRE_GAME_INTRO_FRAMES
+    ///                            && *CC_INTRO_STATE_ADDR )
+    ///       *CC_INTRO_STATE_ADDR = 0;
+    ///
+    /// A loaded state from before the intro finished may carry a non-zero
+    /// intro flag; re-running that state would re-trigger intro-only logic
+    /// (e.g. the guard-bar masking in readCharaHash) and desync the re-run.
+    /// Clearing it once we're past frame 224 keeps the re-run on the
+    /// gameplay path.
+    pub fn clearIntroStateDuringRollback(self: *NetplayManager) void {
+        if (!self.isInRollback()) return;
+        if (self.indexed_frame.frame <= pre_game_intro_frames) return;
+        if (intro_state_addr.* == 0) return;
+        intro_state_addr.* = 0;
     }
 
     pub fn checkRerunComplete(self: *NetplayManager) bool {

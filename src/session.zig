@@ -438,12 +438,18 @@ pub const NetplaySession = struct {
         self.config.delay = @min(computed, 8);
         self.log.info("Auto delay: {d}", .{self.config.delay});
 
-        // Move to config exchange.
-        self.handshake_subphase = 3;
-        self.phase_attempts = 0;
-        self.state = .handshaking;
+        // After ping exchange:
+        // - Host: go to waiting_confirmation. Config is sent later when
+        //   the host clicks "Start Match" (hostConfirm), so the host can
+        //   override the delay on the confirmation screen.
+        // - Client: wait for the host's config message (subphase 3).
         if (self.config.is_host) {
-            self.sendConfigMessage();
+            self.state = .waiting_confirmation;
+            self.log.info("Handshake complete — waiting for host to confirm start", .{});
+        } else {
+            self.handshake_subphase = 3;
+            self.phase_attempts = 0;
+            self.state = .handshaking;
         }
     }
 
@@ -524,10 +530,18 @@ pub const NetplaySession = struct {
     }
 
     /// Host-only: called by the UI once the user clicks "Start match".
+    /// Sends the config (with the final delay value, which the host may
+    /// have overridden) and transitions to a sub-phase that waits for
+    /// the client's confirm. The step() function handles the confirm.
     pub fn hostConfirm(self: *NetplaySession) void {
         if (self.state != .waiting_confirmation) return;
         self.host_confirmed = true;
-        self.state = .launching;
-        self.log.info("Host confirmed — ready to launch", .{});
+        // Send config with the (possibly overridden) delay.
+        self.sendConfigMessage();
+        // Move to config-exchange sub-phase to wait for client confirm.
+        self.handshake_subphase = 3;
+        self.phase_attempts = 0;
+        self.state = .handshaking;
+        self.log.info("Host confirmed — sent config, waiting for client confirm (delay={d})", .{self.config.delay});
     }
 };

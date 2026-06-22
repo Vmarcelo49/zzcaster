@@ -1,6 +1,7 @@
 const std = @import("std");
 const logging = @import("logging.zig");
 const net = @import("net.zig");
+const net_util = @import("net_util.zig");
 
 // Re-use NetplayManager.NetplayConfig so the launcher and the DLL see the same
 // struct layout (avoids drift when new fields are added).
@@ -23,6 +24,10 @@ pub const NetplayConfig = struct {
     spectator_listen_port: u16 = 0,
     local_name: [32]u8 = [_]u8{0} ** 32,
     remote_name: [32]u8 = [_]u8{0} ** 32,
+    // Connection type ("Wired", "Wireless", "Unknown") — exchanged during
+    // the handshake and displayed on the confirmation screen.
+    local_connection_type: [16]u8 = [_]u8{0} ** 16,
+    remote_connection_type: [16]u8 = [_]u8{0} ** 16,
 };
 
 pub const SessionState = enum {
@@ -136,6 +141,23 @@ pub const NetplaySession = struct {
         const copy_len = @min(name.len, self.config.local_name.len - 1);
         @memcpy(self.config.local_name[0..copy_len], name[0..copy_len]);
         self.config.local_name[copy_len] = 0;
+    }
+
+    /// Detect the local connection type (WiFi/Ethernet) and store it.
+    /// Called by the launcher before the handshake starts.
+    pub fn detectConnectionType(self: *NetplaySession) void {
+        const ct = net_util.getConnectionType();
+        const copy_len = @min(ct.len, self.config.local_connection_type.len - 1);
+        @memcpy(self.config.local_connection_type[0..copy_len], ct[0..copy_len]);
+        self.config.local_connection_type[copy_len] = 0;
+    }
+
+    pub fn localConnectionType(self: *const NetplaySession) []const u8 {
+        return std.mem.sliceTo(&self.config.local_connection_type, 0);
+    }
+
+    pub fn remoteConnectionType(self: *const NetplaySession) []const u8 {
+        return std.mem.sliceTo(&self.config.remote_connection_type, 0);
     }
 
     pub fn localName(self: *const NetplaySession) []const u8 {
@@ -368,13 +390,18 @@ pub const NetplaySession = struct {
 
     fn startNameExchange(self: *NetplaySession) void {
         const local = self.localName();
-        var name_buf: [34]u8 = undefined;
-        name_buf[0] = @intFromEnum(Msg.name);
+        const conn_type = self.localConnectionType();
+        // Format: [6=name][name_len][name_bytes][conn_type_len][conn_type_bytes]
+        var buf: [66]u8 = undefined;
+        buf[0] = @intFromEnum(Msg.name);
         const name_len = @min(local.len, 31);
-        name_buf[1] = @intCast(name_len);
-        @memcpy(name_buf[2 .. 2 + name_len], local[0..name_len]);
-        _ = self.transport.sendReliable(name_buf[0 .. 2 + name_len]);
-        self.log.info("Sent display name: '{s}'", .{local});
+        buf[1] = @intCast(name_len);
+        @memcpy(buf[2 .. 2 + name_len], local[0..name_len]);
+        const ct_len = @min(conn_type.len, 15);
+        buf[2 + name_len] = @intCast(ct_len);
+        @memcpy(buf[3 + name_len .. 3 + name_len + ct_len], conn_type[0..ct_len]);
+        _ = self.transport.sendReliable(buf[0 .. 3 + name_len + ct_len]);
+        self.log.info("Sent display name: '{s}' (conn: {s})", .{ local, conn_type });
     }
 
     fn stepExchangeNames(self: *NetplaySession) void {
@@ -397,7 +424,17 @@ pub const NetplaySession = struct {
                     const copy_len = @min(peer_name.len, self.config.remote_name.len - 1);
                     @memcpy(self.config.remote_name[0..copy_len], peer_name[0..copy_len]);
                     self.config.remote_name[copy_len] = 0;
-                    self.log.info("Peer display name: '{s}'", .{self.remoteName()});
+
+                    // Parse connection type if present (appended after name).
+                    if (msg.len >= 3 + peer_name_len) {
+                        const ct_len: usize = @min(msg[2 + peer_name_len], msg.len - 3 - peer_name_len);
+                        const ct = msg[3 + peer_name_len .. 3 + peer_name_len + ct_len];
+                        const ct_copy = @min(ct.len, self.config.remote_connection_type.len - 1);
+                        @memcpy(self.config.remote_connection_type[0..ct_copy], ct[0..ct_copy]);
+                        self.config.remote_connection_type[ct_copy] = 0;
+                    }
+
+                    self.log.info("Peer display name: '{s}' (conn: {s})", .{ self.remoteName(), self.remoteConnectionType() });
                     self.handshake_subphase = 2;
                     self.phase_attempts = 0;
                     self.startPingExchange();

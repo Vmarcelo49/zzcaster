@@ -1,20 +1,3 @@
-// ui_waiting_for_peer.zig — Netplay handshake UI + session lifecycle helpers,
-// extracted from ui.zig.
-//
-// Contains:
-//   - cleanupSession     : tear down an in-progress NetplaySession
-//   - startHostSession   : begin the host-side handshake
-//   - startJoinSession   : begin the client-side handshake
-//   - drawWaitingForPeer : the .waiting_for_peer UI screen — drives
-//                          session.step() each frame, shows progress / ping /
-//                          delay override / Start button, and dispatches to
-//                          launchGameAfterHandshake() once both sides agree.
-//   - setClipboardZ      : helper used by drawWaitingForPeer to copy the
-//                          host's IP:port to the clipboard via ImGui
-//
-// The UiState type is re-imported from ui.zig (circular import is fine in
-// Zig — both modules see the same enum value at compile time).
-
 const std = @import("std");
 const config = @import("common").config;
 const logging = @import("common").logging;
@@ -278,10 +261,17 @@ pub fn drawWaitingForPeer(
             // For the host this is reached after hostConfirm(); for the
             // client it's reached right after waitForConfig().
             game_launcher.launchGameAfterHandshake(
-                allocator, io, cfg, log, pipe_name,
+                allocator,
+                io,
+                cfg,
+                log,
+                pipe_name,
                 np_session,
-                win_launcher, game_pid, ipc_server,
-                error_msg, error_msg_len,
+                win_launcher,
+                game_pid,
+                ipc_server,
+                error_msg,
+                error_msg_len,
             );
             if (game_pid.* > 0) {
                 ui_state.* = .in_game;

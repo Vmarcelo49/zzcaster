@@ -1,21 +1,3 @@
-// ui.zig — Top-level UI entry points + main ImGui/SDL2 event loop.
-//
-// This file is the "shell" of the launcher UI. It owns:
-//   - the SDL2 + OpenGL + ImGui init/teardown sequence
-//   - the UiState / MenuPage enums (re-exported for use by ui_pages.zig and
-//     ui_waiting_for_peer.zig)
-//   - the per-frame state variables (input buffers, controller mapping,
-//     netplay session, game launcher handles) that are threaded through
-//     the page renderers
-//   - the main loop's switch on UiState (idle / waiting_for_peer / in_game /
-//     error_state), delegating the heavy rendering to ui_pages.zig and
-//     ui_waiting_for_peer.zig
-//   - runCli(), the non-interactive CLI entry point (delegates all real
-//     work to game_launcher.zig)
-//
-// All page rendering, controller-mapper widgets, and game-launch logic
-// live in sibling files — see the imports below.
-
 const std = @import("std");
 const config = @import("common").config;
 const logging = @import("common").logging;
@@ -37,17 +19,6 @@ const win32 = struct {
     extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
 };
 
-/// Resolve the path to mapping.ini relative to the exe's own directory.
-/// zzcaster.exe is typically at `<MBAACC>/zzcaster.exe` or
-/// `<MBAACC>/zzcaster/zzcaster.exe`. The mapping.ini file should be in
-/// the same directory as hook.dll — i.e. `<MBAACC>/zzcaster/mapping.ini`.
-///
-/// To match the DLL's path resolution (which uses hook.dll's directory),
-/// we check two locations:
-///   1. `<exe_dir>/mapping.ini` (if exe is in zzcaster/ subdir)
-///   2. `<exe_dir>/zzcaster/mapping.ini` (if exe is in MBAACC root)
-///
-/// Returns a slice into the provided buffer.
 fn resolveMappingPath(buf: []u8) []const u8 {
     var exe_path: [512]u8 = undefined;
     const len = win32.GetModuleFileNameA(null, &exe_path, exe_path.len);
@@ -82,7 +53,7 @@ fn resolveMappingPath(buf: []u8) []const u8 {
         // exe is in zzcaster/ subdir — mapping.ini is right here
         if (exe_dir.len + filename.len + 1 <= buf.len) {
             @memcpy(buf[0..exe_dir.len], exe_dir);
-            @memcpy(buf[exe_dir.len..exe_dir.len + filename.len], filename);
+            @memcpy(buf[exe_dir.len .. exe_dir.len + filename.len], filename);
             const total = exe_dir.len + filename.len;
             buf[total] = 0;
             return buf[0..total];
@@ -93,7 +64,7 @@ fn resolveMappingPath(buf: []u8) []const u8 {
     const subdir = "zzcaster\\";
     if (exe_dir.len + subdir.len + filename.len + 1 <= buf.len) {
         @memcpy(buf[0..exe_dir.len], exe_dir);
-        @memcpy(buf[exe_dir.len..exe_dir.len + subdir.len], subdir);
+        @memcpy(buf[exe_dir.len .. exe_dir.len + subdir.len], subdir);
         @memcpy(buf[exe_dir.len + subdir.len .. exe_dir.len + subdir.len + filename.len], filename);
         const total = exe_dir.len + subdir.len + filename.len;
         buf[total] = 0;
@@ -292,13 +263,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
         p1_device_sel = if (mappings.p1.device_index >= 0) mappings.p1.device_index + 1 else 0;
         p2_device_sel = if (mappings.p2.device_index >= 0) mappings.p2.device_index + 1 else 0;
     } else {
-        // No saved mapping — default both players to Xbox layout.
-        // Leave device_index at -1 (keyboard) so the drawPlayerPanel
-        // detects a mismatch when SDL_NumJoysticks > 0 and auto-opens
-        // joystick 0 on first frame. Setting device_index = 0 here
-        // would match the default device_sel=0 (keyboard) and skip
-        // the open, leaving p1_joystick null and breaking the bind
-        // poll.
         p1_mapping = mapper.defaultXboxMapping();
         p2_mapping = mapper.defaultXboxMapping();
         p1_mapping.device_index = -1;
@@ -336,31 +300,57 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
         switch (ui_state) {
             .idle => {
                 ui_pages.drawIdlePage(
-                    allocator, io, cfg, log, pipe_name,
+                    allocator,
+                    io,
+                    cfg,
+                    log,
+                    pipe_name,
                     &current_page,
-                    &peer_buf, &port_buf,
-                    &name_buf, &wincount_buf, &rollback_buf,
+                    &peer_buf,
+                    &port_buf,
+                    &name_buf,
+                    &wincount_buf,
+                    &rollback_buf,
                     &ui_state,
-                    &np_session, &host_start_clicked,
-                    &win_launcher, &game_pid, &ipc_server,
-                    &error_msg, &error_msg_len,
-                    &p1_mapping, &p2_mapping,
-                    &p1_bind_target, &p2_bind_target,
-                    &p1_joystick, &p2_joystick,
-                    &p1_device_sel, &p2_device_sel,
-                    &bind_cooldown, &list_view,
-                    mapping_path, num_joy,
+                    &np_session,
+                    &host_start_clicked,
+                    &win_launcher,
+                    &game_pid,
+                    &ipc_server,
+                    &error_msg,
+                    &error_msg_len,
+                    &p1_mapping,
+                    &p2_mapping,
+                    &p1_bind_target,
+                    &p2_bind_target,
+                    &p1_joystick,
+                    &p2_joystick,
+                    &p1_device_sel,
+                    &p2_device_sel,
+                    &bind_cooldown,
+                    &list_view,
+                    mapping_path,
+                    num_joy,
                     &quit,
                 );
             },
             .waiting_for_peer => {
                 ui_waiting_for_peer.drawWaitingForPeer(
-                    allocator, io, cfg, log, pipe_name,
+                    allocator,
+                    io,
+                    cfg,
+                    log,
+                    pipe_name,
                     &np_session,
-                    &win_launcher, &game_pid, &ipc_server,
-                    &ui_state, &error_msg, &error_msg_len,
+                    &win_launcher,
+                    &game_pid,
+                    &ipc_server,
+                    &ui_state,
+                    &error_msg,
+                    &error_msg_len,
                     &host_start_clicked,
-                    &delay_buf, &delay_override_active,
+                    &delay_buf,
+                    &delay_override_active,
                 );
             },
             .in_game => {

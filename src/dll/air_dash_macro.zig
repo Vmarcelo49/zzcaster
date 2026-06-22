@@ -1,11 +1,12 @@
 const std = @import("std");
 
-const jump_startup_frames: u8 = 2; // 2 frames, the game buffer accepts the air dash for all characters except pciel
+// 2 frames: the game buffer accepts the air dash for all characters except pciel.
+const jump_startup_frames: u8 = 2;
 
 const MacroState = enum {
     idle, // waiting for 9AB / 7AB
-    startup, // jump emitted; counting down startup frames before the dash
-    suppressed, // sequence done; AB still held → strip AB, pass dirs, until release
+    startup, // jump emitted; counting down before the dash
+    suppressed, // sequence done; AB still held → strip AB until release
 };
 
 pub const StepResult = struct {
@@ -13,7 +14,7 @@ pub const StepResult = struct {
     triggered: bool,
 };
 
-const ab_buttons: u16 = 0x0070; // button_a (0x0010) | button_b (0x0020) | button_ab (0x0040)
+const ab_buttons: u16 = 0x0070; // button_a | button_b | button_ab
 
 const ab_buttons_combined: u16 = ab_buttons << 4; // 0x0700
 

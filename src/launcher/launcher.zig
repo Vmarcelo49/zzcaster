@@ -24,31 +24,52 @@ const win32 = struct {
     extern "kernel32" fn TerminateProcess(hProcess: ?*anyopaque, uExitCode: u32) callconv(.winapi) i32;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
     extern "kernel32" fn VirtualAllocEx(
-        hProcess: ?*anyopaque, lpAddress: ?*anyopaque, dwSize: usize,
-        flAllocationType: u32, flProtect: u32,
+        hProcess: ?*anyopaque,
+        lpAddress: ?*anyopaque,
+        dwSize: usize,
+        flAllocationType: u32,
+        flProtect: u32,
     ) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn VirtualFreeEx(
-        hProcess: ?*anyopaque, lpAddress: ?*anyopaque, dwSize: usize, dwFreeType: u32,
+        hProcess: ?*anyopaque,
+        lpAddress: ?*anyopaque,
+        dwSize: usize,
+        dwFreeType: u32,
     ) callconv(.winapi) i32;
     extern "kernel32" fn WriteProcessMemory(
-        hProcess: ?*anyopaque, lpBaseAddress: ?*const anyopaque,
-        lpBuffer: ?*const anyopaque, nSize: usize, lpNumberOfBytesWritten: ?*usize,
+        hProcess: ?*anyopaque,
+        lpBaseAddress: ?*const anyopaque,
+        lpBuffer: ?*const anyopaque,
+        nSize: usize,
+        lpNumberOfBytesWritten: ?*usize,
     ) callconv(.winapi) i32;
     extern "kernel32" fn ReadProcessMemory(
-        hProcess: ?*anyopaque, lpBaseAddress: ?*const anyopaque,
-        lpBuffer: ?*anyopaque, nSize: usize, lpNumberOfBytesRead: ?*usize,
+        hProcess: ?*anyopaque,
+        lpBaseAddress: ?*const anyopaque,
+        lpBuffer: ?*anyopaque,
+        nSize: usize,
+        lpNumberOfBytesRead: ?*usize,
     ) callconv(.winapi) i32;
     extern "kernel32" fn VirtualProtectEx(
-        hProcess: ?*anyopaque, lpAddress: ?*const anyopaque, dwSize: usize,
-        flNewProtect: u32, lpflOldProtect: *u32,
+        hProcess: ?*anyopaque,
+        lpAddress: ?*const anyopaque,
+        dwSize: usize,
+        flNewProtect: u32,
+        lpflOldProtect: *u32,
     ) callconv(.winapi) i32;
     extern "kernel32" fn FlushInstructionCache(
-        hProcess: ?*anyopaque, lpBaseAddress: ?*const anyopaque, dwSize: usize,
+        hProcess: ?*anyopaque,
+        lpBaseAddress: ?*const anyopaque,
+        dwSize: usize,
     ) callconv(.winapi) i32;
     extern "kernel32" fn CreateRemoteThread(
-        hProcess: ?*anyopaque, lpThreadAttributes: ?*anyopaque,
-        dwStackSize: u32, lpStartAddress: ?*const anyopaque,
-        lpParameter: ?*anyopaque, dwCreationFlags: u32, lpThreadId: ?*u32,
+        hProcess: ?*anyopaque,
+        lpThreadAttributes: ?*anyopaque,
+        dwStackSize: u32,
+        lpStartAddress: ?*const anyopaque,
+        lpParameter: ?*anyopaque,
+        dwCreationFlags: u32,
+        lpThreadId: ?*u32,
     ) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn WaitForSingleObject(hHandle: ?*anyopaque, dwMilliseconds: u32) callconv(.winapi) u32;
     extern "kernel32" fn GetExitCodeThread(hThread: ?*const anyopaque, lpExitCode: *u32) callconv(.winapi) i32;
@@ -57,11 +78,15 @@ const win32 = struct {
     extern "kernel32" fn GetThreadContext(hThread: ?*const anyopaque, lpContext: *Context) callconv(.winapi) i32;
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn SetEnvironmentVariableA(
-        lpName: [*:0]const u8, lpValue: [*:0]const u8,
+        lpName: [*:0]const u8,
+        lpValue: [*:0]const u8,
     ) callconv(.winapi) i32;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
     extern "kernel32" fn GetFullPathNameA(
-        lpFileName: [*:0]const u8, nBufferLength: u32, lpBuffer: [*]u8, lpFilePart: ?*?[*:0]u8,
+        lpFileName: [*:0]const u8,
+        nBufferLength: u32,
+        lpBuffer: [*]u8,
+        lpFilePart: ?*?[*:0]u8,
     ) callconv(.winapi) u32;
 
     const CREATE_SUSPENDED: u32 = 0x00000004;
@@ -206,22 +231,8 @@ pub const WindowsLauncher = struct {
         }
         log.info("Orig bytes: {x:0>2} {x:0>2}", .{ orig_bytes[0], orig_bytes[1] });
 
-        // Inject hook.dll while the main thread is still suspended. The
-        // DLL's DllMain runs in a remote thread (via CreateRemoteThread +
-        // LoadLibraryA), so it can patch the game's code/data before the
-        // main thread ever runs.
-        //
-        // We deliberately skip the legacy "halt at entry point + Suspend/
-        // Resume polling" dance: under Wine, SuspendThread + GetThreadContext
-        // is flaky and the extra ResumeThread can leave the thread in a
-        // stuck state. Doing everything synchronously while the thread is
-        // still suspended (from CREATE_SUSPENDED) is more reliable.
         log.info("Injecting {s}...", .{cfg.dll_path});
-        // Resolve the DLL path to an ABSOLUTE path before injecting. The
-        // injected LoadLibraryA runs in MBAA.exe's context and resolves
-        // relative paths against the *target* process's CWD — which under
-        // Wine is not guaranteed to be the MBAACC root where hook.dll lives.
-        // An absolute path makes the load independent of the target CWD.
+
         var full_dll_buf: [512]u8 = undefined;
         var dll_path_z: [512]u8 = undefined;
         const dll_path_z_slice = std.fmt.bufPrintZ(&dll_path_z, "{s}", .{cfg.dll_path}) catch return error.PathTooLong;
@@ -315,10 +326,6 @@ fn injectDll(process: ?*anyopaque, dll_path: []const u8, log: *logging.Logger) b
     };
     const wait_res = win32.WaitForSingleObject(thread, 10000);
 
-    // The remote thread's exit code IS LoadLibraryA's return value: a non-zero
-    // module handle on success, 0 on failure. This is the one check the old
-    // code skipped — under Wine a relative DLL path that doesn't resolve in
-    // the target process's CWD fails here silently.
     var exit_code: u32 = 0;
     _ = win32.GetExitCodeThread(thread, &exit_code);
     _ = win32.CloseHandle(thread);

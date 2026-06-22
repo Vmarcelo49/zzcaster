@@ -4,10 +4,6 @@ const net = @import("net").enet_transport;
 const ip_discovery = @import("net").ip_discovery;
 const net_util = @import("net_util.zig");
 
-// Re-use NetplayManager.NetplayConfig so the launcher and the DLL see the same
-// struct layout (avoids drift when new fields are added).
-//
-// Fields kept in sync with src/netplay_manager.zig:NetplayConfig.
 pub const NetplayConfig = struct {
     is_host: bool = false,
     is_training: bool = false,
@@ -207,11 +203,6 @@ pub const NetplaySession = struct {
         self.error_len = n;
     }
 
-    // ====================================================================
-    // Host / Join entry points — set up the session, then the UI calls
-    // step() each frame to drive the handshake forward.
-    // ====================================================================
-
     pub fn startHost(self: *NetplaySession, port: u16, training: bool) !void {
         self.config.is_host = true;
         self.config.is_training = training;
@@ -241,12 +232,6 @@ pub const NetplaySession = struct {
         try self.transport.connect(host_str, port, self.log);
     }
 
-    // ====================================================================
-    // step() — called once per UI frame. Does one non-blocking ENet poll
-    // and advances the handshake state machine. Returns when the state
-    // changes (or after one poll iteration if still in progress).
-    // ====================================================================
-
     pub fn step(self: *NetplaySession) void {
         if (self.cancel_requested) {
             if (self.state != .launching and self.state != .failed and self.state != .cancelled) {
@@ -258,14 +243,6 @@ pub const NetplaySession = struct {
         switch (self.state) {
             .idle, .launching, .completed, .failed, .cancelled => return,
 
-            // Host: while waiting for the user to confirm on the confirmation
-            // screen, keep polling ENet so (a) the connection stays alive
-            // against ENet's internal peer timeout and (b) we detect a client
-            // that gives up / disconnects. We discard any messages here — the
-            // only valid message at this point is the client's confirm, which
-            // arrives AFTER the host sends config (in the .handshaking phase).
-            // This is especially important now that the host can spend an
-            // arbitrary amount of time reviewing/overriding the input delay.
             .waiting_confirmation => {
                 if (self.transport.poll(0)) |event| {
                     if (event == .disconnected) {
@@ -284,8 +261,7 @@ pub const NetplaySession = struct {
     }
 
     fn stepListening(self: *NetplaySession) void {
-        // 1 hour timeout = 216000 frames at 60fps. The host may wait a long
-        // time for an opponent — 60s was too short for arranging matches.
+        // 1 hour timeout = 216000 frames at 60fps
         if (self.phase_attempts >= 216000) {
             self.setError("Connection timed out (no opponent connected in 1 hour)");
             self.state = .failed;
@@ -324,12 +300,6 @@ pub const NetplaySession = struct {
         }
     }
 
-    // --- Handshake sub-phases ---
-    // We use a single `handshaking` state with an internal sub-phase tracker
-    // stored in `handshake_subphase` (declared with the other fields above).
-    // This keeps the public SessionState enum simple while allowing multi-step
-    // handshake progression.
-
     fn startVersionExchange(self: *NetplaySession) void {
         self.handshake_subphase = 0;
         // Send our version: [1=version][len byte][version bytes]
@@ -347,8 +317,7 @@ pub const NetplaySession = struct {
         switch (self.handshake_subphase) {
             0 => self.stepExchangeVersion(),
             1 => self.stepExchangeNames(),
-            // Subphase 2 (pings) uses the .ping_exchanging state, not
-            // .handshaking — see stepPingExchanging() below.
+
             3 => self.stepExchangeConfig(),
             else => self.state = .failed,
         }
@@ -549,19 +518,6 @@ pub const NetplaySession = struct {
     }
 
     fn stepExchangeConfig(self: *NetplaySession) void {
-        // Timeout handling differs by role:
-        //   - Client waiting for config: NO timeout. The host may spend an
-        //     arbitrary amount of time on the confirmation screen reviewing
-        //     ping and overriding the input delay. The client must wait as
-        //     long as the host needs; liveness is covered by disconnect
-        //     detection (ENet's peer timeout + the disconnect event below).
-        //     A fixed timeout here was the root cause of the
-        //     "Peer disconnected waiting for confirm" failure: the client
-        //     timed out, failed, and its deinit() sent a DISCONNECT that the
-        //     host saw while waiting for the confirm.
-        //   - Host waiting for confirm: 30s. Once the host sends config, the
-        //     client responds nearly instantly, so 30s is a generous safety
-        //     net for packet loss / retransmits.
         if (self.config.is_host and self.phase_attempts >= 1800) {
             self.setError("Client never confirmed config (30s timeout)");
             self.state = .failed;
@@ -573,15 +529,6 @@ pub const NetplaySession = struct {
             if (event == .message_received) {
                 const msg = self.transport.getLastMessage();
                 if (self.config.is_host) {
-                    // Host waits for client's ConfirmConfig. The host reached
-                    // this sub-phase from hostConfirm(), which already sent the
-                    // config. Receiving the confirm means the client accepted
-                    // — both sides are ready, so go straight to .launching.
-                    // (Previously this went back to .waiting_confirmation,
-                    // which was correct in the pre-manual-delay flow where
-                    // the host sent config BEFORE the confirmation screen.
-                    // Now config is sent FROM the confirmation screen, so the
-                    // confirm is the final handshake step.)
                     if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.confirm)) {
                         self.log.info("Client confirmed config", .{});
                         self.state = .launching;

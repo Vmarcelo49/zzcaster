@@ -1,15 +1,3 @@
-// ui_pages.zig — Idle (main menu) page rendering, extracted from ui.zig.
-//
-// Contains drawIdlePage(), which renders the sidebar (page selector) and the
-// four content pages: netplay, offline, game_config, controllers. This is
-// the body of the `.idle =>` switch arm that was previously inline in
-// ui.run()'s main loop.
-//
-// All UI state is passed in by pointer from ui.run()'s local variables —
-// the function is a pure view over the caller's state and dispatches to
-// helpers in ui_waiting_for_peer.zig, game_launcher.zig, and
-// ui_controller_mapper.zig for the actual session/launch/binding logic.
-
 const std = @import("std");
 const config = @import("common").config;
 const logging = @import("common").logging;

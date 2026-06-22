@@ -9,10 +9,6 @@ const win32 = struct {
     extern "user32" fn GetAsyncKeyState(vKey: c_int) callconv(.winapi) i16;
 };
 
-// ============================================================================
-// Input Binding Types
-// ============================================================================
-
 pub const InputType = enum(u8) {
     none,
     sdl_button,
@@ -36,9 +32,14 @@ pub const InputBinding = struct {
                 const hat_idx = self.index & 0xFF;
                 const dir: u8 = @intCast(self.index >> 8);
                 const dir_str: []const u8 = switch (dir) {
-                    1 => "DL", 2 => "D", 3 => "DR",
-                    4 => "L", 6 => "R",
-                    7 => "UL", 8 => "U", 9 => "UR",
+                    1 => "DL",
+                    2 => "D",
+                    3 => "DR",
+                    4 => "L",
+                    6 => "R",
+                    7 => "UL",
+                    8 => "U",
+                    9 => "UR",
                     else => "?",
                 };
                 break :blk std.fmt.bufPrint(buf, "Hat{d} {s}", .{ hat_idx, dir_str }) catch "Hat";
@@ -107,27 +108,27 @@ pub const ControllerMapping = struct {
     deadzone: u32 = 8000,
     socd_mode: u8 = 1, // 1=L+R negate, 2=U+D negate, 3=both (0 unused, normalized to 1)
     device_index: c_int = 0, // -1 = keyboard
-    // Optional input transform: 9AB/7AB → jump on frame N, air-dash on N+1.
-    // Off by default; per-player so P1 and P2 can toggle independently.
-    // See docs/air-dash-macro-design.md and air_dash_macro.zig.
+
     air_dash_macro: bool = false,
 };
 
 pub const BindingTarget = enum {
     none,
-    a, b, c, d, e, ab,
-    start, fn1, fn2,
-    up, down, left, right,
+    a,
+    b,
+    c,
+    d,
+    e,
+    ab,
+    start,
+    fn1,
+    fn2,
+    up,
+    down,
+    left,
+    right,
 };
 
-// ============================================================================
-// Input Polling for Click-to-Bind
-// ============================================================================
-
-/// Poll the given joystick (or keyboard if device_index == -1) for any input.
-/// Returns the first detected input as an InputBinding, or null if nothing
-/// is pressed. Used by the controller mapper's click-to-bind UI.
-/// joy is ?*anyopaque to avoid SDL type mismatch between different @cImport instances.
 pub fn pollForBindInput(joy: ?*anyopaque, device_index: c_int) ?InputBinding {
     if (device_index >= 0) {
         if (joy == null) return null;
@@ -142,10 +143,6 @@ pub fn pollForBindInput(joy: ?*anyopaque, device_index: c_int) ?InputBinding {
             }
         }
 
-        // Check axes — use high threshold to avoid trigger noise.
-        // Analog triggers on Xbox controllers rest at -32768 and move toward 0
-        // when pressed. We skip axes at exactly -32768 (trigger at rest) and
-        // require significant movement (>20000) for stick axes.
         const num_axes = c.SDL_JoystickNumAxes(j);
         i = 0;
         while (i < num_axes) : (i += 1) {
@@ -184,20 +181,14 @@ pub fn pollForBindInput(joy: ?*anyopaque, device_index: c_int) ?InputBinding {
     return null;
 }
 
-/// Default Xbox controller mapping for MBAA.
-/// MBAA button → Xbox button (raw SDL_Joystick button index):
-///   A → X (btn 2), B → Y (btn 3), C → B (btn 1), D → A (btn 0)
-///   E → LB (btn 4), A+B → RB (btn 5)
-///   Start → Start (btn 7), FN1 → Select/Back (btn 6), FN2 → R-Stick press (btn 9)
-///   Directions → D-pad hat 0
 pub fn defaultXboxMapping() ControllerMapping {
     return .{
-        .a = .{ .type = .sdl_button, .index = 2 },   // X
-        .b = .{ .type = .sdl_button, .index = 3 },   // Y
-        .c = .{ .type = .sdl_button, .index = 1 },   // B
-        .d = .{ .type = .sdl_button, .index = 0 },   // A
-        .e = .{ .type = .sdl_button, .index = 4 },   // LB
-        .ab = .{ .type = .sdl_button, .index = 5 },  // RB
+        .a = .{ .type = .sdl_button, .index = 2 }, // X
+        .b = .{ .type = .sdl_button, .index = 3 }, // Y
+        .c = .{ .type = .sdl_button, .index = 1 }, // B
+        .d = .{ .type = .sdl_button, .index = 0 }, // A
+        .e = .{ .type = .sdl_button, .index = 4 }, // LB
+        .ab = .{ .type = .sdl_button, .index = 5 }, // RB
         .start = .{ .type = .sdl_button, .index = 7 }, // Start
         .fn1 = .{ .type = .sdl_button, .index = 6 }, // Select/Back
         .fn2 = .{ .type = .sdl_button, .index = 9 }, // R-Stick press
@@ -213,18 +204,6 @@ pub fn defaultXboxMapping() ControllerMapping {
     };
 }
 
-// ============================================================================
-// Read Input Using Mapping (for the DLL's GamepadReader)
-// ============================================================================
-
-/// Read a single binding's state (true = pressed).
-///
-/// `deadzone` only affects `.sdl_axis_pos` / `.sdl_axis_neg` bindings — it's
-/// the absolute value (0..32767) above which an axis is considered "pressed".
-/// Passing the user-configurable `m.deadzone` here (instead of a hardcoded
-/// 8000) ensures that axis-bound buttons (e.g. D-pad mapped to left stick)
-/// respect the deadzone slider in the GUI. Otherwise a higher deadzone set
-/// to suppress stick drift would have no effect on axis bindings.
 fn isBindingActive(binding: InputBinding, joy: ?*anyopaque, deadzone: u32) bool {
     return switch (binding.type) {
         .none => false,
@@ -236,20 +215,7 @@ fn isBindingActive(binding: InputBinding, joy: ?*anyopaque, deadzone: u32) bool 
             const hat_idx: c_int = @intCast(binding.index & 0xFF);
             const dir: u8 = @intCast(binding.index >> 8);
             const hat = c.SDL_JoystickGetHat(@ptrCast(joy), hat_idx);
-            // Cardinal directions (2=Down, 4=Left, 6=Right, 8=Up) match
-            // if their primary direction bit is set, regardless of
-            // perpendicular bits. This allows diagonals to work: pressing
-            // Down+Right on the D-pad matches both the Down binding (dir=2)
-            // and the Right binding (dir=6), and readInputMapped combines
-            // them into numpad 3 (Down-Right).
-            //
-            // The old code had exclusivity checks (e.g. dir=2 required
-            // hat & LEFT == 0 AND hat & RIGHT == 0), which prevented
-            // diagonals from registering — pressing Down+Right matched
-            // neither Down nor Right, producing neutral input.
-            //
-            // Diagonal directions (1=DL, 3=DR, 7=UL, 9=UR) still require
-            // both bits, since those are explicit diagonal bindings.
+
             const matched = switch (dir) {
                 1 => (hat & c.SDL_HAT_LEFT != 0) and (hat & c.SDL_HAT_DOWN != 0),
                 2 => (hat & c.SDL_HAT_DOWN != 0),
@@ -287,8 +253,14 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
 
     // SOCD resolution
     const socd = m.socd_mode;
-    if ((socd & 1) != 0 and left and right) { left = false; right = false; }
-    if ((socd & 2) != 0 and up and down) { up = false; down = false; }
+    if ((socd & 1) != 0 and left and right) {
+        left = false;
+        right = false;
+    }
+    if ((socd & 2) != 0 and up and down) {
+        up = false;
+        down = false;
+    }
 
     // Direction to numpad (start at 5=neutral so +/-1 yields 4=L, 6=R)
     var dir: u16 = 5;
@@ -313,25 +285,13 @@ pub fn readInputMapped(joy: ?*anyopaque, m: ControllerMapping) u16 {
     return dir | (btns << 4);
 }
 
-// ============================================================================
-// Save / Load Mapping
-// ============================================================================
-
 pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u8, io: std.Io, log: *logging.Logger) void {
-    // Ensure the parent directory exists. createFile does NOT create
-    // intermediate directories — if "zzcaster/" doesn't exist yet (e.g.
-    // first run), the save would silently fail.
     if (std.fs.path.dirname(path)) |dir| {
         if (dir.len > 0) {
             std.Io.Dir.cwd().createDirPath(io, dir) catch {};
         }
     }
 
-    // Build the INI content in a fixed memory buffer first, then write it
-    // to the file in a single call. This avoids the buffered-writer issues
-    // that previously left the file empty (file.writer(&buf) + w.print +
-    // w.flush silently produced 0-byte files because the print errors were
-    // swallowed by catch {}).
     var content_buf: [4096]u8 = undefined;
     var w: std.Io.Writer = .fixed(&content_buf);
     var buf: [64]u8 = undefined;

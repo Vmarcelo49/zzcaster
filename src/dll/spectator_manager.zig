@@ -2,34 +2,8 @@ const std = @import("std");
 const logging = @import("common").logging;
 const net = @import("net").enet_transport;
 
-// Use the shared ENet cimport from enet_transport.zig (see comment there).
+// Use the shared ENet cimport from enet_transport.zig
 const enet = net.enet;
-
-// ============================================================================
-// SpectatorManager — spectator chain forwarding (host-side).
-//
-// In the GGPO model, spectators are "just more players" — they're peers
-// who don't contribute inputs of their own but receive both players'
-// inputs every frame and re-simulate the match.
-//
-// In our DLL-resident ENet topology:
-//   * The host's hook.dll owns the ENet host (already created for the
-//     main peer in NetplayManager.initEnet).
-//   * Spectators connect to the same ENet host but on a separate channel
-//     (channel 2) so we can demux them from the main peer.
-//   * When a new peer connects, the host either:
-//       - Accepts it as a spectator (if spectator_count < MAX_ROOT_SPECTATORS
-//         on a relay host, or < MAX_SPECTATORS on a chain spectator).
-//       - Sends a REDIRECT:<addr>:<port> reliable message and disconnects,
-//         so the would-be spectator reconnects to an existing spectator
-//         (this is the chain forwarding from legacy SpectatorManager).
-//
-// PER-FRAME FLOW (host side, called from NetplayManager.frameStep)
-//   spec_mgr.frameStepSpectators(indexed_frame, both_inputs_buf):
-//     1. For each connected spectator, advance its `pos` to the next batch.
-//     2. Send a BothInputs packet covering [pos..pos+NUM_INPUTS) frames.
-//     3. Optionally send RNG state / state transitions (reliable).
-// ============================================================================
 
 pub const max_spectators: usize = 15;
 pub const max_root_spectators: usize = 1;
@@ -37,8 +11,8 @@ pub const num_inputs_per_packet: u32 = 30;
 pub const pending_timeout_ms: u64 = 20000;
 
 pub const SpectatorState = enum {
-    pending,    // TCP-accepted but no first message yet
-    active,     // receiving inputs
+    pending, // TCP-accepted but no first message yet
+    active, // receiving inputs
     redirecting, // sent REDIRECT, awaiting disconnect
 };
 
@@ -63,8 +37,7 @@ pub const Spectator = struct {
 
 pub const SpectatorManager = struct {
     allocator: std.mem.Allocator,
-    // Zig 0.16: std.crypto.random.intRangeLessThan is gone — we keep our
-    // own PRNG (Xoshiro256) seeded once from io.random() and reuse it.
+
     prng: std.Random.Xoshiro256,
     log: *logging.Logger,
     spectators: std.ArrayList(Spectator),

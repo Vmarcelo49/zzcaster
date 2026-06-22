@@ -1,16 +1,3 @@
-// ui_controller_mapper.zig — Controller mapper UI panels + binding helpers,
-// extracted from ui.zig.
-//
-// Contains the ImGui widgets that render the "Controllers" tab:
-//   - applyBinding    : write a polled InputBinding into a ControllerMapping slot
-//   - bindButton      : one bind button (shows current binding or "Press...")
-//   - drawPlayerPanel : classic grid layout (directions + buttons)
-//   - drawListPanel   : alt list layout (rows of [name | bind])
-//   - buildDeviceList : builds the device-name combo box array
-//
-// These are pure rendering helpers — they don't touch any UI state outside
-// the pointers passed in. ui.zig / ui_pages.zig calls them.
-
 const std = @import("std");
 const logging = @import("common").logging;
 const mapper = @import("dll").controller_mapper;
@@ -21,9 +8,6 @@ const c = @cImport({
     @cInclude("cimgui_shim.h");
 });
 
-/// Write a polled InputBinding into the slot identified by `target` on the
-/// given ControllerMapping. .none is a no-op (used as a sentinel for "no
-/// binding in progress").
 pub fn applyBinding(m: *mapper.ControllerMapping, target: mapper.BindingTarget, binding: mapper.InputBinding) void {
     switch (target) {
         .a => m.a = binding,
@@ -43,10 +27,6 @@ pub fn applyBinding(m: *mapper.ControllerMapping, target: mapper.BindingTarget, 
     }
 }
 
-/// Render one bind button. If this target is the one currently being bound
-/// (bind_target.* == target), show "Press..." and ignore clicks. Otherwise
-/// show the current binding label and, when clicked, set bind_target.* = target
-/// and arm a short cooldown so the same click doesn't immediately re-trigger.
 pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapper.InputBinding, bind_target: *mapper.BindingTarget, cooldown: *u32) void {
     var buf: [64]u8 = undefined;
     const bind_label = binding.label(&buf);
@@ -66,12 +46,6 @@ pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapp
     }
 }
 
-/// Classic grid layout for one player's controller mapping panel. Renders
-/// device combo, FN/Start row, direction pad (2x2 grid), button grid (A/B/C
-/// + D/E/A+B), SOCD radio, deadzone slider, Default + Clear buttons.
-///
-/// All state is mutated through the passed pointers — the panel is purely
-/// a view over the caller's data.
 pub fn drawPlayerPanel(
     name: []const u8,
     m: *mapper.ControllerMapping,
@@ -252,14 +226,6 @@ pub fn drawPlayerPanel(
     c.igPopID();
 }
 
-/// List view panel — alternative to drawPlayerPanel. Renders the player's
-/// bindings as a vertical list of rows, each row showing the in-game button
-/// name on the left and the bind button on the right. Below the list: device
-/// combo, SOCD, deadzone, default bindings, clear.
-///
-/// This is the "list view" toggled by the checkbox at the top of the
-/// Controllers tab. Two of these panels sit side-by-side (P1 left, P2 right)
-/// in equal-width child windows.
 pub fn drawListPanel(
     name: []const u8,
     m: *mapper.ControllerMapping,
@@ -394,13 +360,6 @@ pub fn drawListPanel(
 }
 
 /// Build the device-name combo box array used by the Controllers tab.
-/// Slot 0 is always "Keyboard"; slots 1..N are SDL joystick names (or
-/// "Unknown Joystick" if SDL_JoystickNameForIndex returns null). The
-/// returned `dev_names` array contains `dev_count` entries.
-///
-/// The `dev_names_buf` storage must outlive the ImGui calls that read
-/// `dev_names` — both buffers are passed in by the caller and live on
-/// the caller's stack.
 pub fn buildDeviceList(
     dev_names_buf: *[16][64]u8,
     dev_names: *[16][*:0]const u8,

@@ -1,23 +1,3 @@
-// game_launcher.zig — Game launch + IPC config logic, extracted from ui.zig.
-//
-// Contains the launcher-side functions that build the IPC config buffer and
-// spawn MBAA.exe with hook.dll injected:
-//   - launchGameImpl          : offline training/versus
-//   - launchNetplayImpl       : direct spectate / legacy join (no handshake)
-//   - launchGameAfterHandshake: post-netplay-handshake launch
-//   - cleanupGame             : tear down IPC + launcher state
-//   - setErr                  : write a fixed-size error message buffer
-//   - parsePort               : parse a sentinel u16 port from a [*]u8
-//
-// Plus the CLI-only launchers used by ui.runCli:
-//   - launchGame              : blocking offline launcher (no UI)
-//   - launchNetplayPeerImpl   : blocking spectate/join launcher (no UI)
-//   - runCliNetplay           : blocking handshake + launch (no UI)
-//
-// These functions have no ImGui/SDL dependencies — pure launcher + IPC + ipc
-// buffer construction. Kept in their own file so ui.zig stays focused on the
-// event loop.
-
 const std = @import("std");
 const config = @import("common").config;
 const logging = @import("common").logging;
@@ -25,8 +5,6 @@ const launcher = @import("launcher.zig");
 const ipc = @import("common").ipc;
 const session = @import("session.zig");
 
-/// Parse a port number from a sentinel-terminated buffer. Falls back to
-/// config.default_port if the buffer isn't a valid u16.
 pub fn parsePort(buf: [*]u8) u16 {
     const s = std.mem.sliceTo(@as([*:0]u8, @ptrCast(buf)), 0);
     return std.fmt.parseInt(u16, s, 10) catch config.default_port;
@@ -221,7 +199,7 @@ pub fn launchNetplayImpl(
     config_buf[4] = 1;
     std.mem.writeInt(u16, config_buf[5..7], port, .little);
     const addr_copy_len = @min(peer_addr.len, 248);
-    @memcpy(config_buf[7..7 + addr_copy_len], peer_addr[0..addr_copy_len]);
+    @memcpy(config_buf[7 .. 7 + addr_copy_len], peer_addr[0..addr_copy_len]);
     const msg_len = 7 + addr_copy_len;
 
     if (ipc_server.*) |*srv| {
@@ -346,7 +324,7 @@ pub fn launchGameAfterHandshake(
     if (!is_host) {
         const addr_slice = std.mem.sliceTo(&peer_addr, 0);
         const addr_copy_len = @min(addr_slice.len, 248);
-        @memcpy(config_buf[7..7 + addr_copy_len], addr_slice[0..addr_copy_len]);
+        @memcpy(config_buf[7 .. 7 + addr_copy_len], addr_slice[0..addr_copy_len]);
         msg_len = 7 + addr_copy_len;
     }
 
@@ -358,13 +336,7 @@ pub fn launchGameAfterHandshake(
     });
 }
 
-// ============================================================================
-// CLI-only launchers (used by ui.runCli — no UI, blocking until game exits)
-// ============================================================================
-
-/// Blocking offline launcher used by the CLI path. Mirrors launchGameImpl
-/// but with no error_msg reporting — failures are logged and the function
-/// returns quietly. Blocks until the game process exits.
+// CLI
 pub fn launchGame(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *logging.Logger, training: bool, is_netplay_host: bool, port: u16, pipe_name: []const u8, non_interactive: bool) !void {
     _ = non_interactive;
     const game_exe = try std.fs.path.join(allocator, &.{ cfg.app_dir, "MBAA.exe" });
@@ -425,9 +397,6 @@ pub fn launchGame(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config,
     log.info("Game exited", .{});
 }
 
-/// Blocking spectate/join launcher used by the CLI path. Like
-/// launchNetplayImpl but blocks until the game exits and has no error
-/// reporting — failures just return early.
 pub fn launchNetplayPeerImpl(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *logging.Logger, addr_str: []const u8, is_spectator: bool, pipe_name: []const u8) !void {
     const colon = std.mem.lastIndexOfScalar(u8, addr_str, ':') orelse return;
     const peer_addr = addr_str[0..colon];
@@ -463,7 +432,7 @@ pub fn launchNetplayPeerImpl(allocator: std.mem.Allocator, io: std.Io, cfg: *con
     config_buf[4] = 1;
     std.mem.writeInt(u16, config_buf[5..7], port, .little);
     const addr_copy_len = @min(peer_addr.len, 248);
-    @memcpy(config_buf[7..7 + addr_copy_len], peer_addr[0..addr_copy_len]);
+    @memcpy(config_buf[7 .. 7 + addr_copy_len], peer_addr[0..addr_copy_len]);
     const msg_len = 7 + addr_copy_len;
 
     _ = ipc_server.send(config_buf[0..msg_len]);
@@ -477,12 +446,7 @@ pub fn launchNetplayPeerImpl(allocator: std.mem.Allocator, io: std.Io, cfg: *con
     log.info("Session ended", .{});
 }
 
-/// CLI netplay: run the launcher-side handshake session (blocking, no UI —
-/// the host auto-confirms after the peer connects), then launch the game with
-/// the negotiated config. Mirrors the GUI's startHostSession/Join +
-/// launchGameAfterHandshake but single-threaded for the CLI path.
-///
-/// `peer_host` is null for host mode, "ip" for join mode.
+/// CLI netplay
 pub fn runCliNetplay(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -587,7 +551,7 @@ pub fn runCliNetplay(
     if (!snap.is_host) {
         const addr_slice = std.mem.sliceTo(&snap.peer_addr, 0);
         const addr_copy_len = @min(addr_slice.len, 248);
-        @memcpy(config_buf[7..7 + addr_copy_len], addr_slice[0..addr_copy_len]);
+        @memcpy(config_buf[7 .. 7 + addr_copy_len], addr_slice[0..addr_copy_len]);
         msg_len = 7 + addr_copy_len;
     }
 

@@ -1,56 +1,7 @@
 const std = @import("std");
 const logging = @import("common").logging;
 
-// ============================================================================
 // SfxDedup — sound-effect deduplication during rollback re-runs.
-//
-// Ported from the legacy sfxFilterArray / sfxMuteArray logic in
-// legacy_unused/targets/DllAsmHacks.cpp + DllRollbackManager.cpp.
-//
-// PROBLEM
-// -------
-// During a rollback re-run, the game re-executes logic that may play sound
-// effects. If a sound already played before the rollback, we don't want to
-// hear it again. If a sound was queued to play before the rollback but
-// didn't actually fire (because we rolled back), we want to force-mute it
-// on re-run to "cancel" the stale audio cue.
-//
-// SOLUTION (three arrays of length CC_SFX_ARRAY_LEN = 1500)
-// ---------------------------------------------------------
-//   sfxFilterArray : 0 = not played, 1+ = played N times this rerun,
-//                    0x80 = played-then-rolled-back sentinel.
-//   sfxMuteArray   : 1 = next playback of this SFX should be muted.
-//                    Used to "cancel" a queued sound by playing it silently.
-//   CC_SFX_ARRAY   : the game's "play this SFX" trigger array at 0x76E008.
-//                    The game writes 1 to byte i when sound i should play.
-//
-// PER-FRAME FLOW
-// --------------
-//   saveState(frame):
-//     Copy current sfxFilterArray into sfxHistory[frame % N].
-//   loadState(target_frame, current_frame):
-//     Walk sfxHistory from target_frame..current_frame, OR all snapshots
-//     together into sfxFilterArray, then mark each non-zero entry as 0x80.
-//   saveRerunSounds(frame):
-//     After each re-run frame: for each SFX i, if filter[i] & ~0x80
-//     (was actually played this rerun) write 1 to history slot, else 0.
-//   finishedRerun():
-//     For each SFX i where filter[i] == 0x80 (was queued pre-rollback but
-//     didn't re-fire post-rollback), set CC_SFX_ARRAY[i] = 1 AND
-//     sfxMuteArray[i] = 1 — this plays the SFX muted to cancel the queued
-//     playback. Then clear sfxFilterArray.
-//
-// ASM HOOKS (applied once at DLL load, see applySfxAsmHacks in dllmain.zig)
-// --------------------------------------------------------------------------
-//   filterRepeatedSfx: at the game's "play SFX i" path, redirect to a small
-//     trampoline that:
-//       1. Reads sfxMuteArray[i]. If non-zero, skip actual playback (muted).
-//       2. Reads sfxFilterArray[i]. If > 1, skip playback (already played).
-//       3. Otherwise play, then increment sfxFilterArray[i].
-//   muteSpecificSfx: when the game emits a sound, check sfxMuteArray[i]
-//     and if set, use DX_MUTED_VOLUME instead of the real volume, then
-//     clear the mute flag (so subsequent plays are normal).
-// ============================================================================
 
 pub const sfx_array_addr: usize = 0x76E008;
 pub const sfx_array_len: usize = 1500;

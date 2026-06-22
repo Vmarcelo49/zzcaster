@@ -50,17 +50,6 @@ const win32 = struct {
 
 /// Detect whether the active network connection is WiFi or Ethernet.
 /// Returns "Wired", "Wireless", or "Unknown".
-///
-/// Uses GetAdaptersAddresses to enumerate network adapters, filters for
-/// those that are operational (have a unicast IP), and checks IfType:
-///   - IF_TYPE_IEEE80211 (71) = WiFi
-///   - IF_TYPE_ETHERNET_CSMACD (6) = Ethernet
-///
-/// If any active adapter is WiFi, returns "Wireless". If all active
-/// adapters are Ethernet, returns "Wired". Otherwise "Unknown".
-///
-/// This is a read-only local query — no network traffic, no admin
-/// privileges needed, runs in <1ms. Works under Wine.
 pub fn getConnectionType() []const u8 {
     var buf_size: u32 = 0;
 
@@ -90,12 +79,6 @@ pub fn getConnectionType() []const u8 {
             continue;
         }
 
-        // Check if this adapter has a unicast address (meaning it's active).
-        // The FirstUnicastAddress field is at a larger offset than what we've
-        // declared in our partial struct. We approximate "active" by checking
-        // the adapter type — if it's Ethernet or WiFi, it's likely active.
-        // A more precise check would require the full struct, but this is
-        // sufficient for the display purpose.
         if (a.Type == win32.IF_TYPE_IEEE80211) {
             has_wifi = true;
         } else if (a.Type == win32.IF_TYPE_ETHERNET_CSMACD) {

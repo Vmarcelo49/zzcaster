@@ -2,11 +2,6 @@ const std = @import("std");
 const logging = @import("common").logging;
 const builtin = @import("builtin");
 
-// Rollback state pool — saves/restores game memory snapshots.
-// In a full implementation, the memory regions to save are loaded from
-// res/rollback.bin (a binary file listing all addresses+sizes to snapshot).
-// Here we implement the pool itself + FPU state save/restore.
-
 pub const InputBuffer = struct {
     allocator: std.mem.Allocator,
     inputs: std.AutoHashMap(u64, u16),
@@ -108,7 +103,7 @@ pub const SavedState = struct {
     frame: u32,
     index: u32,
     fpu_env: [28]u8, // x87 FPU control word save area (fenv_t on x86)
-    data: []u8,      // contiguous buffer for all memory regions
+    data: []u8, // contiguous buffer for all memory regions
 };
 
 pub const StatePool = struct {
@@ -290,14 +285,6 @@ pub const StatePool = struct {
     }
 };
 
-// Free functions for x86-only FPU state save/restore. These are kept out of
-// the StatePool struct so that the asm constraints don't trip Zig 0.15's
-// "cannot output to const local" check on the struct method receiver.
-//
-// We use the AT&T syntax `fnstenv -28(%esp)` style: write the FPU env to a
-// 28-byte region on the stack via a manual sub/store. Simpler approach: use
-// `fnstenv [esp]` and then read it back — but Zig 0.15's asm parser wants
-// `%[name]` syntax for named operands.
 fn saveFpu(out: *[28]u8) void {
     // Allocate a local stack slot and have fnstenv write to it via the
     // pointer operand (input "=m" makes it an output).

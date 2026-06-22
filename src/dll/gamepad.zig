@@ -24,15 +24,6 @@ pub const GamepadMapping = struct {
     down: c_int = c.SDL_CONTROLLER_BUTTON_DPAD_DOWN,
     left: c_int = c.SDL_CONTROLLER_BUTTON_DPAD_LEFT,
     right: c_int = c.SDL_CONTROLLER_BUTTON_DPAD_RIGHT,
-    // MBAACC Community Edition standard layout (matches original CCCaster
-    // defaultXboxMapping):
-    //   MBAA A ← Xbox X   (SDL_CONTROLLER_BUTTON_X)
-    //   MBAA B ← Xbox Y   (SDL_CONTROLLER_BUTTON_Y)
-    //   MBAA C ← Xbox B   (SDL_CONTROLLER_BUTTON_B)
-    //   MBAA D ← Xbox A   (SDL_CONTROLLER_BUTTON_A)
-    // This is the layout the community expects: the bottom face button
-    // (A on Xbox) is MBAA's D (the "weak" attack), and the left face
-    // button (X on Xbox) is MBAA's A (the "light" attack).
     a: c_int = c.SDL_CONTROLLER_BUTTON_X,
     b: c_int = c.SDL_CONTROLLER_BUTTON_Y,
     c_btn: c_int = c.SDL_CONTROLLER_BUTTON_B,
@@ -49,8 +40,6 @@ pub const GamepadReader = struct {
     joystick: ?*c.SDL_Joystick = null,
     mapping: GamepadMapping = .{},
 
-    // New: optional controller_mapper mapping. If set, uses SDL_Joystick API
-    // with the custom mapping instead of the hardcoded GamepadMapping.
     mapped_joystick: ?*anyopaque = null,
     custom_mapping: ?@import("controller_mapper.zig").ControllerMapping = null,
 
@@ -105,12 +94,6 @@ pub const GamepadReader = struct {
     }
 
     pub fn hasGamepad(self: *const GamepadReader) bool {
-        // A custom keyboard mapping (device_index == -1) is always usable,
-        // even with no physical controller plugged in. Without this, the
-        // frameStep hook falls through to keyboard.readInput() (the legacy
-        // reader that polls MBAA.exe's built-in config at offset 0x14D2C0)
-        // and the user's custom keyboard bindings from mapping.ini are
-        // silently ignored.
         if (self.custom_mapping) |m| {
             if (m.device_index < 0) return true;
         }
@@ -141,30 +124,16 @@ pub const GamepadReader = struct {
     }
 
     pub fn readInput(self: *GamepadReader) u16 {
-        // If a custom mapping is loaded, route to readInputMapped() —
-        // which handles both keyboard bindings (via GetAsyncKeyState) and
-        // joystick bindings (via SDL_Joystick* API). The previous code only
-        // routed when mapped_joystick was non-null, which meant keyboard
-        // mappings (device_index == -1) were silently dropped here and
-        // frameStep fell back to the legacy keyboard reader using MBAA's
-        // built-in config.
         if (self.custom_mapping) |m| {
             const mapper = @import("controller_mapper.zig");
-            // Keyboard mapping: poll keyboard bindings via GetAsyncKeyState.
-            // Pass null as the joystick so readInputMapped skips its
-            // analog-stick code path (which would dereference a null joy).
+
             if (m.device_index < 0) {
                 return mapper.readInputMapped(null, m);
             }
-            // Joystick mapping: use the opened mapped_joystick.
+
             if (self.mapped_joystick != null) {
                 return mapper.readInputMapped(self.mapped_joystick, m);
             }
-            // Custom joystick mapping requested but no joystick could be
-            // opened (rare — SDL_Init failed or controller unplugged since
-            // GUI saved the mapping). Fall through to the controller /
-            // joystick paths below instead of returning 0 (which would
-            // silently disable input).
         }
         if (self.controller != null) return self.readGameController();
         if (self.joystick != null) return self.readJoystick();
@@ -187,8 +156,14 @@ pub const GamepadReader = struct {
         if (y > deadzone) down = true else if (y < -deadzone) up = true;
 
         // SOCD
-        if (up and down) { up = false; down = false; }
-        if (left and right) { left = false; right = false; }
+        if (up and down) {
+            up = false;
+            down = false;
+        }
+        if (left and right) {
+            left = false;
+            right = false;
+        }
 
         // Direction to numpad (start at 5=neutral so +/-1 yields 4=L, 6=R)
         var dir: u16 = 5;
@@ -241,8 +216,14 @@ pub const GamepadReader = struct {
         }
 
         // SOCD
-        if (up and down) { up = false; down = false; }
-        if (left and right) { left = false; right = false; }
+        if (up and down) {
+            up = false;
+            down = false;
+        }
+        if (left and right) {
+            left = false;
+            right = false;
+        }
 
         var dir: u16 = 5;
         if (up) dir = 8 else if (down) dir = 2;

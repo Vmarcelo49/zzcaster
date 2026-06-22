@@ -15,10 +15,6 @@ pub const CliMode = enum {
     spectate,
 };
 
-// Zig 0.16: main() receives the full std.process.Init — the runtime provides a
-// ready-to-use general purpose allocator (init.gpa, leak-checked in Debug) and
-// I/O backend (init.io), so we no longer construct those manually. Args live
-// under init.minimal.args (Init wraps Minimal).
 pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
@@ -31,10 +27,7 @@ pub fn main(init: std.process.Init) !void {
     //   zzcaster.exe --mode=host --port=46318 [--name=Bob]
     //   zzcaster.exe --mode=join --peer=1.2.3.4:46318 [--name=Bob]
     //   zzcaster.exe --mode=spectate --peer=1.2.3.4:46318
-    //
-    // Zig 0.16: argsWithAllocator is gone; iterate via Args.Iterator.
-    // On Windows the iterator buffers into a WTF-8 string; initAllocator is
-    // the cross-platform path that handles both POSIX and Windows.
+
     var it = try args_vector.iterateAllocator(allocator);
     defer it.deinit();
     var cli_mode: CliMode = .menu;
@@ -63,10 +56,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // --name overrides the config's display name for this session.
-    // (Applied here — needs both cli_name and cfg to be in scope.)
 
-    // Each launcher instance needs a unique pipe name so two zzcaster.exe
-    // processes can run side-by-side (e.g. for local netplay testing).
     var pipe_name_buf: [64]u8 = undefined;
     const pipe_name = std.fmt.bufPrint(
         &pipe_name_buf,

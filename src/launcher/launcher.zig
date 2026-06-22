@@ -1,7 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
 
 const win32 = struct {
     extern "kernel32" fn CreateProcessA(

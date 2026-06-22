@@ -1,8 +1,8 @@
 const std = @import("std");
-const logging = @import("logging.zig");
-const net = @import("net.zig");
+const logging = @import("common").logging;
+const net = @import("net").enet_transport;
 
-// Use the shared ENet cimport from net.zig (see comment there).
+// Use the shared ENet cimport from enet_transport.zig (see comment there).
 const enet = net.enet;
 
 // ============================================================================

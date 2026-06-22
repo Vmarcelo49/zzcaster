@@ -1,0 +1,27 @@
+.{
+    // Default name used by packages depending on this one.
+    // It is redundant to include "zig" in this name because it is already
+    // within the Zig package namespace.
+    .name = .zzcaster,
+    // [Semantic Version](https://semver.org/). Matches config.version_string.
+    .version = "4.0.0",
+    // Together with name, this represents a globally unique package identifier.
+    // Generated once and never changed. Forks that wish to publish should
+    // regenerate it (delete the field and run `zig build`).
+    .fingerprint = 0xb66bbe519604d63f,
+    // Tracks the earliest Zig version the package supports.
+    .minimum_zig_version = "0.16.0",
+    // Dependencies (none yet — vendored C libs live in libs/, fetched by
+    // scripts/fetch-deps.sh, not via the Zig package manager).
+    .dependencies = .{},
+    // Files and directories included in this package.
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "docs",
+        // libs/ is vendored (fetched by scripts/fetch-deps.sh) so it is
+        // intentionally NOT listed here.
+    },
+}

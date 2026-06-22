@@ -80,7 +80,25 @@ A window opens with a sidebar menu:
 - **Netplay / Spectate** — Enter IP:port, then click Host, Join, or Spectate
 - **Offline** — Training Mode or Versus Mode
 - **Game Config** — Set win count and rollback frames (text input + Apply)
-- **Controllers** — Lists detected gamepads (full mapper planned)
+- **Controllers** — Per-player controller mapper: bind any button/direction
+  via click-to-bind, set SOCD mode and analog deadzone, and toggle the
+  optional Air Dash Macro (see below). Saved to `mapping.ini` and loaded by
+  `hook.dll` on game start.
+
+#### Air Dash Macro
+
+An optional input transform, enabled per-player in the **Controllers** tab
+(off by default). When enabled, pressing `9AB` (up-forward + A+B) or `7AB`
+(up-back + A+B) is expanded into a 2-frame sequence — a jump on frame N
+followed by an air-dash on frame N+1 — before the input reaches the game.
+This helps players who can't reliably hit the 1-frame jump→dash window.
+
+The transform runs before inputs enter the rollback InputBuffer, so in
+netplay the expanded sequence is what's sent to the peer and replayed by
+rollback re-runs; only the local client needs it enabled. Holding `9AB`
+across multiple frames produces alternating jump/dash cycles (one sequence
+every 2 frames). See `docs/air-dash-macro-design.md` for full design
+details.
 
 ### CLI (non-interactive)
 

@@ -5,6 +5,7 @@ const sfx_dedup = @import("sfx_dedup.zig");
 const spectator_manager_mod = @import("spectator_manager.zig");
 const net = @import("net").enet_transport;
 const rollback_regions = @import("rollback_regions.zig");
+const air_dash = @import("air_dash_macro.zig");
 
 const Md5 = std.crypto.hash.Md5;
 
@@ -398,6 +399,15 @@ pub const NetplayManager = struct {
 
     // SFX dedup (drives the sfx_filter_array / sfx_mute_array + history ring)
     sfx_dedup: ?sfx_dedup.SfxDedup = null,
+
+    // Air Dash Macro for the LOCAL player's input. Stepped each frame in
+    // frame_step.frameStepNetplay between getNetplayInput and setLocalInput,
+    // so the expanded 9→6AB (or 7→4AB) sequence is what enters the InputBuffer
+    // and gets sent to the peer / replayed by rollback. The `enabled` flag is
+    // wired from the P1 ControllerMapping in initSdlOnMainThread. Reset on
+    // every round-enter transition so a pending dash can't leak across rounds.
+    // See air_dash_macro.zig and docs/air-dash-macro-design.md.
+    air_dash_macro: air_dash.AirDashMacro = .{},
 
     // Spectator chain (host-side: forwards both players' inputs to spectators)
     spectators: ?spectator_manager_mod.SpectatorManager = null,
@@ -1349,6 +1359,12 @@ pub const NetplayManager = struct {
             self.sendReliable(&buf);
         }
 
+        // Clear air-dash-macro state on every round-enter transition so a
+        // pending dash from the tail of one round can't fire on frame 0 of
+        // the next (design doc §6.6). Covers chara_intro→in_game and
+        // skippable→in_game (next round).
+        if (new == .in_game) self.air_dash_macro.reset();
+
         self.log.info("State transition: {s} -> {s}, index={d}", .{
             @tagName(old), @tagName(new), self.indexed_frame.index,
         });
@@ -1548,6 +1564,13 @@ pub const NetplayManager = struct {
 
         // Reset SFX dedup at round start.
         if (self.sfx_dedup) |*sd| sd.reset();
+
+        // Defensive: clear air-dash-macro state at round start too (the
+        // onStateTransition reset already handles the chara_intro→in_game and
+        // skippable→in_game paths, but onEnterInGame is the canonical
+        // "round just started" hook — resetting here is cheap and future-proof
+        // against new state paths).
+        self.air_dash_macro.reset();
     }
 
     // --- Rollback ---

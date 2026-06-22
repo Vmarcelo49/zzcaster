@@ -19,10 +19,10 @@
 // event loop.
 
 const std = @import("std");
-const config = @import("config.zig");
-const logging = @import("logging.zig");
+const config = @import("common").config;
+const logging = @import("common").logging;
 const launcher = @import("launcher.zig");
-const ipc = @import("ipc.zig");
+const ipc = @import("common").ipc;
 const session = @import("session.zig");
 
 /// Parse a port number from a sentinel-terminated buffer. Falls back to

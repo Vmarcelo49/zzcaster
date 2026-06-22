@@ -1,5 +1,5 @@
 const std = @import("std");
-const logging = @import("logging.zig");
+const logging = @import("common").logging;
 const gamepad = @import("gamepad.zig");
 const keyboard = @import("keyboard.zig");
 const netman = @import("netplay_manager.zig");

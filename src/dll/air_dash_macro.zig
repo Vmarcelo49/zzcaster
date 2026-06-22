@@ -1,9 +1,22 @@
 // air_dash_macro.zig — optional "Air Dash Macro" input transformation.
 //
 // Detects `9AB` (up-forward + A+B) or `7AB` (up-back + A+B) and expands it
-// into a 2-frame sequence: jump on frame N, air-dash on frame N+1. This lets
-// players who can't reliably hit the 1-frame jump→dash window perform the
-// air-dash off a single button press.
+// into a multi-frame sequence: jump on frame N, neutral during the jump's
+// startup frames, then air-dash once the character is airborne. This lets
+// players who can't reliably hit the jump→dash window perform an air-dash off
+// a single button press.
+//
+// MBAACC jumps are not instantaneous: the character enters a startup phase
+// (still grounded, in pre-jump animation) for `jump_startup_frames` frames
+// before becoming airborne. An air-dash input during startup is ignored — the
+// character isn't in the air yet. So the macro must wait out the startup
+// before emitting the dash:
+//
+//   Frame N:                9     (jump input — enters startup)
+//   Frame N+1 .. N+3:       0     (startup — 3 frames, character grounded)
+//   Frame N+4:              6AB   (character airborne — air dash fires)
+//
+// For 7AB the dash direction is 4 instead of 6.
 //
 // The macro is a pure, stateless-except-for-its-own-machine transform on a
 // `u16` input. It knows nothing about frames, the InputBuffer, netplay, or
@@ -12,17 +25,13 @@
 // InputBuffer, it is automatically what gets sent over the network and what a
 // rollback re-run replays — no rollback-awareness is required here.
 //
-// State machine:
-//
-//   IDLE ──9AB/7AB──► PENDING (emit jump direction only) ──next frame──► IDLE
-//                                                             (emit dash)
-//
-// Per design doc §4.3 and §6: once the macro commits to a sequence on frame N,
-// the frame-N+1 dash is emitted regardless of what the player presses that
-// frame (the jump already happened; the dash must follow). Holding 9AB across
-// multiple frames produces alternating jump/dash cycles. The macro only fires
-// on A+B with no other buttons held and only for diagonals 9/7 (8AB / 6AB do
-// not trigger it).
+// Once the macro commits to a sequence (detects 9AB/7AB), the entire sequence
+// plays out regardless of what the player presses in subsequent frames — the
+// jump already happened on frame N, and the dash must follow on frame N+4.
+// The player's input during the startup/neutral frames is overridden to
+// neutral. Holding 9AB across multiple frames triggers a new sequence every
+// `jump_startup_frames + 2` frames. The macro only fires on A+B with no other
+// buttons held and only for diagonals 9/7 (8AB / 6AB do not trigger it).
 //
 // Input encoding (combined u16 = dir | (btns << 4)):
 //   dir nibble (bits 0-3): numpad notation (9=up-right, 7=up-left, ...)
@@ -31,16 +40,24 @@
 //   9AB = 0x0709, 7AB = 0x0707, 6AB = 0x0706, 4AB = 0x0704.
 const std = @import("std");
 
+/// Number of startup frames a jump has before the character leaves the ground
+/// and can air-dash. In MBAACC this is 3 — the jump input is registered on
+/// frame N, the character is grounded for frames N+1..N+3, and becomes
+/// airborne on frame N+4. Emitting the dash before frame N+4 would feed it
+/// into the grounded startup where air-dashes are not accepted, so the dash
+/// would silently fail.
+const jump_startup_frames: u8 = 3;
+
 const MacroState = enum {
     idle, // waiting for 9AB / 7AB
-    pending, // jump emitted last frame; inject the dash this frame
+    startup, // jump emitted; counting down startup frames before the dash
 };
 
 /// Result of a single `step` call. `triggered` is true only on the frame where
 /// the macro detects 9AB/7AB and starts a sequence — callers log it for
-/// debugging desync reports (design doc §5.5). The frame-N+1 dash emission is
-/// not a "trigger" (it's the committed tail of the previous trigger), so
-/// `triggered` is false there.
+/// debugging desync reports (design doc §5.5). The subsequent neutral/ dash
+/// emissions are the committed tail of that trigger, so `triggered` is false
+/// there.
 pub const StepResult = struct {
     output: u16,
     triggered: bool,
@@ -55,16 +72,21 @@ pub const AirDashMacro = struct {
     /// per-player `air_dash_macro` field in ControllerMapping (mapping.ini).
     enabled: bool = false,
     state: MacroState = .idle,
-    /// Dash direction to inject on the frame after a trigger (6 after 9AB,
-    /// 4 after 7AB). Only meaningful while `state == .pending`.
+    /// Dash direction to inject after the startup countdown (6 after 9AB,
+    /// 4 after 7AB). Only meaningful while `state == .startup`.
     dash_dir: u8 = 0,
+    /// Frames remaining before the dash fires. Set to `jump_startup_frames`
+    /// when a trigger is detected; counts down by 1 each frame. When it
+    /// reaches 0 the next `step` emits the dash and returns to idle.
+    startup_countdown: u8 = 0,
 
     /// Clear the state machine. Called on round transitions and whenever the
-    /// game leaves the in-game state, so a pending dash from the end of one
-    /// round can't leak into the first frame of the next (design doc §6.6).
+    /// game leaves the in-game state, so a pending sequence from the end of
+    /// one round can't leak into the first frame of the next (design doc §6.6).
     pub fn reset(self: *AirDashMacro) void {
         self.state = .idle;
         self.dash_dir = 0;
+        self.startup_countdown = 0;
     }
 
     /// Advance the state machine by one frame.
@@ -75,11 +97,17 @@ pub const AirDashMacro = struct {
     pub fn step(self: *AirDashMacro, raw_input: u16) StepResult {
         if (!self.enabled) return .{ .output = raw_input, .triggered = false };
 
-        // If we committed to a sequence last frame, the dash must fire now no
-        // matter what the player is currently pressing — the jump already
-        // happened, so the input the game saw last frame is inconsistent with
-        // anything other than completing the dash (design doc §6.2).
-        if (self.state == .pending) {
+        // STARTUP: we committed to a jump last frame (or are still counting
+        // down). Emit neutral until the countdown expires, then fire the dash.
+        // The player's input is overridden for the entire committed sequence —
+        // the jump already happened on frame N, and the dash must follow on
+        // frame N+4 regardless of what the player presses meanwhile.
+        if (self.state == .startup) {
+            if (self.startup_countdown > 0) {
+                self.startup_countdown -= 1;
+                return .{ .output = 0, .triggered = false };
+            }
+            // Countdown expired — the character is now airborne. Emit the dash.
             const dash_input: u16 = @as(u16, self.dash_dir) | (ab_buttons << 4);
             self.state = .idle;
             self.dash_dir = 0;
@@ -99,13 +127,14 @@ pub const AirDashMacro = struct {
         const other_buttons = btns & ~ab_buttons;
 
         if (has_ab and (dir == 9 or dir == 7) and other_buttons == 0) {
-            self.state = .pending;
+            self.state = .startup;
             self.dash_dir = if (dir == 9) 6 else 4;
+            self.startup_countdown = jump_startup_frames;
             // Frame N: just the jump direction, no buttons. Emitting the bare
-            // diagonal here (rather than e.g. 9AB) is what makes the next
-            // frame's dash a true air-dash: the game sees the character leave
-            // the ground on frame N, then reads a forward/back dash on frame
-            // N+1 while airborne.
+            // diagonal here (rather than e.g. 9AB) is what makes the later
+            // dash a true air-dash: the game sees the character leave the
+            // ground on frame N, and after the startup countdown reads a
+            // dash while the character is airborne.
             return .{ .output = @as(u16, dir), .triggered = true };
         }
 
@@ -132,6 +161,9 @@ fn dashWithDir(dir: u8) u16 {
     return @as(u16, dir) | (ab_buttons << 4);
 }
 
+/// Total length of an air-dash sequence: 1 jump + startup_frames neutral + 1 dash.
+const sequence_len: u8 = 1 + jump_startup_frames + 1;
+
 test "disabled macro is a pure passthrough" {
     var m: AirDashMacro = .{ .enabled = false };
     // Same input, same output, no trigger — even for a would-be trigger.
@@ -141,70 +173,110 @@ test "disabled macro is a pure passthrough" {
     try testing.expectEqual(MacroState.idle, m.state);
 }
 
-test "9AB expands to jump (frame N) then forward dash (frame N+1)" {
+test "9AB expands to jump, startup neutrals, then forward dash" {
     var m: AirDashMacro = .{ .enabled = true };
 
     // Frame N: trigger fires, emit just the jump diagonal.
     const r0 = m.step(input_9ab);
     try testing.expectEqual(@as(u16, 9), r0.output);
     try testing.expectEqual(true, r0.triggered);
-    try testing.expectEqual(MacroState.pending, m.state);
+    try testing.expectEqual(MacroState.startup, m.state);
 
-    // Frame N+1: committed dash, regardless of current input.
-    const r1 = m.step(neutral);
-    try testing.expectEqual(dashWithDir(6), r1.output);
-    try testing.expectEqual(false, r1.triggered);
+    // Frames N+1 .. N+3: startup — emit neutral each frame.
+    var i: u8 = 0;
+    while (i < jump_startup_frames) : (i += 1) {
+        const r = m.step(neutral);
+        try testing.expectEqual(@as(u16, 0), r.output);
+        try testing.expectEqual(false, r.triggered);
+    }
+
+    // Frame N+4: character airborne — committed forward dash.
+    const rdash = m.step(neutral);
+    try testing.expectEqual(dashWithDir(6), rdash.output);
+    try testing.expectEqual(false, rdash.triggered);
     try testing.expectEqual(MacroState.idle, m.state);
 }
 
-test "7AB expands to jump (frame N) then back dash (frame N+1)" {
+test "7AB expands to jump, startup neutrals, then back dash" {
     var m: AirDashMacro = .{ .enabled = true };
 
     const r0 = m.step(input_7ab);
     try testing.expectEqual(@as(u16, 7), r0.output);
     try testing.expectEqual(true, r0.triggered);
 
-    const r1 = m.step(neutral);
-    try testing.expectEqual(dashWithDir(4), r1.output);
-    try testing.expectEqual(false, r1.triggered);
+    var i: u8 = 0;
+    while (i < jump_startup_frames) : (i += 1) {
+        try testing.expectEqual(@as(u16, 0), m.step(neutral).output);
+    }
+
+    const rdash = m.step(neutral);
+    try testing.expectEqual(dashWithDir(4), rdash.output);
 }
 
-test "dash fires on frame N+1 even if buttons released" {
-    // Design doc §6.2: the macro commits to the dash on frame N+1 regardless
-    // of whether the player is still holding the buttons.
+test "dash fires on frame N+4 even if buttons released" {
+    // The macro commits to the full sequence once triggered — the jump
+    // already happened on frame N, so the dash must follow on frame N+4
+    // regardless of whether the player is still holding the buttons.
     var m: AirDashMacro = .{ .enabled = true };
     _ = m.step(input_9ab);
-    // Player releases everything on frame N+1.
+    // Player releases everything immediately after frame N.
+    var i: u8 = 0;
+    while (i < jump_startup_frames) : (i += 1) {
+        try testing.expectEqual(@as(u16, 0), m.step(neutral).output);
+    }
     const r = m.step(neutral);
     try testing.expectEqual(dashWithDir(6), r.output);
 }
 
 test "direction change mid-sequence is ignored" {
-    // Design doc §6.3: pressing 7AB on frame N+1 (while committed to a forward
-    // dash from a frame-N 9AB) does NOT switch the dash to back-dash. The
-    // 7AB is consumed as the committed forward dash; the player would have to
-    // press 7AB again on frame N+2 (once idle) to start a back-dash sequence.
+    // Pressing 7AB during the startup of a forward-dash sequence does NOT
+    // switch the dash to back-dash. The sequence committed by the frame-N 9AB
+    // plays out in full; the player must wait for idle to start a back-dash.
     var m: AirDashMacro = .{ .enabled = true };
     _ = m.step(input_9ab);
-    const r = m.step(input_7ab);
-    try testing.expectEqual(dashWithDir(6), r.output);
+    // Feed 7AB during every startup frame.
+    var i: u8 = 0;
+    while (i < jump_startup_frames) : (i += 1) {
+        try testing.expectEqual(@as(u16, 0), m.step(input_7ab).output);
+    }
+    // The dash is still forward (6), not back (4).
+    try testing.expectEqual(dashWithDir(6), m.step(input_7ab).output);
     try testing.expectEqual(MacroState.idle, m.state);
 }
 
-test "holding 9AB produces alternating jump/dash cycles" {
-    // Design doc §6.1: holding 9AB triggers a new sequence every other frame.
+test "holding 9AB produces one jump-dash cycle per sequence length" {
     var m: AirDashMacro = .{ .enabled = true };
 
     // Frame 0: trigger, jump.
     try testing.expectEqual(@as(u16, 9), m.step(input_9ab).output);
-    // Frame 1: committed dash.
+    // Frames 1..3: startup neutrals.
+    var i: u8 = 0;
+    while (i < jump_startup_frames) : (i += 1) {
+        try testing.expectEqual(@as(u16, 0), m.step(input_9ab).output);
+    }
+    // Frame 4: dash.
     try testing.expectEqual(dashWithDir(6), m.step(input_9ab).output);
-    // Frame 2: still holding → NEW trigger, jump again.
-    const r2 = m.step(input_9ab);
-    try testing.expectEqual(@as(u16, 9), r2.output);
-    try testing.expectEqual(true, r2.triggered);
-    // Frame 3: committed dash again.
-    try testing.expectEqual(dashWithDir(6), m.step(input_9ab).output);
+    // Frame 5: still holding → NEW trigger, jump again.
+    const r = m.step(input_9ab);
+    try testing.expectEqual(@as(u16, 9), r.output);
+    try testing.expectEqual(true, r.triggered);
+}
+
+test "sequence length matches jump_startup_frames + 2" {
+    // Sanity: from the trigger frame, exactly sequence_len frames are consumed
+    // before the machine returns to idle (1 jump + startup + 1 dash).
+    var m: AirDashMacro = .{ .enabled = true };
+    _ = m.step(input_9ab); // frame 0 — trigger
+
+    var frames_until_idle: u8 = 0;
+    while (m.state != .idle) {
+        _ = m.step(neutral);
+        frames_until_idle += 1;
+        // Guard against an infinite loop if the state machine is broken.
+        try testing.expect(frames_until_idle <= sequence_len * 2);
+    }
+    // frames_until_idle counts the neutral frames + the dash frame.
+    try testing.expectEqual(jump_startup_frames + 1, frames_until_idle);
 }
 
 test "non-AB buttons do not trigger the macro" {
@@ -241,25 +313,45 @@ test "A+B pressed simultaneously triggers the macro (not just the AB button)" {
     try testing.expectEqual(@as(u16, 9), r0.output);
     try testing.expectEqual(true, r0.triggered);
 
-    const r1 = m.step(neutral);
-    try testing.expectEqual(dashWithDir(6), r1.output);
+    var i: u8 = 0;
+    while (i < jump_startup_frames) : (i += 1) {
+        try testing.expectEqual(@as(u16, 0), m.step(neutral).output);
+    }
+    try testing.expectEqual(dashWithDir(6), m.step(neutral).output);
 }
 
-test "reset clears a pending dash" {
-    // Design doc §6.6: a pending dash must not survive a round transition.
+test "reset clears an in-progress sequence" {
+    // A pending startup must not survive a round transition.
     var m: AirDashMacro = .{ .enabled = true };
     _ = m.step(input_9ab);
-    try testing.expectEqual(MacroState.pending, m.state);
+    try testing.expectEqual(MacroState.startup, m.state);
+    try testing.expect(m.startup_countdown > 0);
 
     m.reset();
     try testing.expectEqual(MacroState.idle, m.state);
     try testing.expectEqual(@as(u8, 0), m.dash_dir);
+    try testing.expectEqual(@as(u8, 0), m.startup_countdown);
 
     // After reset, the next frame is treated as a fresh IDLE frame — no
     // spurious dash from the pre-reset trigger.
     const r = m.step(neutral);
     try testing.expectEqual(neutral, r.output);
     try testing.expectEqual(false, r.triggered);
+}
+
+test "reset mid-startup does not emit a dash" {
+    // Reset partway through the startup countdown: the remaining neutrals
+    // and the dash are all cancelled. The next trigger starts fresh.
+    var m: AirDashMacro = .{ .enabled = true };
+    _ = m.step(input_9ab); // countdown = 3
+    _ = m.step(neutral); // countdown = 2
+
+    m.reset();
+
+    // Should be idle — no dash leaks out.
+    const r = m.step(neutral);
+    try testing.expectEqual(neutral, r.output);
+    try testing.expectEqual(MacroState.idle, m.state);
 }
 
 test "reset while idle is a no-op" {

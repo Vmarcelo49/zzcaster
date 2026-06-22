@@ -1183,14 +1183,14 @@ fn sessionThreadMain(ctx: SessionThreadCtx) void {
     if (ctx.is_host) {
         ctx.s.host(ctx.port, ctx.training) catch |err| {
             if (err != error.Cancelled) {
-                ctx.s.log.warn("host() failed: {t}", .{err});
+                ctx.s.log.warn("host() failed: {s}", .{@errorName(err)});
             }
         };
     } else {
         const addr = ctx.peer_addr orelse return;
         ctx.s.join(addr, ctx.port, ctx.training) catch |err| {
             if (err != error.Cancelled) {
-                ctx.s.log.warn("join() failed: {t}", .{err});
+                ctx.s.log.warn("join() failed: {s}", .{@errorName(err)});
             }
         };
     }
@@ -1718,7 +1718,7 @@ fn runCliNetplay(
     }
 
     if (s.state != .launching) {
-        log.err("Handshake did not reach launching state (state={t})", .{s.state});
+        log.err("Handshake did not reach launching state (state={s})", .{@tagName(s.state)});
         return error.HandshakeFailed;
     }
 

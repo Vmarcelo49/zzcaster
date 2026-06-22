@@ -87,7 +87,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Init logging
     var log = try logging.Logger.init(allocator, io, "zzcaster/debug.log");
     defer log.deinit();
-    log.info("CCCaster v{s} (zig port) [mode={t}]", .{ config.version_string, cli_mode });
+    log.info("CCCaster v{s} (zig port) [mode={s}]", .{ config.version_string, @tagName(cli_mode) });
 
     // Parse config
     var cfg = try config.loadConfig(allocator, io);

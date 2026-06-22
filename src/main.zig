@@ -27,9 +27,11 @@ pub fn main(init: std.process.Init.Minimal) !void {
     const allocator = gpa_storage.allocator();
 
     // Zig 0.16: every file/stdout operation needs an explicit Io handle. We
-    // create the single-threaded variant in the launcher to avoid spawning
-    // worker threads — the launcher is a thin UI/CLI driver that does only a
-    // handful of config/log reads and writes.
+    // use init_single_threaded because the launcher runs all logic on the
+    // main thread — the netplay handshake is driven by step() calls from
+    // the UI event loop, not a background thread. Using init_single_threaded
+    // avoids the overhead of worker threads and is safe because there are
+    // no cross-thread Io operations.
     var io_backend: std.Io.Threaded = .init_single_threaded;
     const io = io_backend.io();
 
@@ -87,7 +89,7 @@ pub fn main(init: std.process.Init.Minimal) !void {
     // Init logging
     var log = try logging.Logger.init(allocator, io, "zzcaster/debug.log");
     defer log.deinit();
-    log.info("CCCaster v{s} (zig port) [mode={t}]", .{ config.version_string, cli_mode });
+    log.info("CCCaster v{s} (zig port) [mode={s}]", .{ config.version_string, @tagName(cli_mode) });
 
     // Parse config
     var cfg = try config.loadConfig(allocator, io);

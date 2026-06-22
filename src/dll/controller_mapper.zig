@@ -107,6 +107,10 @@ pub const ControllerMapping = struct {
     deadzone: u32 = 8000,
     socd_mode: u8 = 1, // 1=L+R negate, 2=U+D negate, 3=both (0 unused, normalized to 1)
     device_index: c_int = 0, // -1 = keyboard
+    // Optional input transform: 9AB/7AB → jump on frame N, air-dash on N+1.
+    // Off by default; per-player so P1 and P2 can toggle independently.
+    // See docs/air-dash-macro-design.md and air_dash_macro.zig.
+    air_dash_macro: bool = false,
 };
 
 pub const BindingTarget = enum {
@@ -352,6 +356,7 @@ pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u
     w.print("stick_x={d}\nstick_y={d}\ndeadzone={d}\nsocd={d}\n", .{
         p1.stick_x_axis, p1.stick_y_axis, p1.deadzone, p1.socd_mode,
     }) catch {};
+    w.print("air_dash_macro={d}\n", .{@intFromBool(p1.air_dash_macro)}) catch {};
 
     w.print("\n[Player2]\ndevice={d}\n", .{p2.device_index}) catch {};
     w.print("a={s}\n", .{p2.a.serialize(&buf)}) catch {};
@@ -370,6 +375,7 @@ pub fn saveMapping(p1: ControllerMapping, p2: ControllerMapping, path: []const u
     w.print("stick_x={d}\nstick_y={d}\ndeadzone={d}\nsocd={d}\n", .{
         p2.stick_x_axis, p2.stick_y_axis, p2.deadzone, p2.socd_mode,
     }) catch {};
+    w.print("air_dash_macro={d}\n", .{@intFromBool(p2.air_dash_macro)}) catch {};
 
     const written = w.buffered();
     log.info("saveMapping: built {d} bytes of INI content", .{written.len});
@@ -439,6 +445,11 @@ pub fn loadMapping(path: []const u8, io: std.Io, log: *logging.Logger) ?struct {
             current.deadzone = std.fmt.parseInt(u32, val, 10) catch 8000;
         } else if (std.mem.eql(u8, key, "socd")) {
             current.socd_mode = std.fmt.parseInt(u8, val, 10) catch 1;
+        } else if (std.mem.eql(u8, key, "air_dash_macro")) {
+            // Accept "1"/"0" (what saveMapping writes) and treat anything
+            // non-"1" as disabled — old ini files without this key keep the
+            // struct default (false).
+            current.air_dash_macro = std.mem.eql(u8, val, "1");
         } else {
             const binding = InputBinding.parse(val);
             if (std.mem.eql(u8, key, "a")) current.a = binding;

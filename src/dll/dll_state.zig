@@ -34,6 +34,7 @@ const std = @import("std");
 const logging = @import("common").logging;
 const netman = @import("netplay_manager.zig");
 const gamepad = @import("gamepad.zig");
+const air_dash = @import("air_dash_macro.zig");
 
 // ============================================================================
 // Group A — Game memory addresses (read/written each frame)
@@ -90,6 +91,14 @@ pub var reader: ?gamepad.GamepadReader = null;
 /// Offline-Versus P2 reader; null in netplay/spectator modes (P2 input comes
 /// from the network there). Built in applyPostLoadHacks.
 pub var reader2: ?gamepad.GamepadReader = null;
+
+/// Per-player Air Dash Macro state machines for OFFLINE mode (one per local
+/// player). The `enabled` flag is wired from ControllerMapping.air_dash_macro
+/// in initSdlOnMainThread; the state machine is stepped each frame in
+/// frame_step.frameStepOffline. Netplay mode uses the NetplayManager's own
+/// air_dash_macro field instead (one local player). See air_dash_macro.zig.
+pub var air_dash_macro_p1: air_dash.AirDashMacro = .{};
+pub var air_dash_macro_p2: air_dash.AirDashMacro = .{};
 
 /// Counter for periodic input-value logging in frameStepOffline.
 pub var input_log_frame: u32 = 0;

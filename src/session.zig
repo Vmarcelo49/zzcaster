@@ -206,7 +206,25 @@ pub const NetplaySession = struct {
         }
 
         switch (self.state) {
-            .idle, .launching, .completed, .failed, .cancelled, .waiting_confirmation => return,
+            .idle, .launching, .completed, .failed, .cancelled => return,
+
+            // Host: while waiting for the user to confirm on the confirmation
+            // screen, keep polling ENet so (a) the connection stays alive
+            // against ENet's internal peer timeout and (b) we detect a client
+            // that gives up / disconnects. We discard any messages here — the
+            // only valid message at this point is the client's confirm, which
+            // arrives AFTER the host sends config (in the .handshaking phase).
+            // This is especially important now that the host can spend an
+            // arbitrary amount of time reviewing/overriding the input delay.
+            .waiting_confirmation => {
+                if (self.transport.poll(0)) |event| {
+                    if (event == .disconnected) {
+                        self.setError("Peer disconnected while waiting for host to confirm");
+                        self.state = .failed;
+                    }
+                }
+                return;
+            },
 
             .listening => self.stepListening(),
             .connecting => self.stepConnecting(),
@@ -467,13 +485,21 @@ pub const NetplaySession = struct {
     }
 
     fn stepExchangeConfig(self: *NetplaySession) void {
-        // 5s timeout = 300 frames.
-        if (self.phase_attempts >= 300) {
-            if (self.config.is_host) {
-                self.setError("Client never confirmed config (5s timeout)");
-            } else {
-                self.setError("Never received config from host (5s timeout)");
-            }
+        // Timeout handling differs by role:
+        //   - Client waiting for config: NO timeout. The host may spend an
+        //     arbitrary amount of time on the confirmation screen reviewing
+        //     ping and overriding the input delay. The client must wait as
+        //     long as the host needs; liveness is covered by disconnect
+        //     detection (ENet's peer timeout + the disconnect event below).
+        //     A fixed timeout here was the root cause of the
+        //     "Peer disconnected waiting for confirm" failure: the client
+        //     timed out, failed, and its deinit() sent a DISCONNECT that the
+        //     host saw while waiting for the confirm.
+        //   - Host waiting for confirm: 30s. Once the host sends config, the
+        //     client responds nearly instantly, so 30s is a generous safety
+        //     net for packet loss / retransmits.
+        if (self.config.is_host and self.phase_attempts >= 1800) {
+            self.setError("Client never confirmed config (30s timeout)");
             self.state = .failed;
             return;
         }
@@ -483,11 +509,19 @@ pub const NetplaySession = struct {
             if (event == .message_received) {
                 const msg = self.transport.getLastMessage();
                 if (self.config.is_host) {
-                    // Host waits for client's ConfirmConfig.
+                    // Host waits for client's ConfirmConfig. The host reached
+                    // this sub-phase from hostConfirm(), which already sent the
+                    // config. Receiving the confirm means the client accepted
+                    // — both sides are ready, so go straight to .launching.
+                    // (Previously this went back to .waiting_confirmation,
+                    // which was correct in the pre-manual-delay flow where
+                    // the host sent config BEFORE the confirmation screen.
+                    // Now config is sent FROM the confirmation screen, so the
+                    // confirm is the final handshake step.)
                     if (msg.len >= 1 and msg[0] == @intFromEnum(Msg.confirm)) {
                         self.log.info("Client confirmed config", .{});
-                        self.state = .waiting_confirmation;
-                        self.log.info("Handshake complete — waiting for host to confirm start", .{});
+                        self.state = .launching;
+                        self.log.info("Handshake complete — ready to launch", .{});
                     }
                 } else {
                     // Client waits for config, then sends confirm.

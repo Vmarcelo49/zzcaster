@@ -381,7 +381,21 @@ pub const NetplayManager = struct {
 
     spectators: ?spectator_manager_mod.SpectatorManager = null,
 
-    should_sync_rng: bool = true,
+    // Defaults to false: the host must NOT send RNG during chara_select.
+    // The legacy CCCaster only synced RNG at `game_state == 99` (in-game
+    // intro-done), and the Zig port must match that timing. Arming RNG
+    // sync during chara_select caused a desync because each side resets
+    // `indexed_frame.frame = 0` at its own `world_timer` value, and the
+    // lazy ENet reconnect blocks each side for varying wall-clock
+    // durations — so the host sends RNG at frame N while the client
+    // applies it at frame M (with N != M), baking in a permanent
+    // advancement offset that the lockstep cannot recover from.
+    //
+    // The flag is armed by:
+    //   - `onStateTransition` to `.in_game` (round 1 entry from chara_intro)
+    //   - `checkIntroDone` when `game_state == 99` (per-round re-arm)
+    // `syncRngState` also gates on `intro_rng_enabled` as a defense-in-depth.
+    should_sync_rng: bool = false,
     rng_synced: bool = false,
 
     // RNG ack handshake: the host sends RNG state, but the peer must confirm
@@ -973,6 +987,15 @@ pub const NetplayManager = struct {
     pub fn syncRngState(self: *NetplayManager) void {
         if (!self.should_sync_rng or self.rng_acked) return;
         if (!self.config.is_host) return;
+        // Defense-in-depth: only sync RNG after `game_state == 99` (intro-done)
+        // has been observed. `should_sync_rng` is armed by `onStateTransition`
+        // to `.in_game` and by `checkIntroDone` on the per-round re-arm, so in
+        // principle this gate is redundant — but it ensures we can NEVER fire
+        // during chara_select even if some future code path arms
+        // `should_sync_rng` early. The legacy CCCaster only synced at
+        // intro-done, and syncing earlier causes a desync (see the comment on
+        // `should_sync_rng` for the full explanation).
+        if (!self.intro_rng_enabled) return;
         // Lazy-reconnect: only send once the ENet peer has actually connected.
         // The peer's CONNECT event may not have arrived yet on the first
         // frames of chara-select; sending before that silently drops the
@@ -1311,7 +1334,17 @@ pub const NetplayManager = struct {
         self.start_world_time = world_timer_addr.*;
         self.indexed_frame.frame = 0;
 
-        if (new == .in_game or new == .chara_select) {
+        // Arm RNG sync only when entering `.in_game` (round 1 entry from
+        // chara_intro, or training mode direct entry). The per-round re-arm
+        // for rounds 2+ is handled by `checkIntroDone` when `game_state == 99`.
+        //
+        // We deliberately do NOT arm for `.chara_select`: see the comment on
+        // `should_sync_rng` above. The legacy CCCaster only synced RNG at
+        // intro-done (`game_state == 99`), and arming during chara_select
+        // caused a desync at the first SyncHash check (frame 149) because
+        // the host's RNG send (at frame N) was applied on the client at a
+        // different frame M, baking in a permanent advancement offset.
+        if (new == .in_game) {
             self.rng_synced = false;
             self.rng_acked = false;
             self.rng_send_cooldown = 0;

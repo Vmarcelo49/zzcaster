@@ -148,6 +148,24 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
                 last_resend = now;
             }
 
+            // Re-attempt RNG sync inside the wait loop. Two reasons:
+            //   1. The host's first `syncRngState()` (called earlier in
+            //      frameStepNetplay) may have bailed because ENet wasn't
+            //      connected yet. By the time we're in this wait loop,
+            //      `pollAndDispatch(10)` may have just established the
+            //      connection — without this call the host would never
+            //      send the RNG and both sides would deadlock until the
+            //      10s timeout fires.
+            //   2. The client is now blocking on `rng_synced` (see
+            //      `isRemoteInputReady`), so the host MUST be able to
+            //      (re-)send the RNG packet from inside this loop.
+            // `syncRngState` is idempotent: it no-ops once `rng_acked`
+            // is set, and `applyRemoteRng` is idempotent once
+            // `rng_synced` is set, so calling it on every loop iteration
+            // is safe. The internal `rng_send_cooldown` (30 frames)
+            // throttles re-sends to ~300ms intervals inside this loop.
+            n.syncRngState();
+
             if (n.was_connected and !n.enet_connected) {
                 state.log.?.err("Peer disconnected while waiting for input!", .{});
                 state.alive_flag_addr.* = 0;

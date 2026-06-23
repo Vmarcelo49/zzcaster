@@ -30,6 +30,11 @@ pub const EnetTransport = struct {
     connected: bool = false,
     last_message: [4096]u8 = undefined,
     last_message_len: usize = 0,
+    // True when THIS instance called `enet_initialize()` (i.e. we own the
+    // global ENet state). Set by `listen()` and `connect()`, checked by
+    // `deinit()` so we don't tear down ENet while another transport in the
+    // same process is still using it.
+    owns_enet_init: bool = false,
 
     pub fn init() EnetTransport {
         return EnetTransport{};
@@ -47,12 +52,14 @@ pub const EnetTransport = struct {
         }
         self.connected = false;
         // Only deinitialize ENet if we were the side that initialized it.
-        // Both listen() and connect() call enet_initialize(); we match that
-        // with a single deinit here. (If the host process already inited ENet
-        // elsewhere — e.g. the DLL — that caller is responsible for its own
-        // deinit.)
-        if (self.is_host or !self.is_host) {
+        // The previous code had `if (self.is_host or !self.is_host)` which is
+        // tautologically true — it always deinitialized ENet regardless of
+        // ownership, which is dangerous when multiple transports share a
+        // process (the DLL's NetplayManager and a spectator chain, for
+        // example). Now we track ownership explicitly.
+        if (self.owns_enet_init) {
             enet.enet_deinitialize();
+            self.owns_enet_init = false;
         }
     }
 
@@ -64,6 +71,13 @@ pub const EnetTransport = struct {
         // whole session. deinit() below calls enet_deinitialize() once the
         // transport is dropped.
         if (enet.enet_initialize() != 0) return error.EnetInitFailed;
+        // If enet_initialize() succeeded we own the global state until deinit.
+        // (If anything below fails, we still need to tear it down.)
+        self.owns_enet_init = true;
+        errdefer {
+            enet.enet_deinitialize();
+            self.owns_enet_init = false;
+        }
 
         var addr: enet.ENetAddress = undefined;
         addr.host = enet.ENET_HOST_ANY;
@@ -80,6 +94,11 @@ pub const EnetTransport = struct {
 
     pub fn connect(self: *EnetTransport, host_str: []const u8, port: u16, log: *logging.Logger) !void {
         if (enet.enet_initialize() != 0) return error.EnetInitFailed;
+        self.owns_enet_init = true;
+        errdefer {
+            enet.enet_deinitialize();
+            self.owns_enet_init = false;
+        }
 
         self.host = enet.enet_host_create(null, 1, 2, 0, 0);
         if (self.host == null) {

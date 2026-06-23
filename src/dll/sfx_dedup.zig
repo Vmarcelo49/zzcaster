@@ -6,7 +6,18 @@ const logging = @import("common").logging;
 pub const sfx_array_addr: usize = 0x76E008;
 pub const sfx_array_len: usize = 1500;
 pub const num_rollback_states: usize = 60; // matches StatePool default
-pub const dx_muted_volume: u32 = 0xFFFE0000; // -10000 in DirectSound hundredths-of-dB (= -100 dB, silent). NOTE: legacy DX_MUTED_VOLUME is 0xFFFFD8F0; this Zig value differs and may be a port bug.
+// DirectSound volume is in hundredths of decibels, with 0 = full volume and
+// large negative values = attenuation. -10000 (= -100 dB) is effectively
+// silent. The legacy CCCaster uses 0xFFFFD8F0 = -10000 as i32 (the upper 16
+// bits hold the value, the lower 16 are reserved by DirectSound). The
+// previous Zig port used 0xFFFE0000 (= -512 dB) which is out of range and
+// is interpreted by DirectSound as DSBVOLUME_MAX (= 0 = full volume) — the
+// exact OPPOSITE of "muted". This bug caused stale SFX to play at full
+// volume during rollback re-runs instead of being silently cancelled,
+// which can desync audio state and (in some Windows DirectSound builds)
+// trigger an access violation in the SFX play-hook path. Aligned with the
+// legacy value.
+pub const dx_muted_volume: u32 = 0xFFFFD8F0;
 
 // Game's SFX trigger array (read each frame; the game writes 1 to byte i to
 // trigger playback of sound i).

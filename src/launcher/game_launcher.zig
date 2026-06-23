@@ -115,9 +115,13 @@ pub fn launchGameImpl(
     const msg_len = 7;
 
     if (ipc_server.*) |*srv| {
-        _ = srv.send(config_buf[0..msg_len]);
+        if (srv.send(config_buf[0..msg_len])) {
+            log.info("Config sent (host={} training={} port={d})", .{ is_netplay_host, training, port });
+        } else {
+            log.err("Config send FAILED (gle={d}) — DLL will not enter training/versus mode", .{srv.last_send_error});
+            setErr(error_msg, error_msg_len, "IPC send failed (config not delivered to DLL)");
+        }
     }
-    log.info("Config sent (host={} training={} port={d})", .{ is_netplay_host, training, port });
 }
 
 /// Launch MBAA.exe for direct spectate or legacy join (no handshake — peer
@@ -203,11 +207,15 @@ pub fn launchNetplayImpl(
     const msg_len = 7 + addr_copy_len;
 
     if (ipc_server.*) |*srv| {
-        _ = srv.send(config_buf[0..msg_len]);
+        if (srv.send(config_buf[0..msg_len])) {
+            log.info("Config sent ({s} -> {s}:{d})", .{
+                if (is_spectator) "spectator" else "client", peer_addr, port,
+            });
+        } else {
+            log.err("Config send FAILED (gle={d}) — DLL will not connect to peer", .{srv.last_send_error});
+            setErr(error_msg, error_msg_len, "IPC send failed (config not delivered to DLL)");
+        }
     }
-    log.info("Config sent ({s} -> {s}:{d})", .{
-        if (is_spectator) "spectator" else "client", peer_addr, port,
-    });
 }
 
 /// Launch the game after the launcher-side handshake completed. Mirrors
@@ -329,11 +337,15 @@ pub fn launchGameAfterHandshake(
     }
 
     if (ipc_server.*) |*srv| {
-        _ = srv.send(config_buf[0..msg_len]);
+        if (srv.send(config_buf[0..msg_len])) {
+            log.info("Config sent to DLL (host={} delay={d} rollback={d} port={d})", .{
+                is_host, delay, rollback, peer_port,
+            });
+        } else {
+            log.err("Config send FAILED (gle={d}) — DLL will not start netplay correctly", .{srv.last_send_error});
+            setErr(error_msg, error_msg_len, "IPC send failed (config not delivered to DLL)");
+        }
     }
-    log.info("Config sent to DLL (host={} delay={d} rollback={d} port={d})", .{
-        is_host, delay, rollback, peer_port,
-    });
 }
 
 // CLI

@@ -56,8 +56,13 @@ zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseFast
 ```
 
 Output appears in `zig-out/bin/`:
-- `zzcaster.exe` — the launcher (64-bit)
+- `zzcaster.exe` — the launcher (32-bit)
 - `hook.dll` — the injected DLL (32-bit, matches MBAA.exe)
+
+Both binaries are 32-bit (x86-windows-gnu). MBAA.exe is a 32-bit binary,
+so `hook.dll` MUST be 32-bit to be loadable. `zzcaster.exe` is also built
+32-bit so the launcher and DLL share types and ABI for IPC. The build
+will refuse to produce a non-x86 Windows target (see `build.zig`).
 
 ### Deploy to game directory
 
@@ -113,7 +118,7 @@ zzcaster.exe --mode=spectate --peer=1.2.3.4:46318
 ## Architecture
 
 ```
-zzcaster.exe (launcher, 64-bit)
+zzcaster.exe (launcher, 32-bit)
   ├── Creates MBAA.exe suspended
   ├── Injects hook.dll via CreateRemoteThread
   ├── Sends config via named pipe IPC
@@ -203,14 +208,15 @@ src/
 ├── netplay_manager.zig   # Per-frame netplay state machine
 ├── sfx_dedup.zig         # SFX dedup (rollback re-run audio cancellation)
 ├── spectator_manager.zig # Spectator chain forwarding
-└── hook_exports.c        # C glue for DLL exports
 ```
 
 ## Cross-compilation
 
-ZZCaster cross-compiles from Linux to Windows. The `hook.dll` is 32-bit
-(MBAA.exe is a 32-bit binary); `zzcaster.exe` is also built as 32-bit for
-simplicity (both use the same `-Dtarget=x86-windows-gnu`).
+ZZCaster cross-compiles from Linux to Windows. Both `hook.dll` and
+`zzcaster.exe` are 32-bit (`-Dtarget=x86-windows-gnu`). MBAA.exe is a
+32-bit binary so `hook.dll` MUST be 32-bit; the launcher is also 32-bit
+so the two artifacts share types and ABI for the IPC config struct.
+The build script rejects any non-x86 Windows target with a clear error.
 
 ## License
 

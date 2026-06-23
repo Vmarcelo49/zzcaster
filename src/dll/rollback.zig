@@ -125,14 +125,17 @@ pub const StatePool = struct {
     }
 
     pub fn deinit(self: *StatePool) void {
-        if (self.pool.len > 0) self.allocator.free(self.pool);
-        self.free_stack.deinit(self.allocator);
-        // Free saved state data buffers
-        for (self.saved_states.items) |s| {
-            self.allocator.free(s.data);
-        }
+        // `pool` is the single owner of all snapshot memory. `saved_states[i].data`
+        // is a slice INTO `pool`, not a separate allocation, so we must NOT call
+        // allocator.free on each `s.data` — that would be a double-free.
+        // Just free the pool once, then the bookkeeping arrays.
         self.saved_states.deinit(self.allocator);
+        self.free_stack.deinit(self.allocator);
         self.regions.deinit(self.allocator);
+        if (self.pool.len > 0) self.allocator.free(self.pool);
+        self.pool = &.{};
+        self.state_size = 0;
+        self.num_states = 0;
     }
 
     /// Add a memory region to save/restore (from res/rollback.bin)
@@ -167,9 +170,26 @@ pub const StatePool = struct {
     }
 
     /// Save current game state (memory regions + FPU env)
+    ///
+    /// If no free slots are available, the OLDEST saved state is overwritten
+    /// (ring-buffer semantics). This prevents rollback from silently dying
+    /// after `num_states` saves (e.g. 60 frames at 60 FPS = 1 second of play).
     pub fn saveState(self: *StatePool, frame: u32, index: u32) ?usize {
-        if (self.state_size == 0 or self.free_stack.items.len == 0) return null;
-        const slot = self.free_stack.pop() orelse return null;
+        if (self.state_size == 0) return null;
+
+        var slot: usize = undefined;
+        if (self.free_stack.items.len > 0) {
+            slot = self.free_stack.pop() orelse return null;
+        } else if (self.saved_states.items.len > 0) {
+            // Recycle the oldest entry. We don't return its slot to the
+            // free_stack on the way out — we hand it straight to the new
+            // snapshot. The saved_states list shrinks below.
+            const oldest = self.saved_states.orderedRemove(0);
+            slot = (@intFromPtr(oldest.data.ptr) - @intFromPtr(self.pool.ptr)) / self.state_size;
+        } else {
+            return null;
+        }
+
         const offset = slot * self.state_size;
         const dst = self.pool[offset .. offset + self.state_size];
 
@@ -256,33 +276,14 @@ pub const StatePool = struct {
         return null;
     }
 
-    /// Load memory regions from res/rollback.bin
-    pub fn loadFromRbBin(self: *StatePool, path: []const u8, io: std.Io, log: *logging.Logger) !void {
-        const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch {
-            log.warn("rollback.bin not found at {s} — rollback disabled", .{path});
-            return error.FileNotFound;
-        };
-        defer file.close(io);
-
-        const stat = try file.stat(io);
-        const data = try self.allocator.alloc(u8, stat.size);
-        defer self.allocator.free(data);
-        _ = try file.readPositionalAll(io, data, 0);
-
-        // rollback.bin format: sequence of (u32 address, u32 size) pairs
-        var i: usize = 0;
-        var count: usize = 0;
-        while (i + 8 <= data.len) : (i += 8) {
-            const addr = std.mem.readInt(u32, data[i..][0..4], .little);
-            const size = std.mem.readInt(u32, data[i + 4 ..][0..4], .little);
-            if (addr == 0 and size == 0) break;
-            try self.addRegion(addr, size);
-            count += 1;
-        }
-        log.info("Loaded {d} memory regions from rollback.bin ({d} bytes total)", .{
-            count, self.totalRegionSize(),
-        });
-    }
+    // The previous `pub fn loadFromRbBin(self, path, io, log) !void` was
+    // REMOVED — it was a legacy code path. The active path lives in
+    // `src/dll/rollback_regions.zig` (`all_regions`) and is consumed directly
+    // by `NetplayManager.onEnterInGame()`. `loadFromRbBin` had no callers
+    // (verified by grep) and no tests; keeping it created a second, untested
+    // path for the same concern. If you need to load regions from a binary
+    // file again, port the rollback_regions.zig format instead of reviving
+    // this stale one.
 };
 
 fn saveFpu(out: *[28]u8) void {

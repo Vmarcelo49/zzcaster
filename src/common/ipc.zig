@@ -75,8 +75,10 @@ pub const IpcServer = struct {
     connect_event: ?*anyopaque = null,
     connect_overlapped: win32.Overlapped = std.mem.zeroes(win32.Overlapped),
     connected: bool = false,
-    recv_buf: [65536]u8 = undefined,
-    recv_len: usize = 0,
+    // NOTE: recv_buf/recv_len were removed along with poll() — they only
+    // existed to back that dead method. If a future caller needs to RECEIVE
+    // data on the server side, add a framing-aware reader modeled on the
+    // DLL's IpcReader.
 
     pub fn listen(name: []const u8) !IpcServer {
         var name_buf: [256]u8 = undefined;
@@ -143,27 +145,15 @@ pub const IpcServer = struct {
         return true;
     }
 
-    pub fn poll(self: *IpcServer) ?[]const u8 {
-        if (!self.connected or self.pipe_handle == null) return null;
-
-        // Check if data is available
-        var available: u32 = 0;
-        if (win32.PeekNamedPipe(self.pipe_handle, null, 0, null, &available, null) == 0) {
-            self.connected = false;
-            return null;
-        }
-        if (available == 0) return null;
-
-        // Read available data
-        var read: u32 = 0;
-        if (win32.ReadFile(self.pipe_handle, &self.recv_buf, available, &read, null) == 0) {
-            self.connected = false;
-            return null;
-        }
-
-        self.recv_len = read;
-        return self.recv_buf[0..read];
-    }
+    // The previous `pub fn poll(self: *IpcServer) ?[]const u8` was REMOVED:
+    //   - It was unused anywhere in the codebase.
+    //   - It read raw bytes via PeekNamedPipe+ReadFile without honoring the
+    //     length-prefix framing that `send()` emits. If it had been called,
+    //     it would have desynchronized the protocol exactly the way the
+    //     DLL-side reader used to before this PR fixed it.
+    // The DLL-side `IpcReader` in src/dll/dllmain.zig is the canonical
+    // framing-aware reader; if a server-side poll is ever needed again,
+    // port that state machine here rather than resurrecting this stub.
 
     pub fn close(self: *IpcServer) void {
         if (self.connected) {

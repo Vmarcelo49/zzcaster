@@ -27,7 +27,7 @@ pub fn applyBinding(m: *mapper.ControllerMapping, target: mapper.BindingTarget, 
     }
 }
 
-pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapper.InputBinding, bind_target: *mapper.BindingTarget, cooldown: *u32) void {
+pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapper.InputBinding, bind_target: *mapper.BindingTarget, cooldown_until_ms: *i64, now_ms: i64) void {
     var buf: [64]u8 = undefined;
     const bind_label = binding.label(&buf);
 
@@ -41,7 +41,10 @@ pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapp
         const btn_text = std.fmt.bufPrintZ(&btn_buf, "{s}: {s}", .{ label, bind_label }) catch label;
         if (c.igButton(btn_text.ptr, .{ .x = 90, .y = 0 })) {
             bind_target.* = target;
-            cooldown.* = 15; // ~250ms at 60fps to avoid immediate re-bind
+            // 250 ms wall-clock cooldown so the same click that triggered
+            // "press to bind" is not read back as the binding itself.
+            // Wall-clock based — correct regardless of UI frame rate.
+            cooldown_until_ms.* = now_ms + 250;
         }
     }
 }
@@ -56,9 +59,14 @@ pub fn drawPlayerPanel(
     dev_count: c_int,
     num_joy: c_int,
     log: *logging.Logger,
-    cooldown: *u32,
+    io: std.Io,
+    cooldown_until_ms: *i64,
 ) void {
     _ = num_joy;
+
+    // Capture wall-clock ms once per panel draw — passed to each bindButton
+    // so cooldowns are anchored to real time, not UI frame rate.
+    const now_ms: i64 = std.Io.Clock.now(.real, io).toMilliseconds();
 
     // Build unique ID suffixes from player name to avoid ImGui ID conflicts
     var id_suffix_buf: [32]u8 = undefined;
@@ -97,11 +105,11 @@ pub fn drawPlayerPanel(
 
     // Top row: FN1, Start, FN2
     c.igIndent(200);
-    bindButton("FN1", .fn1, m.fn1, bind_target, cooldown);
+    bindButton("FN1", .fn1, m.fn1, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
-    bindButton("Start", .start, m.start, bind_target, cooldown);
+    bindButton("Start", .start, m.start, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
-    bindButton("FN2", .fn2, m.fn2, bind_target, cooldown);
+    bindButton("FN2", .fn2, m.fn2, bind_target, cooldown_until_ms, now_ms);
     c.igUnindent(200);
 
     c.igSpacing();
@@ -117,19 +125,19 @@ pub fn drawPlayerPanel(
 
     // Up (centered)
     c.igIndent(60);
-    bindButton("Up", .up, m.up, bind_target, cooldown);
+    bindButton("Up", .up, m.up, bind_target, cooldown_until_ms, now_ms);
     c.igUnindent(60);
 
     // Left + Right
-    bindButton("Left", .left, m.left, bind_target, cooldown);
+    bindButton("Left", .left, m.left, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
     c.igDummy(.{ .x = 30, .y = 0 });
     c.igSameLine(0, 8);
-    bindButton("Right", .right, m.right, bind_target, cooldown);
+    bindButton("Right", .right, m.right, bind_target, cooldown_until_ms, now_ms);
 
     // Down (centered)
     c.igIndent(60);
-    bindButton("Down", .down, m.down, bind_target, cooldown);
+    bindButton("Down", .down, m.down, bind_target, cooldown_until_ms, now_ms);
     c.igUnindent(60);
 
     c.igEndChild();
@@ -142,20 +150,20 @@ pub fn drawPlayerPanel(
     c.igSpacing();
 
     // Row 1: A, B, C
-    bindButton("A", .a, m.a, bind_target, cooldown);
+    bindButton("A", .a, m.a, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
-    bindButton("B", .b, m.b, bind_target, cooldown);
+    bindButton("B", .b, m.b, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
-    bindButton("C", .c, m.c, bind_target, cooldown);
+    bindButton("C", .c, m.c, bind_target, cooldown_until_ms, now_ms);
 
     c.igSpacing();
 
     // Row 2: D, E, AB
-    bindButton("D", .d, m.d, bind_target, cooldown);
+    bindButton("D", .d, m.d, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
-    bindButton("E", .e, m.e, bind_target, cooldown);
+    bindButton("E", .e, m.e, bind_target, cooldown_until_ms, now_ms);
     c.igSameLine(0, 8);
-    bindButton("A+B", .ab, m.ab, bind_target, cooldown);
+    bindButton("A+B", .ab, m.ab, bind_target, cooldown_until_ms, now_ms);
 
     c.igEndChild();
 
@@ -235,8 +243,12 @@ pub fn drawListPanel(
     dev_names: *const [16][*:0]const u8,
     dev_count: c_int,
     log: *logging.Logger,
-    cooldown: *u32,
+    io: std.Io,
+    cooldown_until_ms: *i64,
 ) void {
+    // Capture wall-clock ms once per panel draw — passed to each bindButton
+    // so cooldowns are anchored to real time, not UI frame rate.
+    const now_ms: i64 = std.Io.Clock.now(.real, io).toMilliseconds();
     // Build unique ID suffix for ImGui ID stack
     var id_suffix_buf: [32]u8 = undefined;
     const id_suffix = std.fmt.bufPrintZ(&id_suffix_buf, "##list_{s}", .{name}) catch "##list_p";
@@ -301,7 +313,7 @@ pub fn drawListPanel(
         c.igText("%s", @as([*:0]const u8, @ptrCast(label_z.ptr)));
         c.igSameLine(90, 8); // 90px name column + 8px spacing
         // Bind button (right column)
-        bindButton(row.label, row.target, row.binding, bind_target, cooldown);
+        bindButton(row.label, row.target, row.binding, bind_target, cooldown_until_ms, now_ms);
     }
 
     c.igSpacing();

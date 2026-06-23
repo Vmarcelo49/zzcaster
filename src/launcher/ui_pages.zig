@@ -53,7 +53,7 @@ pub fn drawIdlePage(
     p2_joystick: *?*anyopaque,
     p1_device_sel: *c_int,
     p2_device_sel: *c_int,
-    bind_cooldown: *u32,
+    bind_cooldown_until_ms: *i64,
     list_view: *bool,
     mapping_path: []const u8,
     num_joy: c_int,
@@ -208,18 +208,25 @@ pub fn drawIdlePage(
             c.igSeparator();
             c.igSpacing();
 
-            // Decrement cooldown
-            if (bind_cooldown.* > 0) bind_cooldown.* -= 1;
+            // Check bind cooldown using wall-clock ms so it runs at real-time
+            // speed regardless of the UI's frame rate. The cooldown prevents
+            // the same click that triggered "press to bind" from being read
+            // back as the binding itself.
+            const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+            const cooldown_done = bind_cooldown_until_ms.* == 0 or now_ms >= bind_cooldown_until_ms.*;
+            if (bind_cooldown_until_ms.* != 0 and cooldown_done) {
+                bind_cooldown_until_ms.* = 0;
+            }
 
             // Poll for bind input if active
-            if (p1_bind_target.* != .none and bind_cooldown.* == 0) {
+            if (p1_bind_target.* != .none and cooldown_done) {
                 const dev_idx: c_int = p1_device_sel.* - 1;
                 if (mapper.pollForBindInput(p1_joystick.*, dev_idx)) |binding| {
                     ui_controller_mapper.applyBinding(p1_mapping, p1_bind_target.*, binding);
                     p1_bind_target.* = .none;
                 }
             }
-            if (p2_bind_target.* != .none and bind_cooldown.* == 0) {
+            if (p2_bind_target.* != .none and cooldown_done) {
                 const dev_idx: c_int = p2_device_sel.* - 1;
                 if (mapper.pollForBindInput(p2_joystick.*, dev_idx)) |binding| {
                     ui_controller_mapper.applyBinding(p2_mapping, p2_bind_target.*, binding);
@@ -243,24 +250,24 @@ pub fn drawIdlePage(
 
                 // Left column: Player 1
                 _ = c.igBeginChild_Str("P1List", .{ .x = 0, .y = 0 }, true, 0);
-                ui_controller_mapper.drawListPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, log, bind_cooldown);
+                ui_controller_mapper.drawListPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, log, io, bind_cooldown_until_ms);
                 c.igEndChild();
 
                 c.igSameLine(0, 8);
 
                 // Right column: Player 2
                 _ = c.igBeginChild_Str("P2List", .{ .x = 0, .y = 0 }, true, 0);
-                ui_controller_mapper.drawListPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, log, bind_cooldown);
+                ui_controller_mapper.drawListPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, log, io, bind_cooldown_until_ms);
                 c.igEndChild();
             } else {
                 // === GRID VIEW (classic layout) ===
-                ui_controller_mapper.drawPlayerPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, num_joy, log, bind_cooldown);
+                ui_controller_mapper.drawPlayerPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, num_joy, log, io, bind_cooldown_until_ms);
 
                 c.igSpacing();
                 c.igSeparator();
                 c.igSpacing();
 
-                ui_controller_mapper.drawPlayerPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, num_joy, log, bind_cooldown);
+                ui_controller_mapper.drawPlayerPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, num_joy, log, io, bind_cooldown_until_ms);
             }
 
             c.igSpacing();

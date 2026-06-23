@@ -1,24 +1,7 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Both zzcaster.exe and hook.dll MUST be 32-bit (x86-windows-gnu):
-    //   - hook.dll is injected into MBAA.exe (a 32-bit binary). A 64-bit
-    //     DLL cannot be loaded into a 32-bit process — full stop.
-    //   - zzcaster.exe is also built 32-bit so that it shares types with
-    //     dll_export_mod (which re-exports dll types like ControllerMapping
-    //     into the launcher) and so the launcher/DLL use the same ABI for
-    //     shared structures passed via IPC.
-    //
-    // The previous code used `b.standardTargetOptions(.{})` for both, which
-    // meant `-Dtarget=x86_64-windows-gnu` would silently produce a hook.dll
-    // that the loader refuses to map into MBAA.exe. We now default the target
-    // to x86-windows-gnu but still allow -Dtarget to be set explicitly so
-    // power users can override. If a non-x86 Windows target is requested, we
-    // fail the build with a clear error rather than producing a broken DLL.
-    //
-    // Note: we only enforce the arch when the target is Windows — host-arch
-    // test runs (which use the host target, e.g. linux x86_64) must still
-    // work so `zig build test` doesn't trip this guard.
+    // both zzcaster and hook.dll are 32 bit applications, so we force the build to be x86
     const user_target = b.standardTargetOptions(.{});
     if (user_target.result.os.tag == .windows and user_target.result.cpu.arch != .x86) {
         std.debug.panic(

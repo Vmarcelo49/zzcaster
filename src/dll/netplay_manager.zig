@@ -338,6 +338,12 @@ fn readU32At(p: [*]u8) u32 {
 const sync_send_period: u32 = 5 * 60; // 5 seconds at 60fps
 const sync_queue_len: u8 = 16;
 
+// Host re-sends the RNG state this many frames apart while waiting for the
+// peer's RNG_ACK. ~0.5s at 60fps is slow enough not to flood, fast enough to
+// recover within the chara-select phase well before the first SyncHash check
+// at frame 149.
+const rng_resend_period: u32 = 30;
+
 // Round-over: extra frames to wait before committing the InGame→Skippable
 // transition when rollback is enabled. Matches ROLLBACK_ROUND_OVER_DELAY in
 // DllMain.cpp:38.
@@ -377,7 +383,27 @@ pub const NetplayManager = struct {
     should_sync_rng: bool = true,
     rng_synced: bool = false,
 
+    // RNG ack handshake: the host sends RNG state, but the peer must confirm
+    // receipt before the host treats the sync as complete. The lazy-reconnect
+    // design (ENet connection established inside frameStep, not in the
+    // launcher) means the host's first RNG packet can be sent before the peer
+    // has finished its ENet CONNECT — so the packet would be dropped and the
+    // host would run with `rng_synced=true` while the peer still has its own
+    // seed. That diverged the RNG hash and triggered a false desync at
+    // frame 149. The ack closes this race: the host re-sends RNG until the
+    // peer's ack arrives, and only then flips `rng_synced`.
+    rng_acked: bool = false,
+    rng_send_cooldown: u32 = 0, // frames until next resend attempt
+    rng_send_count: u32 = 0, // diagnostic: how many times we sent
+
     intro_rng_enabled: bool = false,
+
+    // Round-start detection: the detectRoundStart ASM hack (asm_hacks.zig)
+    // increments a counter in DLL memory each time a round begins. We watch
+    // it for changes to drive the Skippable → InGame transition (round 2+),
+    // matching the legacy Variable::RoundStart change-monitor in
+    // DllMain.cpp:1266-1270. last_round_start is the last-seen value.
+    last_round_start: u32 = 0,
 
     // Input resend
     resend_timer_active: bool = false,
@@ -677,6 +703,12 @@ pub const NetplayManager = struct {
             0x04 => { // SyncHash (desync detection)
                 self.applyRemoteSyncHash(msg[1..]);
             },
+            0x05 => { // RNG_ACK (peer confirms it applied the host's RNG state)
+                if (msg.len >= 5) {
+                    const idx = std.mem.readInt(u32, msg[1..5], .little);
+                    self.confirmRngAck(idx);
+                }
+            },
             0x20 => { // BothInputs (spectator broadcast from host)
                 if (self.config.is_spectator) {
                     self.applyBothInputsPacket(msg[1..]);
@@ -938,8 +970,22 @@ pub const NetplayManager = struct {
     // --- RNG sync ---
 
     pub fn syncRngState(self: *NetplayManager) void {
-        if (!self.should_sync_rng or self.rng_synced) return;
+        if (!self.should_sync_rng or self.rng_acked) return;
         if (!self.config.is_host) return;
+        // Lazy-reconnect: only send once the ENet peer has actually connected.
+        // The peer's CONNECT event may not have arrived yet on the first
+        // frames of chara-select; sending before that silently drops the
+        // packet (sendReliable bails when !enet_connected), so we must not
+        // burn a send attempt or mark anything done in that window.
+        if (self.enet_peer == null or !self.enet_connected) return;
+
+        // Throttle resends so we don't flood the peer every frame while the
+        // ack is in flight. Send immediately on the first attempt, then wait
+        // rng_resend_period frames between retries.
+        if (self.rng_send_count > 0 and self.rng_send_cooldown > 0) {
+            self.rng_send_cooldown -= 1;
+            return;
+        }
 
         // Host sends RNG state to client. Format:
         //   [1 byte type=0x02][4 bytes index][4+4+4+220 bytes RNG state]
@@ -952,8 +998,14 @@ pub const NetplayManager = struct {
         std.mem.writeInt(u32, rng_buf[13..17], rng_state2_addr.*, .little);
         @memcpy(rng_buf[17..][0..rng_state3_size], rng_state3_addr[0..rng_state3_size]);
         self.sendReliable(rng_buf[0..payload_len]);
-        self.rng_synced = true;
-        self.log.info("RNG state synced (index={d})", .{self.indexed_frame.index});
+
+        self.rng_send_count += 1;
+        self.rng_send_cooldown = rng_resend_period;
+        // NOTE: rng_synced / rng_acked are NOT set here. The host only treats
+        // the sync as complete once the peer's RNG_ACK arrives. This closes
+        // the race where the first send was dropped before the peer finished
+        // connecting.
+        self.log.info("RNG state sent (index={d}, attempt={d})", .{ self.indexed_frame.index, self.rng_send_count });
     }
 
     pub fn applyRemoteRng(self: *NetplayManager, data: []const u8) void {
@@ -977,6 +1029,39 @@ pub const NetplayManager = struct {
         @memcpy(rng_state3_addr[0..rng_state3_size], body[16 .. 16 + rng_state3_size]);
         self.rng_synced = true;
         self.log.info("Applied remote RNG state (index={d})", .{rng_index});
+
+        // Acknowledge receipt so the host can stop re-sending and flip its
+        // rng_synced flag. The host may re-send several times before this
+        // arrives (see syncRngState); replying to every received packet is
+        // fine — the host ignores acks after the first.
+        self.sendRngAck(rng_index);
+    }
+
+    /// Peer → host: confirm the RNG state for `rng_index` was applied.
+    /// Format: [1 byte type=0x05][4 bytes index]
+    fn sendRngAck(self: *NetplayManager, rng_index: u32) void {
+        if (self.enet_peer == null or !self.enet_connected) return;
+        var buf: [5]u8 = undefined;
+        buf[0] = 0x05; // RNG_ACK
+        std.mem.writeInt(u32, buf[1..5], rng_index, .little);
+        self.sendReliable(&buf);
+        self.log.info("Sent RNG_ACK (index={d})", .{rng_index});
+    }
+
+    /// Host: peer confirmed receipt of the RNG state. Flip rng_synced/rng_acked
+    /// so the host stops re-sending and treats the RNG as authoritative.
+    pub fn confirmRngAck(self: *NetplayManager, rng_index: u32) void {
+        if (!self.config.is_host) return;
+        // Ignore stale acks for an index we've moved past.
+        if (rng_index != self.indexed_frame.index and rng_index != self.indexed_frame.index + 1) {
+            return;
+        }
+        if (self.rng_acked) return; // already confirmed for this round
+        self.rng_acked = true;
+        self.rng_synced = true;
+        self.log.info("RNG sync confirmed by peer ack (index={d}, after {d} send(s))", .{
+            rng_index, self.rng_send_count,
+        });
     }
 
     // --- State transitions ---
@@ -1057,6 +1142,9 @@ pub const NetplayManager = struct {
             self.intro_rng_enabled = true;
             self.should_sync_rng = true;
             self.rng_synced = false;
+            self.rng_acked = false;
+            self.rng_send_cooldown = 0;
+            self.rng_send_count = 0;
             self.log.info("Intro done (game_state=99) — RNG sync enabled", .{});
         }
 
@@ -1158,6 +1246,9 @@ pub const NetplayManager = struct {
 
         if (new == .in_game or new == .chara_select) {
             self.rng_synced = false;
+            self.rng_acked = false;
+            self.rng_send_cooldown = 0;
+            self.rng_send_count = 0;
             self.should_sync_rng = true;
         }
 

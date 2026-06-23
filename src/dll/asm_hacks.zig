@@ -8,6 +8,19 @@ const hook_call1_addr: u32 = 0x40D032;
 const hook_call2_addr: u32 = 0x40D411;
 const multiple_melty_addr: *u8 = @ptrFromInt(0x40D25A);
 
+// Counter incremented by the detectRoundStart ASM hack every time a round
+// begins (when players can move). Lives in the DLL's memory, not the game's.
+// Ported from legacy DllAsmHacks.cpp:48 (roundStartCounter). The game code,
+// patched at 0x440CC5 → 0x440D16 → code cave 0x441002, does:
+//   mov ecx, &round_start_counter   ; load the ADDRESS (B9 = mov ecx, imm32)
+//   mov esi, [ecx]                  ; read current value
+//   inc esi                         ; increment
+//   mov [ecx], esi                  ; store back
+// NetplayManager watches this counter for changes to drive the
+// Skippable → InGame transition (round 2+ start), matching the legacy
+// Variable::RoundStart change-monitor in DllMain.cpp:1266-1270.
+pub var round_start_counter: u32 = 0;
+
 pub fn applyPreLoadHacks() void {
     if (state.log == null) return;
     state.log.?.info("Applying pre-load ASM hacks...", .{});
@@ -15,6 +28,7 @@ pub fn applyPreLoadHacks() void {
     var multi_melty: [1]u8 = .{0xEB};
     writeBytes(@intFromPtr(multiple_melty_addr), &multi_melty);
     applyHijackControls();
+    applyDetectRoundStart();
 
     applySfxAsmHacks();
     state.log.?.info("Pre-load hacks applied", .{});
@@ -64,6 +78,51 @@ pub fn applyHijackControls() void {
     }
     var zeros: [20]u8 = [_]u8{0} ** 20;
     writeBytes(0x54D2C0, &zeros);
+}
+
+// detectRoundStart — three patches that increment round_start_counter each
+// time a round begins (when players can move). Ported from legacy
+// DllAsmHacks.hpp:322-340. The patches redirect the game's round-start
+// code path through a small code cave at 0x441002 that bumps the counter,
+// letting NetplayManager detect round transitions via a change-monitor
+// (legacy DllMain.cpp:1266-1270, Variable::RoundStart).
+//
+// Patch order matters: the entry redirect at 0x440CC5 is written LAST so the
+// patched code at 0x440D16 and its code cave at 0x441002 are in place before
+// execution can reach them (legacy comment: "Write this last due to
+// dependencies").
+pub fn applyDetectRoundStart() void {
+    const counter_addr: u32 = @intCast(@intFromPtr(&round_start_counter));
+
+    // Patch 1 @ 0x440D16 (9 bytes): load the counter's address into ecx and
+    // jump to the code cave. B9 = mov ecx, imm32 (loads the ADDRESS, not the
+    // value — the legacy comment "mov ecx,[&counter]" is misleading).
+    var p1: [9]u8 = undefined;
+    p1[0] = 0xB9; // mov ecx, imm32
+    std.mem.writeInt(u32, p1[1..5], counter_addr, .little);
+    p1[5] = 0xE9; // jmp rel32 -> 0x441002
+    std.mem.writeInt(u32, p1[6..10], rel32(0x441002, 0x440D16 + 5, 5), .little);
+    writeBytes(0x440D16, &p1);
+
+    // Patch 2 @ 0x441002 (9 bytes): code cave. Read/increment/store the
+    // counter, then pop the registers the call site expected to be preserved
+    // and return (the original site at 0x440CC5 is a call into this region).
+    const p2: [9]u8 = .{
+        0x8B, 0x31, // mov esi, [ecx]
+        0x46, // inc esi
+        0x89, 0x31, // mov [ecx], esi
+        0x5E, // pop esi
+        0x59, // pop ecx
+        0xC3, // ret
+    };
+    writeBytes(0x441002, &p2);
+
+    // Patch 3 @ 0x440CC5 (2 bytes): entry redirect. A short jmp to patch 1.
+    // EB 4F = jmp rel8 to 0x440CC5 + 2 + 0x4F = 0x440D16.
+    const p3: [2]u8 = .{ 0xEB, 0x4F };
+    writeBytes(0x440CC5, &p3);
+
+    state.log.?.info("detectRoundStart applied (round_start_counter @0x{x:0>8})", .{counter_addr});
 }
 
 // SFX dedup hooks. filterRepeatedSfx suppresses repeated/muted playbacks;

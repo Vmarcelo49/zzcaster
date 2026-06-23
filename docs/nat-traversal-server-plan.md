@@ -13,6 +13,17 @@ O servidor será **containerizado com Docker** (multi-stage build, imagem final 
 
 O client zzcaster terá a **configuração do endereço do servidor editável** no `config.ini`. Se vazio, usa um default hardcoded do projeto. Se preenchido, usa o valor do config.
 
+### Decisão: Mesmo repositório (`server/` dentro do zzcaster)
+
+O servidor vive como uma pasta `server/` dentro deste mesmo repositório. **Racional:**
+
+- Versionamento alinhado — quando o protocolo muda, o commit toca server + client juntos
+- Desenvolvimento tandem — `git clone` uma vez, ambos os lados disponíveis
+- Stacks diferentes (Go/Docker vs Zig/Win32) convivem bem em pastas separadas
+- No futuro, se a responsabilidade crescer, pode ser extraído para repo próprio sem dor
+
+**Trade-offs aceitos:** quem quiser só o server baixa o repo inteiro (incluindo libs vendored do client). O CI precisa de Go + Docker além do Zig build toolchain. Deploy cycles são diferentes (server pode ter hotfix independente), mas isso é gerenciável com CI separado pra pasta `server/`.
+
 ---
 
 ## Arquitetura

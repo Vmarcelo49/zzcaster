@@ -130,6 +130,11 @@ var ipc_pipe: ?*anyopaque = null;
 var ipc_connected: std.atomic.Value(bool) = .init(false);
 var last_world_timer: u32 = 0;
 var prev_game_mode: u32 = 0;
+// Counts frameStep calls while config has not yet been received. Used by the
+// heartbeat logger to surface "DLL is alive but launcher hasn't sent config
+// yet" — the single most common silent-failure mode on real Windows where
+// the IPC pipe send can stall or be lost without any log output.
+var frame_heartbeat_counter: u32 = 0;
 
 // DLL module handle, captured in PROCESS_ATTACH; used to locate mapping.ini
 // next to hook.dll regardless of the process CWD.
@@ -153,6 +158,17 @@ var is_spectator: bool = false;
 // `dll_initialized` is written by lazyInit (worker thread) and read by
 // frameStep (game's main thread). Make it atomic for the same reason.
 var dll_initialized: std.atomic.Value(bool) = .init(false);
+
+// `post_load_applied` guards applyPostLoadHacks() against concurrent
+// execution from BOTH lazyInit (worker thread) and frameStep (main thread).
+// Without this guard, the Windows scheduler (unlike Wine) can interleave the
+// two threads such that both observe config_received == true after their
+// waitForConfig() call and both invoke applyPostLoadHacks() at the same
+// instant. For netplay that double-invokes NetplayManager.initEnet() and
+// re-runs keyboard.init() while SDL_Init() is racing on the main thread —
+// corrupting state and crashing the host process when the game enters
+// in-game mode. Compare-and-swap here guarantees single execution.
+var post_load_applied: std.atomic.Value(bool) = .init(false);
 
 // === IPC framing state machine ===
 //
@@ -371,6 +387,20 @@ fn resolveMappingIniPath(buf: []u8) ?[]const u8 {
 
 fn applyPostLoadHacks() void {
     if (state.log == null) return;
+
+    // CAS guard: only one caller (worker thread OR main thread) executes the
+    // body. The other observes `post_load_applied == true` and returns. This
+    // closes the race that manifests on real Windows but not under Wine:
+    //   - lazyInit (worker) sees config_received → calls applyPostLoadHacks
+    //   - frameStep (main)   sees config_received → calls applyPostLoadHacks
+    // Without the guard both invocations race into the body, double-init
+    // SDL/keyboard/ENet, and corrupt NetplayManager state — crashing the host
+    // when the game transitions into in-game mode (training/versus/match).
+    if (post_load_applied.swap(true, .acq_rel)) {
+        // Already applied (or being applied by the other thread) — bail.
+        return;
+    }
+
     state.log.?.info("Applying post-load hacks...", .{});
 
     if (is_training) {
@@ -551,11 +581,32 @@ fn lazyInit() void {
     // yet (frameStep will retry). If it's already here, apply post-load hacks now.
     waitForConfig();
     if (config_received.load(.acquire)) applyPostLoadHacks();
+    state.log.?.info("lazyInit complete (config_received={} post_load_applied={})", .{
+        config_received.load(.acquire),
+        post_load_applied.load(.acquire),
+    });
 }
 
 fn frameStep() callconv(.c) void {
     if (!dll_initialized.load(.acquire)) return;
     if (state.log == null) return;
+
+    // Heartbeat: log once every ~5 seconds (300 frames @ 60Hz) while we are
+    // still waiting for config. This makes a stall obvious in the DLL log
+    // instead of looking like the DLL died. The previous code logged nothing
+    // between "Pre-load hacks applied" and the first InputDiag line, so on
+    // Windows (where the launcher's srv.send() can lose the config silently
+    // — see ipc.zig) users saw a log that just stopped, with no clue whether
+    // frameStep was even running.
+    if (!config_received.load(.acquire)) {
+        frame_heartbeat_counter +%= 1;
+        if (frame_heartbeat_counter % 300 == 0) {
+            state.log.?.warn("frameStep alive: still waiting for config ({} frames elapsed, ipc_connected={})", .{
+                frame_heartbeat_counter,
+                ipc_connected.load(.acquire),
+            });
+        }
+    }
 
     if (!config_received.load(.acquire) and ipc_connected.load(.acquire)) {
         waitForConfig();

@@ -22,6 +22,8 @@ ZZCaster consists of two binaries:
    which handles input reading, network communication (ENet), rollback state
    management, and SFX deduplication.
 
+This is how CCCaster works too.
+
 ## Build
 
 ### Prerequisites
@@ -88,30 +90,6 @@ An optional input macro, enabled per-player in the **Controllers** tab
 #### Wi-fi Indicator
 
 When you play online, you can see if your opponent is using wifi or wired.
-
-
-
-### Netcode
-
-The netcode uses a lockstep + rollback algorithm (same approach as the
-original CCCaster, conceptually similar to GGPO but adapted for a
-closed-source binary-patched game):
-
-1. **Lockstep** — Each frame, both clients exchange inputs. The game frame
-   cannot advance until the remote player's input for the current frame
-   is received (with configurable input delay to hide latency).
-
-2. **Prediction** — If the remote input hasn't arrived yet, the last known
-   input is used as a prediction. The game advances with the predicted input.
-
-3. **Rollback** — When the real remote input arrives and differs from the
-   prediction, the game state is rewound to the mispredicted frame, the
-   corrected inputs are applied, and the game re-runs forward to the current
-   frame (skipping rendering during the re-run).
-
-4. **State save/restore** — The StatePool snapshots ~370 memory regions
-   (player positions, health, velocities, effects, camera, RNG, timers)
-   every frame. On rollback, the closest saved state is restored via memcpy.
 
 
 ## Dependencies

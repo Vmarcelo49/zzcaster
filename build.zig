@@ -215,8 +215,10 @@ pub fn build(b: *std.Build) void {
         },
         .flags = &.{
             "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS",
-            "-I", "libs/imgui",
-            "-I", "libs/cimgui",
+            "-I",
+            "libs/imgui",
+            "-I",
+            "libs/cimgui",
         },
     });
     launcher_mod.linkSystemLibrary("opengl32", .{});
@@ -227,6 +229,19 @@ pub fn build(b: *std.Build) void {
         .root_module = launcher_mod,
     });
     b.installArtifact(exe);
+
+    // === Embed Windows icon (assets/icon.rc → .res via Zig's built-in
+    // Win32 resource compiler, then linked into zzcaster.exe) ===
+    if (target.result.os.tag == .windows) {
+        launcher_mod.addWin32ResourceFile(.{
+            .file = b.path("assets/icon.rc"),
+            // windres wants the .ico to be findable; pass the assets
+            // directory as an include path so the relative
+            // `ICON "icon.ico"` reference inside icon.rc resolves
+            // even when windres is invoked from the build cache.
+            .include_paths = &.{b.path("assets")},
+        });
+    }
 
     // === hook.dll ===
     const hook = b.addLibrary(.{
@@ -252,16 +267,6 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run zzcaster");
     run_step.dependOn(&run_cmd.step);
 
-    // === Test step ===
-    // Runs `test` blocks on the HOST (not cross-compiled) — the common module
-    // (config, logging, ipc) is pure logic with no Win32/SDL deps, so it tests
-    // cleanly on Linux. The dll/launcher modules pull in Windows-only linkage
-    // (ws2_32, SDL2, game-memory addresses) and aren't host-testable; they're
-    // verified via the cross-compile build above instead.
-    //
-    // We build a fresh test module (not common_mod itself, which is already
-    // wired for cross-compilation) so `zig build test` works on the native
-    // host without a -Dtarget flag.
     const common_test_mod = b.createModule(.{
         .root_source_file = b.path("src/common/mod.zig"),
         .target = target,

@@ -509,37 +509,12 @@ pub const NetplayManager = struct {
         }
     }
 
-    pub fn waitForEnetConnect(self: *NetplayManager, timeout_ms: u32) !void {
-        if (self.enet_host == null) return error.NoHost;
-        var event: enet.ENetEvent = undefined;
-        const deadline = timeout_ms / 100;
-        var i: u32 = 0;
-        while (i < deadline) : (i += 1) {
-            if (enet.enet_host_service(self.enet_host, &event, 100) > 0) {
-                if (event.type == enet.ENET_EVENT_TYPE_CONNECT) {
-                    // Host: the FIRST connect event is the main peer (player 2).
-                    // Subsequent connect events are spectators — handled by
-                    // drainSpectatorEvents() below.
-                    if (self.config.is_host and !self.enet_connected) {
-                        self.enet_peer = event.peer;
-                        self.enet_connected = true;
-                        self.log.info("Main peer connected", .{});
-                        return;
-                    } else if (!self.config.is_host) {
-                        self.enet_peer = event.peer;
-                        self.enet_connected = true;
-                        self.log.info("ENet peer connected!", .{});
-                        return;
-                    } else {
-                        // Host: additional peer — treat as spectator.
-                        if (self.spectators) |*sm| sm.onNewPeer(event.peer, std.Io.Clock.now(.real, self.io).toMilliseconds());
-                    }
-                }
-            }
-        }
-        self.log.err("ENet connect timeout", .{});
-        return error.Timeout;
-    }
+    // The previous `pub fn waitForEnetConnect(self, timeout_ms) !void` was
+    // REMOVED — it was dead code per docs/netcode-test-plan.md (status:
+    // Proposed) and had no callers in the codebase. The frame loop in
+    // frame_step.zig handles ENet connect events via `drainSpectatorEvents()`
+    // and the regular `enet_host_service` poll path. Keeping this stub
+    // created two mental models of the same connect flow.
 
     /// After the main peer is connected, the host should call this each
     /// frame to accept/deny any incoming spectator connections.

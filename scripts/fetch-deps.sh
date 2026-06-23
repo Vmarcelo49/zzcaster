@@ -39,9 +39,13 @@ IMGUI_VERSION="1.92.8"
 IMGUI_TARBALL_URL="https://github.com/ocornut/imgui/archive/refs/tags/v${IMGUI_VERSION}.tar.gz"
 IMGUI_TARBALL_SHA256="fecb33d33930e12ff53a34064e9d3a06c8f7c3e04408f14cd36c80e3faac863b"
 
-CIMGUI_VERSION="master"
+# cimgui is pinned to a specific commit (not `master`) and SHA-256-verified,
+# so the build is reproducible. Bump this pin deliberately when upgrading.
+CIMGUI_VERSION="d298666861ebf00dcfeb2407409931c04e47e33c"
 CIMGUI_H_URL="https://raw.githubusercontent.com/cimgui/cimgui/${CIMGUI_VERSION}/cimgui.h"
 CIMGUI_CPP_URL="https://raw.githubusercontent.com/cimgui/cimgui/${CIMGUI_VERSION}/cimgui.cpp"
+CIMGUI_H_SHA256="cd533d7003f68ff0160aaf2bf9d464589d5cb98b5d6c0709bf1a8a6ecf037dde"
+CIMGUI_CPP_SHA256="91dc9c92d8035611c9ef13686ba970eaa3b906bdbdd41410faf7202f383e4d9b"
 
 SDL2_VERSION="2.32.10"
 SDL2_TARBALL_URL="https://github.com/libsdl-org/SDL/releases/download/release-${SDL2_VERSION}/SDL2-devel-${SDL2_VERSION}-mingw.zip"
@@ -233,16 +237,9 @@ fi
 log "Fetching cimgui (${CIMGUI_VERSION})"
 if [[ $CHECK_ONLY -eq 0 ]]; then
     mkdir -p "$LIBS_DIR/cimgui"
-    if have curl; then
-        curl -sSL --fail -o "$LIBS_DIR/cimgui/cimgui.h" "$CIMGUI_H_URL" || die "curl failed for cimgui.h"
-        curl -sSL --fail -o "$LIBS_DIR/cimgui/cimgui.cpp" "$CIMGUI_CPP_URL" || die "curl failed for cimgui.cpp"
-    elif have wget; then
-        wget -q -O "$LIBS_DIR/cimgui/cimgui.h" "$CIMGUI_H_URL" || die "wget failed for cimgui.h"
-        wget -q -O "$LIBS_DIR/cimgui/cimgui.cpp" "$CIMGUI_CPP_URL" || die "wget failed for cimgui.cpp"
-    else
-        die "Neither curl nor wget found"
-    fi
-    [[ -f "$LIBS_DIR/cimgui/cimgui.h" ]] || die "Missing cimgui.h"
+    download "$CIMGUI_H_URL"   "$LIBS_DIR/cimgui/cimgui.h"   "$CIMGUI_H_SHA256"
+    download "$CIMGUI_CPP_URL" "$LIBS_DIR/cimgui/cimgui.cpp" "$CIMGUI_CPP_SHA256"
+    [[ -f "$LIBS_DIR/cimgui/cimgui.h" ]]   || die "Missing cimgui.h"
     [[ -f "$LIBS_DIR/cimgui/cimgui.cpp" ]] || die "Missing cimgui.cpp"
 
     # cimgui.cpp uses #include "./imgui/imgui.h" (relative to its own
@@ -254,9 +251,9 @@ if [[ $CHECK_ONLY -eq 0 ]]; then
     fi
     [[ -e "$LIBS_DIR/cimgui/imgui/imgui.h" ]] || die "cimgui→imgui symlink broken"
 
-    ok "cimgui downloaded"
+    ok "cimgui downloaded (commit ${CIMGUI_VERSION:0:7})"
 else
-    [[ -f "$LIBS_DIR/cimgui/cimgui.h" ]] && ok "cimgui present" || warn "cimgui not present (run without --check to fetch)"
+    [[ -f "$LIBS_DIR/cimgui/cimgui.h" ]] && ok "cimgui present (commit ${CIMGUI_VERSION:0:7})" || warn "cimgui not present (run without --check to fetch)"
 fi
 
 # ---- 4. SDL2 MinGW (for Windows cross-compile) ----

@@ -284,9 +284,11 @@ pub const SpectatorManager = struct {
 
     /// Send the initial game state (mode, training flag, start pos) to a
     /// specific newly-activated spectator.
+    ///
+    /// Packet layout: 1 type + 1 state + 1 training + 4 start_index + 4 start_frame = 11 bytes.
     pub fn sendInitialState(self: *SpectatorManager, peer: ?*enet.ENetPeer, state_byte: u8, is_training: bool, start_index: u32, start_frame: u32) void {
         if (peer == null) return;
-        var buf: [10]u8 = undefined;
+        var buf: [11]u8 = undefined;
         buf[0] = 0x10; // INITIAL_GAME_STATE
         buf[1] = state_byte;
         buf[2] = if (is_training) 1 else 0;

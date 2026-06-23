@@ -49,19 +49,15 @@ Download from https://ziglang.org/download/ (0.16.0 or later) and put
 ### Install SDL2 dev package
 
 `hook.dll` is a 32-bit DLL injected into MBAA.exe (32-bit).
-`cccaster.exe` is a 64-bit launcher. **You need both 32-bit and 64-bit
-SDL2 dev packages** to build the whole tree.
-
-If you only want to build `cccaster.exe` (no `hook.dll`), 64-bit SDL2
-is enough.
+`zzcaster.exe` is also a 32-bit launcher (see `build.zig` and `README.md`).
+You need only the 32-bit (i686) SDL2 dev package — the vendored MinGW
+copy from `scripts/fetch-deps.sh` covers this automatically.
 
 **MSYS2 (recommended on Windows):**
 ```bash
 pacman -S \
     mingw32/mingw-w64-i686-SDL2 \
-    mingw64/mingw-w64-x86_64-SDL2 \
-    mingw32/mingw-w64-i686-pkg-config \
-    mingw64/mingw-w64-x86_64-pkg-config
+    mingw32/mingw-w64-i686-pkg-config
 ```
 
 **Linux (cross-compiling to Windows):**
@@ -112,48 +108,34 @@ curl -sL https://github.com/lsalzman/enet/archive/refs/tags/v1.3.19.tar.gz | sha
 After `fetch-deps.sh` has run successfully:
 
 ```
-zig-cccaster/
+zzcaster/
 ├── build.zig
 ├── scripts/
 │   ├── fetch-deps.sh
 │   └── README.md          ← this file
 ├── libs/                   ← created by fetch-deps.sh
 │   ├── enet/               ← from lsalzman/enet
-│   └── imgui/              ← from ocornut/imgui
+│   ├── imgui/              ← from ocornut/imgui
+│   ├── cimgui/             ← from cimgui/cimgui (pinned commit)
+│   └── sdl2-mingw/         ← from libsdl-org/SDL
 └── src/
-    ├── main.zig            ← cccaster.exe entry point
-    ├── ui.zig              ← TUI menu
-    ├── config.zig
-    ├── logging.zig
-    ├── ipc.zig             ← named-pipe IPC to hook.dll
-    ├── launcher.zig        ← DLL injector
-    ├── net.zig             ← ENet transport wrapper
-    ├── session.zig         ← netplay session FSM
-    ├── gamepad.zig         ← SDL2 gamepad
-    ├── keyboard.zig        ← Win32 GetKeyState
-    ├── rollback.zig        ← InputBuffer + StatePool
-    └── dll/
-        ├── dllmain.zig     ← hook.dll entry point
-        ├── netplay_manager.zig
-        ├── sfx_dedup.zig   ← SFX dedup module
-        ├── spectator_manager.zig
-        └── hook_exports.c
+    ├── common/             ← config, logging, ipc (shared by launcher + dll)
+    ├── net/                ← enet_transport, ip_discovery
+    ├── launcher/           ← zzcaster.exe (main, ui, game_launcher, ...)
+    ├── dll/                ← hook.dll (dllmain, netplay_manager, rollback, ...)
+    ├── cimgui_shim.h       ← minimal C declarations for ImGui functions
+    └── imgui_backend_wrap.cpp ← C-linkage wrappers for ImGui SDL2/OpenGL3 backends
 ```
 
-To build everything (cccaster.exe + hook.dll) for the 32-bit Windows
+To build everything (zzcaster.exe + hook.dll) for the 32-bit Windows
 target:
 
 ```bash
 zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseFast
 ```
 
-To build only `cccaster.exe` for 64-bit Windows:
+The build script will reject any non-x86 Windows target — see `build.zig`
+and `README.md` for the rationale (MBAA.exe is 32-bit, so `hook.dll` must
+also be 32-bit, and the launcher matches for shared-ABI IPC).
 
-```bash
-zig build -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseFast
-```
-
-(You may need to comment out the `hook` target in `build.zig` if you
-only have 64-bit SDL2 installed.)
-
-Output goes to `zig-out/bin/` (`cccaster.exe`, `hook.dll`).
+Output goes to `zig-out/bin/` (`zzcaster.exe`, `hook.dll`).

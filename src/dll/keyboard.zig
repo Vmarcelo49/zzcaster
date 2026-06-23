@@ -23,7 +23,9 @@ pub const button_cancel: u16 = 0x0800;
 // VK codes (will be loaded from MBAA.exe config)
 var vk_codes: [10]u32 = [_]u32{0} ** 10;
 var initialized: bool = false;
-pub fn isInitialized() bool { return initialized; }
+pub fn isInitialized() bool {
+    return initialized;
+}
 
 const MAPVK_VSC_TO_VK_EX: u32 = 3;
 
@@ -82,8 +84,14 @@ pub fn readInput() u16 {
     // Analog stick — N/A for keyboard, skip
 
     // SOCD: simultaneous up+down or left+right → neutral
-    if (up and down) { up = false; down = false; }
-    if (left and right) { left = false; right = false; }
+    if (up and down) {
+        up = false;
+        down = false;
+    }
+    if (left and right) {
+        left = false;
+        right = false;
+    }
 
     // Direction to numpad notation (0=neutral, 1-9). Start at 5=neutral so
     // +/-1 yields 4=L, 6=R (starting at 0 would wrap to 65535 on left).
@@ -111,4 +119,3 @@ pub fn readInput() u16 {
 fn isDown(vk: u32) bool {
     return (win32.GetKeyState(@intCast(vk)) & 0x80) != 0;
 }
-

@@ -103,6 +103,7 @@ ok "copied hook.dll (→ $GAME_DIR/zzcaster/)"
 # Also drop the vendored SDL2.dll alongside hook.dll so the DLL can
 # load it at runtime (hook.dll links SDL2.dll). The MinGW zip ships
 # both i686 and x86_64 DLLs; pick the one matching the build target.
+SDL_DLL_SRC=""
 if [[ -d "$PROJECT_DIR/libs/sdl2-mingw" ]]; then
     case "$TARGET" in
         x86_64*)        sdl_arch="x86_64-w64-mingw32" ;;
@@ -114,10 +115,40 @@ if [[ -d "$PROJECT_DIR/libs/sdl2-mingw" ]]; then
         ok "copied SDL2.dll ($sdl_arch, → $GAME_DIR/zzcaster/)"
     else
         warn "SDL2.dll not found in libs/sdl2-mingw/$sdl_arch/bin/ — skipping"
+        SDL_DLL_SRC=""
     fi
 else
     warn "libs/sdl2-mingw/ not present — SDL2.dll not copied (game may need it at runtime)"
 fi
+
+# ---- 2.5. Package release zip ----
+RELEASE_DIR="$PROJECT_DIR/release"
+mkdir -p "$RELEASE_DIR"
+ZIP_PATH="$RELEASE_DIR/zzcaster.zip"
+
+log "Packaging release zip: $ZIP_PATH"
+
+# Stage files into a temp dir that mirrors the in-game layout, then zip
+# from there so the archive's internal paths match exactly:
+#   zzcaster.exe
+#   zzcaster/hook.dll
+#   zzcaster/SDL2.dll   (if available)
+STAGE_DIR="$(mktemp -d)"
+trap 'rm -rf "$STAGE_DIR"' EXIT
+
+cp -f "$BIN_DIR/zzcaster.exe" "$STAGE_DIR/zzcaster.exe"
+mkdir -p "$STAGE_DIR/zzcaster"
+cp -f "$BIN_DIR/hook.dll" "$STAGE_DIR/zzcaster/hook.dll"
+if [[ -n "$SDL_DLL_SRC" ]]; then
+    cp -f "$SDL_DLL_SRC" "$STAGE_DIR/zzcaster/SDL2.dll"
+fi
+
+(
+    cd "$STAGE_DIR"
+    have zip || die "zip not found on PATH — install it to create the release archive"
+    zip -r "$ZIP_PATH" .
+)
+ok "created $ZIP_PATH"
 
 # ---- 3. Summary ----
 echo
@@ -125,6 +156,7 @@ log "Deploy summary"
 printf "  target:    %s\n" "$TARGET"
 printf "  optimize:  %s\n" "$OPTIMIZE"
 printf "  game dir:  %s\n" "$GAME_DIR"
+printf "  release:   %s\n" "$ZIP_PATH"
 printf "  files:\n"
 for f in zzcaster.exe hook.dll SDL2.dll; do
     # hook.dll + SDL2.dll live in zzcaster/ subdir; zzcaster.exe in the root.

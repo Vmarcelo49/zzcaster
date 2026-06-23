@@ -7,6 +7,8 @@ zig-pkg/
 *.dll
 *.exe
 
+release/
+
 # Vendored dependencies (fetched by scripts/fetch-deps.sh)
 libs/
 

@@ -5,31 +5,51 @@ const logging = @import("logging.zig");
 // Win32 externs for IPC (named pipe)
 const win32 = struct {
     extern "kernel32" fn CreateNamedPipeA(
-        lpName: [*:0]const u8, dwOpenMode: u32, dwPipeMode: u32,
-        nMaxInstances: u32, nOutBufferSize: u32, nInBufferSize: u32,
-        nDefaultTimeOut: u32, lpSecurityAttributes: ?*anyopaque,
+        lpName: [*:0]const u8,
+        dwOpenMode: u32,
+        dwPipeMode: u32,
+        nMaxInstances: u32,
+        nOutBufferSize: u32,
+        nInBufferSize: u32,
+        nDefaultTimeOut: u32,
+        lpSecurityAttributes: ?*anyopaque,
     ) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn ConnectNamedPipe(hNamedPipe: ?*anyopaque, lpOverlapped: ?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn ReadFile(
-        hFile: ?*anyopaque, lpBuffer: [*]u8, nNumberOfBytesToRead: u32,
-        lpNumberOfBytesRead: *u32, lpOverlapped: ?*anyopaque,
+        hFile: ?*anyopaque,
+        lpBuffer: [*]u8,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: *u32,
+        lpOverlapped: ?*anyopaque,
     ) callconv(.winapi) i32;
     extern "kernel32" fn WriteFile(
-        hFile: ?*anyopaque, lpBuffer: [*]const u8, nNumberOfBytesToWrite: u32,
-        lpNumberOfBytesWritten: *u32, lpOverlapped: ?*anyopaque,
+        hFile: ?*anyopaque,
+        lpBuffer: [*]const u8,
+        nNumberOfBytesToWrite: u32,
+        lpNumberOfBytesWritten: *u32,
+        lpOverlapped: ?*anyopaque,
     ) callconv(.winapi) i32;
     extern "kernel32" fn PeekNamedPipe(
-        hNamedPipe: ?*anyopaque, lpBuffer: ?*anyopaque, nBufferSize: u32,
-        lpBytesRead: ?*u32, lpTotalBytesAvail: *u32, lpBytesLeftThisMessage: ?*u32,
+        hNamedPipe: ?*anyopaque,
+        lpBuffer: ?*anyopaque,
+        nBufferSize: u32,
+        lpBytesRead: ?*u32,
+        lpTotalBytesAvail: *u32,
+        lpBytesLeftThisMessage: ?*u32,
     ) callconv(.winapi) i32;
     extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn DisconnectNamedPipe(hNamedPipe: ?*anyopaque) callconv(.winapi) i32;
     extern "kernel32" fn CreateEventA(
-        lpEventAttributes: ?*anyopaque, bManualReset: i32, bInitialState: i32,
+        lpEventAttributes: ?*anyopaque,
+        bManualReset: i32,
+        bInitialState: i32,
         lpName: ?[*:0]const u8,
     ) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn GetOverlappedResult(
-        hFile: ?*anyopaque, lpOverlapped: *Overlapped, lpNumberOfBytesTransferred: *u32, bWait: i32,
+        hFile: ?*anyopaque,
+        lpOverlapped: *Overlapped,
+        lpNumberOfBytesTransferred: *u32,
+        bWait: i32,
     ) callconv(.winapi) i32;
     extern "kernel32" fn GetLastError() callconv(.winapi) u32;
 
@@ -66,10 +86,10 @@ pub const IpcServer = struct {
             name_z.ptr,
             win32.PIPE_ACCESS_DUPLEX | win32.FILE_FLAG_OVERLAPPED,
             win32.PIPE_TYPE_BYTE | win32.PIPE_WAIT,
-            1,      // max instances
-            65536,  // out buffer
-            65536,  // in buffer
-            0,      // default timeout
+            1, // max instances
+            65536, // out buffer
+            65536, // in buffer
+            0, // default timeout
             null,
         );
         if (handle == win32.INVALID_HANDLE_VALUE or handle == null) return error.CreatePipeFailed;

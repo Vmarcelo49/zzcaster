@@ -142,6 +142,11 @@ cp -f "$BIN_DIR/hook.dll" "$STAGE_DIR/zzcaster/hook.dll"
 if [[ -n "$SDL_DLL_SRC" ]]; then
     cp -f "$SDL_DLL_SRC" "$STAGE_DIR/zzcaster/SDL2.dll"
 fi
+# Drop the icon next to zzcaster.exe so File Explorer's "Icon" column /
+# shortcuts pick it up if the embedded PE resource is stripped.
+if [[ -f "$PROJECT_DIR/assets/icon.ico" ]]; then
+    cp -f "$PROJECT_DIR/assets/icon.ico" "$STAGE_DIR/icon.ico"
+fi
 
 (
     cd "$STAGE_DIR"

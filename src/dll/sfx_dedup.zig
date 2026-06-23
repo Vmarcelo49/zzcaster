@@ -6,7 +6,7 @@ const logging = @import("common").logging;
 pub const sfx_array_addr: usize = 0x76E008;
 pub const sfx_array_len: usize = 1500;
 pub const num_rollback_states: usize = 60; // matches StatePool default
-pub const dx_muted_volume: u32 = 0xFFFE0000; // -2.0 in fixed-point volume
+pub const dx_muted_volume: u32 = 0xFFFE0000; // -10000 in DirectSound hundredths-of-dB (= -100 dB, silent). NOTE: legacy DX_MUTED_VOLUME is 0xFFFFD8F0; this Zig value differs and may be a port bug.
 
 // Game's SFX trigger array (read each frame; the game writes 1 to byte i to
 // trigger playback of sound i).
@@ -54,27 +54,32 @@ pub const SfxDedup = struct {
 
     // ----- per-frame hooks (called by NetplayManager) -----
 
-    /// Called by state_pool.saveState: snapshot the current sfx_filter_array
-    /// into the history ring at slot (frame % N).
+    /// Called alongside state_pool.saveState (frame_step.zig): snapshot the
+    /// current sfx_filter_array into the history ring at slot (frame % N).
     pub fn snapshotToHistory(self: *SfxDedup, frame: u32) void {
         const slot = frame % self.history_size;
         @memcpy(&self.history[slot], &sfx_filter_array);
     }
 
-    /// Called by state_pool.loadState: walk the history between the loaded
-    /// frame and the current (pre-rollback) frame, OR all snapshots together
-    /// into sfx_filter_array, then mark each non-zero entry as 0x80.
+    /// Called by NetplayManager before state_pool.loadStateForFrame: walk the
+    /// history between the loaded frame and the current (pre-rollback) frame,
+    /// OR all snapshots together into sfx_filter_array, then mark each non-zero
+    /// entry as 0x80.
     ///
-    /// This implements the legacy:
-    ///   for (i = target_frame; i <= current_frame; ++i)
+    /// Legacy (DllRollbackManager.cpp:210):
+    ///   for (i = target_frame + 1; i < current_frame; ++i)
     ///     for (j = 0; j < LEN; ++j)
     ///       sfxFilterArray[j] |= sfxHistory[i % N][j];
     ///   for (j = 0; j < LEN; ++j)
     ///     if (sfxFilterArray[j]) sfxFilterArray[j] = 0x80;
+    /// NOTE: the Zig implementation below iterates [loaded_frame, current_frame]
+    /// inclusive, which includes both endpoints — diverging from the legacy.
     pub fn applyRollbackFilter(self: *SfxDedup, loaded_frame: u32, current_frame: u32) void {
         // OR together all snapshots from loaded_frame..current_frame (inclusive).
-        // The legacy code iterates the loaded state's slot forward to the current
-        // state's slot. We walk forward (mod N) to include all frames in between.
+        // LEGACY NOTE: the legacy iterates (loaded_frame, current_frame) exclusive
+        // of both endpoints — it skips the loaded frame and the current frame
+        // (the latter because sfxFilterArray already holds current-frame state).
+        // The Zig code below includes both endpoints, which is a behavioral divergence.
         var frame: u32 = loaded_frame;
         while (true) {
             const slot = frame % self.history_size;

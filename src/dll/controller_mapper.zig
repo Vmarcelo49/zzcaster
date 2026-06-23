@@ -170,7 +170,7 @@ pub fn pollForBindInput(joy: ?*anyopaque, device_index: c_int) ?InputBinding {
             }
         }
     } else {
-        // Keyboard: poll all VK codes (skip mouse buttons 0x01-0x06)
+        // Keyboard: poll all VK codes (skip 0x01-0x07: mouse buttons, VK_CANCEL, and undefined 0x07)
         var vk: c_int = 0x08;
         while (vk <= 0xFE) : (vk += 1) {
             if (win32.GetAsyncKeyState(vk) & @as(i16, @bitCast(@as(u16, 0x8000))) != 0) {

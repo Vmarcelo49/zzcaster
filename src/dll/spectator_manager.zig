@@ -11,7 +11,7 @@ pub const num_inputs_per_packet: u32 = 30;
 pub const pending_timeout_ms: u64 = 20000;
 
 pub const SpectatorState = enum {
-    pending, // TCP-accepted but no first message yet
+    pending, // ENet-connected but no first message yet
     active, // receiving inputs
     redirecting, // sent REDIRECT, awaiting disconnect
 };
@@ -97,8 +97,11 @@ pub const SpectatorManager = struct {
             return;
         }
 
-        // If we're a root host (not a chain spectator), only allow 1 direct
-        // spectator — anyone else gets redirected.
+        // Unconditionally cap direct spectators at max_root_spectators (1).
+        // NOTE: diverges from CCCaster, which only applies this cap to root
+        // hosts (ClientMode::Host/Client) and lets chain spectators
+        // (Spectate) accept up to MAX_SPECTATORS (15). The clientMode check
+        // is missing — see CCCaster DllMain.cpp:59 SHOULD_REDIRECT_SPECTATORS.
         if (self.spectators.items.len >= max_root_spectators) {
             self.sendRedirectAndDisconnect(peer);
             return;
@@ -126,9 +129,10 @@ pub const SpectatorManager = struct {
     fn sendRedirectAndDisconnect(self: *SpectatorManager, peer: ?*enet.ENetPeer) void {
         if (peer == null) return;
 
-        // Pick a random active spectator's address.
+        // Pick a random spectator's address from the full list (any state).
+        // NOTE: CCCaster uses round-robin via _spectatorMapPos, not random.
         var redirect_buf: [80]u8 = undefined;
-        redirect_buf[0] = 0xFE; // REDIRECT message type
+        redirect_buf[0] = 0xFE; // ZZCaster-specific REDIRECT tag (0xFE); does NOT match CCCaster, which sends IpAddrPort (0x0B).
         redirect_buf[1] = 0x01;
 
         // If we have at least one spectator, advertise its address; else
@@ -170,7 +174,9 @@ pub const SpectatorManager = struct {
     }
 
     /// Promote a pending spectator to active after they've sent their first
-    /// message (HELLO).
+    /// message. NOTE: in CCCaster the first message is an IpAddrPort (0x0B)
+    /// advertising the spectator's external port, and the start_index is taken
+    /// from the host's getSpectateStartIndex() — not sent by the spectator.
     pub fn activateSpectator(self: *SpectatorManager, peer: ?*enet.ENetPeer, start_index: u32) void {
         for (self.spectators.items) |*s| {
             if (s.peer == peer) {
@@ -203,7 +209,7 @@ pub const SpectatorManager = struct {
 
     /// Per-frame: advance each spectator's pos and send a batch of inputs.
     ///
-    /// `both_inputs_buf` is a function that fills a buffer with NUM_INPUTS
+    /// `fill_inputs` is a function that fills a buffer with NUM_INPUTS
     /// frames of (P1 input, P2 input) starting at a given (index, frame).
     /// Returns the actual length written, or 0 if inputs aren't ready yet.
     pub fn frameStepSpectators(
@@ -224,7 +230,7 @@ pub const SpectatorManager = struct {
 
         // Legacy broadcast pacing: number of broadcasts per frame scales with
         // spectator count so that each spectator gets a batch roughly every
-        // NUM_INPUTS frames.
+        // NUM_INPUTS / 2 frames (≈15 for NUM_INPUTS=30).
         const n_spec: u32 = @intCast(self.spectators.items.len);
         const multiplier: u32 = 1 + (n_spec * 2) / (num_inputs_per_packet + 1);
         const interval: u32 = (multiplier * num_inputs_per_packet / 2) / n_spec;
@@ -246,6 +252,9 @@ pub const SpectatorManager = struct {
             }
 
             // Build the inputs packet. [1 type=0x20][4 frame][4 index][p1p2 × N]
+            // (CCCaster MsgType::BothInputs = 0x02; Zig uses 0x20 — diverges.
+            // CCCaster's wire format also prefixes a compressionLevel byte and
+            // appends an MD5 hash, omitted here.)
             var input_buf: [1 + 4 + 4 + num_inputs_per_packet * 4]u8 = undefined;
             const written = fill_inputs(s.pos_index, s.pos_frame, &input_buf);
             if (written > 0) {
@@ -289,7 +298,7 @@ pub const SpectatorManager = struct {
     pub fn sendInitialState(self: *SpectatorManager, peer: ?*enet.ENetPeer, state_byte: u8, is_training: bool, start_index: u32, start_frame: u32) void {
         if (peer == null) return;
         var buf: [11]u8 = undefined;
-        buf[0] = 0x10; // INITIAL_GAME_STATE
+        buf[0] = 0x10; // INITIAL_GAME_STATE (CCCaster MsgType::InitialGameState = 0x0A; Zig uses 0x10 — diverges. CCCaster's InitialGameState also carries stage/chara/moon/color fields.)
         buf[1] = state_byte;
         buf[2] = if (is_training) 1 else 0;
         std.mem.writeInt(u32, buf[3..7], start_index, .little);

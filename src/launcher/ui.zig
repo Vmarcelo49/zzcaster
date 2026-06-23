@@ -243,7 +243,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var p2_joystick: ?*anyopaque = null;
     var p1_device_sel: c_int = 0; // 0=keyboard, 1+=joystick index+1
     var p2_device_sel: c_int = 0;
-    var bind_cooldown: u32 = 0; // frames to skip before polling (avoids click re-bind)
+    var bind_cooldown_until_ms: i64 = 0; // wall-clock ms; 0 = no cooldown active
     // View mode toggle: false = classic grid layout, true = list layout.
     // List layout shows both players side-by-side, each as a vertical list
     // of (in-game button name | bind button) rows. Easier to scan when
@@ -327,7 +327,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                     &p2_joystick,
                     &p1_device_sel,
                     &p2_device_sel,
-                    &bind_cooldown,
+                    &bind_cooldown_until_ms,
                     &list_view,
                     mapping_path,
                     num_joy,

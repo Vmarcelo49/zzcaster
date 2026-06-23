@@ -94,20 +94,30 @@ pub fn applyHijackControls() void {
 pub fn applyDetectRoundStart() void {
     const counter_addr: u32 = @intCast(@intFromPtr(&round_start_counter));
 
-    // Patch 1 @ 0x440D16 (9 bytes): load the counter's address into ecx and
-    // jump to the code cave. B9 = mov ecx, imm32 (loads the ADDRESS, not the
-    // value — the legacy comment "mov ecx,[&counter]" is misleading).
-    var p1: [9]u8 = undefined;
+    // Patch 1 @ 0x440D16 (10 bytes): load the counter's address into ecx and
+    // jump to the code cave. Layout:
+    //   B9 <imm32>   ; mov ecx, &round_start_counter   (5 bytes)
+    //   E9 <rel32>   ; jmp 0x441002                     (5 bytes)
+    // B9 = mov ecx, imm32 (loads the ADDRESS, not the value — the legacy
+    // comment "mov ecx,[&counter]" is misleading).
+    var p1: [10]u8 = undefined;
     p1[0] = 0xB9; // mov ecx, imm32
     std.mem.writeInt(u32, p1[1..5], counter_addr, .little);
     p1[5] = 0xE9; // jmp rel32 -> 0x441002
     std.mem.writeInt(u32, p1[6..10], rel32(0x441002, 0x440D16 + 5, 5), .little);
     writeBytes(0x440D16, &p1);
 
-    // Patch 2 @ 0x441002 (9 bytes): code cave. Read/increment/store the
+    // Patch 2 @ 0x441002 (8 bytes): code cave. Read/increment/store the
     // counter, then pop the registers the call site expected to be preserved
     // and return (the original site at 0x440CC5 is a call into this region).
-    const p2: [9]u8 = .{
+    //   8B 31    ; mov esi, [ecx]   (2 bytes)
+    //   46       ; inc esi          (1 byte)
+    //   89 31    ; mov [ecx], esi   (2 bytes)
+    //   5E       ; pop esi          (1 byte)
+    //   59       ; pop ecx          (1 byte)
+    //   C3       ; ret              (1 byte)
+    // Total = 8 bytes.
+    const p2: [8]u8 = .{
         0x8B, 0x31, // mov esi, [ecx]
         0x46, // inc esi
         0x89, 0x31, // mov [ecx], esi

@@ -6,6 +6,7 @@ const spectator_manager_mod = @import("spectator_manager.zig");
 const net = @import("net").enet_transport;
 const rollback_regions = @import("rollback_regions.zig");
 const air_dash = @import("air_dash_macro.zig");
+const asm_hacks = @import("asm_hacks.zig");
 
 const Md5 = std.crypto.hash.Md5;
 
@@ -1121,17 +1122,26 @@ pub const NetplayManager = struct {
         }
 
         if (new_state) |ns| {
-            // Validate the transition — log invalid ones but proceed anyway
-            // (the game already wrote the new mode, we can't stop it).
-            _ = self.isValidNext(ns);
+            // Respect isValidNext: refuse to apply invalid transitions.
+            // The previous implementation logged invalid transitions but
+            // proceeded anyway, which could corrupt the FSM when the game
+            // wrote an out-of-sequence mode (e.g. due to a desync or an
+            // unhandled flow like Skippable → CharaSelect). Now we keep
+            // the previous state and let the next frame's checkXxx
+            // functions (checkIntroDone / checkRoundStart / checkRoundOver)
+            // recover from there.
+            //
+            // isValidNext already logs the invalid transition as an error,
+            // so we just bail here without an extra log line.
+            if (!self.isValidNext(ns)) return;
             self.state = ns;
             self.onStateTransition(old_state, ns);
             if (new_mode == mode_in_game) self.onEnterInGame();
-        }
-        self.log.info("NetplayState -> {s} (game_mode={d})", .{ @tagName(self.state), new_mode });
+            self.log.info("NetplayState -> {s} (game_mode={d})", .{ @tagName(self.state), new_mode });
 
-        // Reset SFX dedup on each state transition (legacy clears per round).
-        if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+            // Reset SFX dedup on each state transition (legacy clears per round).
+            if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+        }
     }
 
     pub fn checkIntroDone(self: *NetplayManager) void {
@@ -1199,6 +1209,44 @@ pub const NetplayManager = struct {
     /// from frameStep before checkRoundOver so the timer can reach 0.
     pub fn tickRoundOverTimer(self: *NetplayManager) void {
         if (self.round_over_timer > 0) self.round_over_timer -= 1;
+    }
+
+    /// Watch the `round_start_counter` (incremented by the detectRoundStart
+    /// ASM hack in asm_hacks.zig) for changes. When the counter increments,
+    /// a new round has just started (players can move).
+    ///
+    /// If we're currently in `.skippable` (post-round-over), this is the
+    /// signal to transition back to `.in_game` for the next round. Other
+    /// states ignore the increment — e.g. during `.chara_intro` the first
+    /// increment is the FIRST round starting, which is handled separately
+    /// by checkIntroDone().
+    ///
+    /// Mirrors the legacy Variable::RoundStart change-monitor in
+    /// DllMain.cpp:1266-1270, which fired the Skippable→InGame transition
+    /// whenever the round-start counter changed.
+    pub fn checkRoundStart(self: *NetplayManager) void {
+        const current = asm_hacks.round_start_counter;
+        if (current == self.last_round_start) return;
+
+        // Counter changed — record the new value so we don't re-fire on
+        // the same increment next frame.
+        const prev = self.last_round_start;
+        self.last_round_start = current;
+
+        // Only the Skippable → InGame transition is driven by this signal.
+        // In other states, the increment is informational only.
+        if (self.state == .skippable) {
+            self.log.info("Round start detected (counter {d} -> {d}) — Skippable -> InGame", .{
+                prev, current,
+            });
+            self.transitionTo(.in_game);
+        } else {
+            // Log the increment for diagnostics — useful to confirm the
+            // ASM hack is firing even in states where we don't act on it.
+            self.log.info("Round start counter {d} -> {d} (state={s}, no transition)", .{
+                prev, current, @tagName(self.state),
+            });
+        }
     }
 
     fn transitionTo(self: *NetplayManager, new: NetplayState) void {

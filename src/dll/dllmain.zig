@@ -596,6 +596,12 @@ fn frameStep() callconv(.c) void {
     if (state.nm) |*n| {
         n.checkIntroDone();
 
+        // Watch the round-start counter (incremented by the detectRoundStart
+        // ASM hack) for the Skippable → InGame transition. Runs BEFORE
+        // checkRoundOver so a new round start takes precedence over a
+        // stale round-over signal.
+        n.checkRoundStart();
+
         n.tickRoundOverTimer();
         n.checkRoundOver();
 

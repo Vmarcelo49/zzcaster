@@ -108,8 +108,9 @@ pub fn applyDetectRoundStart() void {
     writeBytes(0x440D16, &p1);
 
     // Patch 2 @ 0x441002 (8 bytes): code cave. Read/increment/store the
-    // counter, then pop the registers the call site expected to be preserved
-    // and return (the original site at 0x440CC5 is a call into this region).
+    // counter, then pop esi/ecx (restoring registers saved by the containing
+    // function's prologue) and ret — this short-circuits the rest of the
+    // function that 0x440CC5 lives in, returning early to its caller.
     //   8B 31    ; mov esi, [ecx]   (2 bytes)
     //   46       ; inc esi          (1 byte)
     //   89 31    ; mov [ecx], esi   (2 bytes)
@@ -145,7 +146,7 @@ pub fn applySfxAsmHacks() void {
     const sfx_len = sfx_dedup.sfx_array_len;
     const muted_vol = sfx_dedup.dx_muted_volume;
 
-    // --- filterRepeatedSfx (5 patches, applied in order) ---
+    // --- filterRepeatedSfx (7 patches, applied in order) ---
     var p0: [7]u8 = undefined;
     p0[0] = 0xB8; // mov eax, imm32
     std.mem.writeInt(u32, p0[1..5], @intCast(mute_arr), .little);
@@ -261,7 +262,7 @@ pub fn applySfxAsmHacks() void {
     m5[1] = 0x05; // je +5 (DONE_MUTE, just past the mov ecx)
     m5[2] = 0xB9; // mov ecx, imm32
     std.mem.writeInt(u32, m5[3..7], muted_vol, .little);
-    m5[7] = 0xE9; // jmp rel32 (DONE_MUTE label)
+    m5[7] = 0xE9; // jmp rel32 to AFTER label (0x40F398)
     std.mem.writeInt(u32, m5[8..12], @as(u32, 0x40F398) -% (@as(u32, 0x40FB01) + 12), .little);
     writeBytes(0x40FB01, &m5);
 

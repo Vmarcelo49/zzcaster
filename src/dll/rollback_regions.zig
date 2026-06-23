@@ -1,6 +1,6 @@
 const std = @import("std");
 
-// Rollback memory regions — ported from legacy_unused/Generator.cpp.
+// Rollback memory regions — ported from tools/Generator.cpp.
 
 pub const Region = struct { addr: usize, size: usize };
 
@@ -92,8 +92,9 @@ const misc_addrs = [_]Region{
 };
 
 // --- Per-player struct (repeated 4× for P1, P2, Puppet1, Puppet2) ---
-// Ported from Generator.cpp playerAddrs. Each entry is {start, end} in the
-// legacy code; we convert to {addr, size = end - start}.
+// Ported from Generator.cpp playerAddrs. Legacy entries use mixed forms
+// ({start, end}, single pointer = 4 bytes, or {ptr, size}); all are
+// normalized to {addr, size}.
 const player_addrs = [_]Region{
     .{ .addr = 0x555130, .size = 0x10 }, // 0x555130..0x555140
     .{ .addr = 0x555140, .size = 0x20 },

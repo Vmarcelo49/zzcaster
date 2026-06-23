@@ -505,11 +505,11 @@ fn initThread(_: ?*anyopaque) callconv(.winapi) u32 {
 }
 
 /// Heavy initialization, deferred from DllMain to the worker thread it
-/// spawns. Runs on a thread with a 256KB stack, where Zig 0.16's std.Io
-/// (used by logging.Logger.init) won't blow the stack the way it does on
-/// the remote LoadLibraryA thread. Does the logger setup, IPC connect,
-/// ASM hook install, and config read — everything that used to live in
-/// DllMain's PROCESS_ATTACH.
+/// spawns. Does the logger setup, IPC connect, ASM hook install, and
+/// config read — everything that used to live in DllMain's PROCESS_ATTACH.
+/// The worker thread is created with an 8MB stack (see CreateThread in
+/// DllMain); Zig 0.16's std.Io call chain is deep enough that the
+/// LoadLibraryA remote thread's default 256KB stack overflowed.
 fn lazyInit() void {
     if (dll_initialized.load(.acquire)) return;
     dll_initialized.store(true, .release);

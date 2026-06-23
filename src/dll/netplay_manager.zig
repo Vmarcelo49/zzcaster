@@ -222,8 +222,11 @@ const SyncHash = struct {
     }
 
     fn charaMatches(a: CharaHash, b: CharaHash) bool {
-        // Compare everything except the two seq fields first (legacy compares
-        // the byte block from offset 8 onward, i.e. health..moon).
+        // Compare health..seq (and conditionally seq_state). NOTE: this is
+        // more permissive than the legacy operator==, whose memcmp covers
+        // bytes 8..sizeof(CharaHash) and therefore also compares the
+        // `chara` and `moon` selector fields — a divergence in those
+        // would NOT be flagged here.
         if (a.health != b.health) return false;
         if (a.red_health != b.red_health) return false;
         if (a.meter != b.meter) return false;
@@ -241,8 +244,9 @@ const SyncHash = struct {
 
     /// Serialize into a flat byte buffer for the wire. Format:
     ///   [8 indexed_frame][16 md5][4 round_timer][4 real_timer]
-    ///   [4 camera_x][4 camera_y][2 × CharaHash (48 bytes each)]
-    /// Total = 8 + 16 + 16 + 96 = 136 bytes.
+    ///   [4 camera_x][4 camera_y][2 × CharaHash (44 bytes data + 4 padding = 48-byte slot each)]
+    /// Total = 8 + 16 + 16 + 96 = 136 bytes. (Legacy CharaHash is 44 bytes
+    /// and its SyncHash wire total is 128; Zig reserves 48-byte slots.)
     fn serialize(self: SyncHash, buf: []u8) usize {
         std.mem.writeInt(u64, buf[0..8], self.indexed_frame, .little);
         @memcpy(buf[8..24], &self.hash);
@@ -282,9 +286,11 @@ const SyncHash = struct {
         std.mem.writeInt(i32, buf[36..40], c.y, .little);
         std.mem.writeInt(u16, buf[40..42], c.chara, .little);
         std.mem.writeInt(u16, buf[42..44], c.moon, .little);
-        // 44 bytes used; legacy CharaHash struct has padding to 48 (the 16-bit
-        // chara/moon fields force alignment). We pack tightly here and the
-        // 4 trailing bytes are unused — buf[44..48] is scratch.
+        // 44 bytes used; legacy CharaHash struct is 44 bytes (no padding —
+        // uint16_t has 2-byte alignment, struct alignment is 4, 44 is already
+        // a multiple of 4). The Zig wire format reserves a 48-byte slot per
+        // CharaHash for 4-byte alignment of the next slot, so buf[44..48] is
+        // unused scratch.
     }
 
     fn readCharaHashBuf(buf: []const u8) CharaHash {
@@ -381,20 +387,26 @@ pub const NetplayManager = struct {
 
     spectators: ?spectator_manager_mod.SpectatorManager = null,
 
-    // Defaults to false: the host must NOT send RNG during chara_select.
-    // The legacy CCCaster only synced RNG at `game_state == 99` (in-game
-    // intro-done), and the Zig port must match that timing. Arming RNG
-    // sync during chara_select caused a desync because each side resets
-    // `indexed_frame.frame = 0` at its own `world_timer` value, and the
-    // lazy ENet reconnect blocks each side for varying wall-clock
-    // durations — so the host sends RNG at frame N while the client
-    // applies it at frame M (with N != M), baking in a permanent
-    // advancement offset that the lockstep cannot recover from.
+    // Defaults to false: armed by `onStateTransition` (on entering `.in_game`)
+    // and by `checkIntroDone` (when `game_state == 99`, per-round re-arm).
     //
-    // The flag is armed by:
-    //   - `onStateTransition` to `.in_game` (round 1 entry from chara_intro)
-    //   - `checkIntroDone` when `game_state == 99` (per-round re-arm)
-    // `syncRngState` also gates on `intro_rng_enabled` as a defense-in-depth.
+    // The Zig port deliberately arms only at InGame / INTRO_DONE, NOT at
+    // CharaSelect — even though the legacy CCCaster arms at all three
+    // (`DllMain.cpp:1075-1081`). The reason is that ZZCaster's
+    // `applyRemoteRng` writes to game memory immediately on packet receipt,
+    // whereas CCCaster defers application to a deterministic point after
+    // the poll loop (`DllMain.cpp:624-646`). With deferred application
+    // AND an `isRngStateReady` gate on the client's poll loop, CharaSelect
+    // arming is safe. With immediate application but NO gate (the
+    // pre-fix Zig port), arming at CharaSelect allowed the client to
+    // apply the host's RNG snapshot at a non-deterministic frame and
+    // diverge. The gate is now in place (see `isRemoteInputReady`), so
+    // CharaSelect arming COULD be re-enabled for parity — but it's left
+    // disabled because the SyncHash detector only checks from CharaSelect
+    // onward, and there's no gameplay simulation during CharaSelect to
+    // advance the RNG anyway.
+    //
+    // `syncRngState` also gates on `intro_rng_enabled` as defense-in-depth.
     should_sync_rng: bool = false,
     rng_synced: bool = false,
 
@@ -402,11 +414,16 @@ pub const NetplayManager = struct {
     // receipt before the host treats the sync as complete. The lazy-reconnect
     // design (ENet connection established inside frameStep, not in the
     // launcher) means the host's first RNG packet can be sent before the peer
-    // has finished its ENet CONNECT — so the packet would be dropped and the
-    // host would run with `rng_synced=true` while the peer still has its own
-    // seed. That diverged the RNG hash and triggered a false desync at
-    // frame 149. The ack closes this race: the host re-sends RNG until the
-    // peer's ack arrives, and only then flips `rng_synced`.
+    // has finished its ENet CONNECT — so the packet would be dropped and
+    // the host would keep re-sending forever. The ack closes this race:
+    // the host re-sends RNG every `rng_resend_period` frames until the
+    // peer's ack arrives, then stops.
+    //
+    // Note: the host's `rng_synced` flag is NOT set when sending — it's
+    // only set by `confirmRngAck` when the peer's ACK arrives. The
+    // client's `rng_synced` flag is set by `applyRemoteRng` when it
+    // actually writes the RNG to game memory. These are two separate
+    // flags on two separate peers; don't conflate them.
     rng_acked: bool = false,
     rng_send_cooldown: u32 = 0, // frames until next resend attempt
     rng_send_count: u32 = 0, // diagnostic: how many times we sent
@@ -535,7 +552,11 @@ pub const NetplayManager = struct {
 
             // For spectators, use a non-zero connect data so the host can
             // immediately distinguish them from the main player peer.
-            // 0x5FEC == "SPEC" sentinel (visual mnemonic).
+            // 0x5FEC is a ZZCaster-specific sentinel (does NOT match any
+            // CCCaster mechanism — CCCaster uses TCP server sockets and
+            // distinguishes spectators by connection context, not a
+            // connect-data field). The value is arbitrary; it just needs
+            // to be non-zero and distinct from the main peer's connect_data (0).
             const connect_data: u32 = if (self.config.is_spectator) 0x5FEC else 0;
             self.enet_peer = enet.enet_host_connect(self.enet_host, &addr, 3, connect_data);
             // Stage-0 diag: log the host_connect return — a null here means
@@ -570,7 +591,8 @@ pub const NetplayManager = struct {
             switch (event.type) {
                 enet.ENET_EVENT_TYPE_CONNECT => {
                     // Distinguish main peer (already connected) from spectator
-                    // by checking connect data (0x5FEC == "SPEC" sentinel).
+                    // by checking connect data (0x5FEC ZZCaster sentinel — see
+                    // initEnet for why this doesn't match CCCaster).
                     if (peer_opt) |p| {
                         if (p.data != null) {
                             const cd: *u32 = @ptrCast(@alignCast(p.data.?));
@@ -940,6 +962,36 @@ pub const NetplayManager = struct {
         // Offline / spectator: always ready
         if (!self.config.is_netplay or self.config.is_spectator) return true;
 
+        // ----------------------------------------------------------------
+        // RNG readiness gate (client only).
+        //
+        // The host captures and sends the game's RNG state at a specific
+        // frame F (when `should_sync_rng` is armed by `onStateTransition`
+        // or `checkIntroDone`). The client must apply that snapshot at the
+        // SAME logical frame F. If the client advances past frame F before
+        // the host's RNG packet arrives, the client's game will already
+        // have advanced its RNG past S_F; overwriting it with S_F at frame
+        // F+N bakes in a permanent advancement offset that the SyncHash
+        // detector flags as "RNG hash mismatch" at the first 150-frame
+        // check (indexed_frame 0x0000000100000095 = index 1, frame 149).
+        //
+        // CCCaster closes this race by gating the poll loop on
+        // `isRngStateReady(shouldSyncRngState)` (DllNetplayManager.cpp:1054)
+        // and deferring `procMan.setRngState()` until after the poll loop
+        // exits (DllMain.cpp:624-646). The Zig port's
+        // `applyRemoteRng` writes to game memory immediately on packet
+        // receipt, so the equivalent fix is to gate `isRemoteInputReady`
+        // on `rng_synced` — the client blocks in the lockstep wait loop
+        // (frame_step.zig), polling ENet until the RNG packet arrives and
+        // is applied, then proceeds. The host does not gate (it captures
+        // and sends its own RNG, and naturally blocks on remote input
+        // because the client can't send inputs while it's waiting for
+        // RNG).
+        // ----------------------------------------------------------------
+        if (self.should_sync_rng and !self.config.is_host and !self.rng_synced) {
+            return false;
+        }
+
         const our_index = self.indexed_frame.index;
 
         // No remote inputs at all yet — wait
@@ -992,9 +1044,16 @@ pub const NetplayManager = struct {
         // to `.in_game` and by `checkIntroDone` on the per-round re-arm, so in
         // principle this gate is redundant — but it ensures we can NEVER fire
         // during chara_select even if some future code path arms
-        // `should_sync_rng` early. The legacy CCCaster only synced at
-        // intro-done, and syncing earlier causes a desync (see the comment on
-        // `should_sync_rng` for the full explanation).
+        // `should_sync_rng` early.
+        //
+        // Note: the legacy CCCaster actually arms RNG sync at THREE points —
+        // CharaSelect, InGame, and INTRO_DONE (`DllMain.cpp:1075-1081`) —
+        // and relies on the `isRngStateReady` poll-loop gate
+        // (`DllNetplayManager.cpp:1054`) plus deferred application
+        // (`DllMain.cpp:624-646`) to keep it deterministic. The Zig port
+        // arms at only InGame / INTRO_DONE and additionally gates
+        // `isRemoteInputReady` on `rng_synced` (see that function) to
+        // achieve the same determinism with immediate application.
         if (!self.intro_rng_enabled) return;
         // Lazy-reconnect: only send once the ENet peer has actually connected.
         // The peer's CONNECT event may not have arrived yet on the first
@@ -1047,6 +1106,22 @@ pub const NetplayManager = struct {
             return;
         }
 
+        // ----------------------------------------------------------------
+        // Idempotent application: if we've already applied the host's RNG
+        // for this round (`rng_synced == true`), do NOT overwrite the
+        // game's RNG state again. The host re-sends every
+        // `rng_resend_period` frames while waiting for our ACK (see
+        // `syncRngState`), and by the time a re-send arrives our game has
+        // already advanced N frames past S_F. Overwriting with the stale
+        // S_F would undo those N advancements and silently diverge us from
+        // the host. We just re-ACK so the host stops re-sending.
+        // ----------------------------------------------------------------
+        if (self.rng_synced) {
+            self.log.info("RNG already synced for index {d} — re-acking only", .{rng_index});
+            self.sendRngAck(rng_index);
+            return;
+        }
+
         rng_state0_addr.* = std.mem.readInt(u32, body[4..8], .little);
         rng_state1_addr.* = std.mem.readInt(u32, body[8..12], .little);
         rng_state2_addr.* = std.mem.readInt(u32, body[12..16], .little);
@@ -1054,10 +1129,10 @@ pub const NetplayManager = struct {
         self.rng_synced = true;
         self.log.info("Applied remote RNG state (index={d})", .{rng_index});
 
-        // Acknowledge receipt so the host can stop re-sending and flip its
-        // rng_synced flag. The host may re-send several times before this
-        // arrives (see syncRngState); replying to every received packet is
-        // fine — the host ignores acks after the first.
+        // Acknowledge receipt so the host can stop re-sending. The host
+        // may re-send several times before this arrives (see syncRngState);
+        // replying to every received packet is fine — the host ignores
+        // acks after the first (see `confirmRngAck`).
         self.sendRngAck(rng_index);
     }
 
@@ -1094,8 +1169,9 @@ pub const NetplayManager = struct {
     /// white-list; invalid transitions indicate a desync and should be logged.
     /// Returns true if the transition is valid, false otherwise.
     ///
-    /// Valid transitions (from CCCaster's isValidNext, plus two pragmatic
-    /// additions noted below):
+    /// Valid transitions (adapted from CCCaster's isValidNext; see divergences
+    /// noted inline). CCCaster states not present in this port (AutoCharaSelect,
+    /// ReplayMenu) are omitted, and the following changes vs. CCCaster are made:
     ///   pre_initial → initial | chara_select | loading | chara_intro | in_game
     ///     ↑ ADDED: the original white-list only allowed `pre_initial → initial`,
     ///       but nothing in the codebase ever fires that transition. The first
@@ -1108,10 +1184,14 @@ pub const NetplayManager = struct {
     ///       state was a vestigial placeholder that the legacy code used
     ///       during a setup phase that the Zig port doesn't have.
     ///   initial → chara_select (netplay) | in_game (training)
+    ///     ↑ ADDED: replaces CCCaster's Initial → AutoCharaSelect → Loading → InGame
+    ///       chain for training mode (no AutoCharaSelect in this port).
     ///   chara_select → loading
     ///   loading → chara_intro (versus) | in_game (training)
+    ///     ↑ DROPPED vs CCCaster: Loading → Skippable.
     ///   chara_intro → in_game
     ///   in_game → skippable | chara_select
+    ///     ↑ DROPPED vs CCCaster: InGame → RetryMenu (and ReplayMenu, no such state).
     ///   skippable → in_game (next round) | retry_menu | chara_select
     ///     ↑ ADDED: when the match ends (someone hits `win_count` wins), the
     ///       game returns to `chara_select (mode 20)`. Without this transition,
@@ -1157,8 +1237,10 @@ pub const NetplayManager = struct {
                 // Versus netplay: enter chara_intro first. The actual
                 // chara_intro → in_game transition is driven by the intro
                 // state flag (CC_INTRO_STATE_ADDR going to 0), watched in
-                // checkIntroDone() — matching the legacy RoundStart variable
-                // watch in DllMain.cpp:1266-1269.
+                // checkIntroDone(). This DIVERGES from the legacy, which uses
+                // the RoundStart variable watch (DllMain.cpp:1266-1270) for
+                // both CharaIntro→InGame and Skippable→InGame; the Zig uses
+                // intro_state for the former and round_start_counter for the latter.
                 new_state = .chara_intro;
             }
         }
@@ -1264,8 +1346,11 @@ pub const NetplayManager = struct {
     /// by checkIntroDone().
     ///
     /// Mirrors the legacy Variable::RoundStart change-monitor in
-    /// DllMain.cpp:1266-1270, which fired the Skippable→InGame transition
-    /// whenever the round-start counter changed.
+    /// DllMain.cpp:1266-1270, which fired netplayStateChanged(InGame)
+    /// unconditionally on counter change (valid from CharaIntro, Skippable,
+    /// or Loading per CCCaster's isValidNext). The Zig only acts on this
+    /// signal for the Skippable→InGame case; CharaIntro→InGame is handled
+    /// separately by checkIntroDone() via CC_INTRO_STATE_ADDR.
     pub fn checkRoundStart(self: *NetplayManager) void {
         const current = asm_hacks.round_start_counter;
         if (current == self.last_round_start) return;
@@ -1338,12 +1423,17 @@ pub const NetplayManager = struct {
         // chara_intro, or training mode direct entry). The per-round re-arm
         // for rounds 2+ is handled by `checkIntroDone` when `game_state == 99`.
         //
-        // We deliberately do NOT arm for `.chara_select`: see the comment on
-        // `should_sync_rng` above. The legacy CCCaster only synced RNG at
-        // intro-done (`game_state == 99`), and arming during chara_select
-        // caused a desync at the first SyncHash check (frame 149) because
-        // the host's RNG send (at frame N) was applied on the client at a
-        // different frame M, baking in a permanent advancement offset.
+        // We deliberately do NOT arm for `.chara_select`, even though the
+        // legacy CCCaster does (`DllMain.cpp:1075-1081`). The Zig port
+        // historically omitted CharaSelect arming because, without an
+        // `isRngStateReady` gate on the client's poll loop, arming at
+        // CharaSelect allowed the client to apply the host's RNG snapshot
+        // at a non-deterministic frame and diverge. That gate is now in
+        // place (see `isRemoteInputReady`), so CharaSelect arming COULD
+        // be re-enabled for parity — but it's left disabled because
+        // there's no gameplay simulation during CharaSelect to advance
+        // the RNG anyway, and the SyncHash detector only checks from
+        // CharaSelect onward.
         if (new == .in_game) {
             self.rng_synced = false;
             self.rng_acked = false;
@@ -1431,10 +1521,11 @@ pub const NetplayManager = struct {
         self.pushSync(&self.remote_sync, &self.remote_sync_count, sh);
     }
 
-    /// Append to a bounded ring; drop the oldest when full. Matches the
-    /// legacy std::list semantics (front-pop on full) closely enough — since
-    /// exchanges resolve within a handful of frames, the ring never wraps in
-    /// practice.
+    /// Append to a bounded ring; drop the oldest when full. The legacy
+    /// code uses an unbounded std::list (DllMain.cpp:175) and never
+    /// discards on full — the bounded ring is a Zig-specific defensive
+    /// measure. In practice exchanges resolve within a handful of frames,
+    /// so the ring never wraps.
     fn pushSync(_: *NetplayManager, buf: *[sync_queue_len]SyncHash, count: *u8, sh: SyncHash) void {
         if (count.* < sync_queue_len) {
             buf[count.*] = sh;
@@ -1454,7 +1545,7 @@ pub const NetplayManager = struct {
         if (self.local_sync_count == 0 or self.remote_sync_count == 0) return;
 
         // Walk both queues in indexed_frame order, dropping entries that have
-        // no counterpart on the other side (legacy pops the higher one first).
+        // no counterpart on the other side (legacy pops the LOWER one first).
         var li: usize = 0;
         var ri: usize = 0;
         while (li < self.local_sync_count and ri < self.remote_sync_count) {

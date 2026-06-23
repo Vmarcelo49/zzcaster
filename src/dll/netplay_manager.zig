@@ -222,8 +222,11 @@ const SyncHash = struct {
     }
 
     fn charaMatches(a: CharaHash, b: CharaHash) bool {
-        // Compare everything except the two seq fields first (legacy compares
-        // the byte block from offset 8 onward, i.e. health..moon).
+        // Compare health..seq (and conditionally seq_state). NOTE: this is
+        // more permissive than the legacy operator==, whose memcmp covers
+        // bytes 8..sizeof(CharaHash) and therefore also compares the
+        // `chara` and `moon` selector fields — a divergence in those
+        // would NOT be flagged here.
         if (a.health != b.health) return false;
         if (a.red_health != b.red_health) return false;
         if (a.meter != b.meter) return false;
@@ -241,8 +244,9 @@ const SyncHash = struct {
 
     /// Serialize into a flat byte buffer for the wire. Format:
     ///   [8 indexed_frame][16 md5][4 round_timer][4 real_timer]
-    ///   [4 camera_x][4 camera_y][2 × CharaHash (48 bytes each)]
-    /// Total = 8 + 16 + 16 + 96 = 136 bytes.
+    ///   [4 camera_x][4 camera_y][2 × CharaHash (44 bytes data + 4 padding = 48-byte slot each)]
+    /// Total = 8 + 16 + 16 + 96 = 136 bytes. (Legacy CharaHash is 44 bytes
+    /// and its SyncHash wire total is 128; Zig reserves 48-byte slots.)
     fn serialize(self: SyncHash, buf: []u8) usize {
         std.mem.writeInt(u64, buf[0..8], self.indexed_frame, .little);
         @memcpy(buf[8..24], &self.hash);
@@ -282,9 +286,11 @@ const SyncHash = struct {
         std.mem.writeInt(i32, buf[36..40], c.y, .little);
         std.mem.writeInt(u16, buf[40..42], c.chara, .little);
         std.mem.writeInt(u16, buf[42..44], c.moon, .little);
-        // 44 bytes used; legacy CharaHash struct has padding to 48 (the 16-bit
-        // chara/moon fields force alignment). We pack tightly here and the
-        // 4 trailing bytes are unused — buf[44..48] is scratch.
+        // 44 bytes used; legacy CharaHash struct is 44 bytes (no padding —
+        // uint16_t has 2-byte alignment, struct alignment is 4, 44 is already
+        // a multiple of 4). The Zig wire format reserves a 48-byte slot per
+        // CharaHash for 4-byte alignment of the next slot, so buf[44..48] is
+        // unused scratch.
     }
 
     fn readCharaHashBuf(buf: []const u8) CharaHash {
@@ -546,7 +552,11 @@ pub const NetplayManager = struct {
 
             // For spectators, use a non-zero connect data so the host can
             // immediately distinguish them from the main player peer.
-            // 0x5FEC == "SPEC" sentinel (visual mnemonic).
+            // 0x5FEC is a ZZCaster-specific sentinel (does NOT match any
+            // CCCaster mechanism — CCCaster uses TCP server sockets and
+            // distinguishes spectators by connection context, not a
+            // connect-data field). The value is arbitrary; it just needs
+            // to be non-zero and distinct from the main peer's connect_data (0).
             const connect_data: u32 = if (self.config.is_spectator) 0x5FEC else 0;
             self.enet_peer = enet.enet_host_connect(self.enet_host, &addr, 3, connect_data);
             // Stage-0 diag: log the host_connect return — a null here means
@@ -581,7 +591,8 @@ pub const NetplayManager = struct {
             switch (event.type) {
                 enet.ENET_EVENT_TYPE_CONNECT => {
                     // Distinguish main peer (already connected) from spectator
-                    // by checking connect data (0x5FEC == "SPEC" sentinel).
+                    // by checking connect data (0x5FEC ZZCaster sentinel — see
+                    // initEnet for why this doesn't match CCCaster).
                     if (peer_opt) |p| {
                         if (p.data != null) {
                             const cd: *u32 = @ptrCast(@alignCast(p.data.?));
@@ -1158,8 +1169,9 @@ pub const NetplayManager = struct {
     /// white-list; invalid transitions indicate a desync and should be logged.
     /// Returns true if the transition is valid, false otherwise.
     ///
-    /// Valid transitions (from CCCaster's isValidNext, plus two pragmatic
-    /// additions noted below):
+    /// Valid transitions (adapted from CCCaster's isValidNext; see divergences
+    /// noted inline). CCCaster states not present in this port (AutoCharaSelect,
+    /// ReplayMenu) are omitted, and the following changes vs. CCCaster are made:
     ///   pre_initial → initial | chara_select | loading | chara_intro | in_game
     ///     ↑ ADDED: the original white-list only allowed `pre_initial → initial`,
     ///       but nothing in the codebase ever fires that transition. The first
@@ -1172,10 +1184,14 @@ pub const NetplayManager = struct {
     ///       state was a vestigial placeholder that the legacy code used
     ///       during a setup phase that the Zig port doesn't have.
     ///   initial → chara_select (netplay) | in_game (training)
+    ///     ↑ ADDED: replaces CCCaster's Initial → AutoCharaSelect → Loading → InGame
+    ///       chain for training mode (no AutoCharaSelect in this port).
     ///   chara_select → loading
     ///   loading → chara_intro (versus) | in_game (training)
+    ///     ↑ DROPPED vs CCCaster: Loading → Skippable.
     ///   chara_intro → in_game
     ///   in_game → skippable | chara_select
+    ///     ↑ DROPPED vs CCCaster: InGame → RetryMenu (and ReplayMenu, no such state).
     ///   skippable → in_game (next round) | retry_menu | chara_select
     ///     ↑ ADDED: when the match ends (someone hits `win_count` wins), the
     ///       game returns to `chara_select (mode 20)`. Without this transition,
@@ -1221,8 +1237,10 @@ pub const NetplayManager = struct {
                 // Versus netplay: enter chara_intro first. The actual
                 // chara_intro → in_game transition is driven by the intro
                 // state flag (CC_INTRO_STATE_ADDR going to 0), watched in
-                // checkIntroDone() — matching the legacy RoundStart variable
-                // watch in DllMain.cpp:1266-1269.
+                // checkIntroDone(). This DIVERGES from the legacy, which uses
+                // the RoundStart variable watch (DllMain.cpp:1266-1270) for
+                // both CharaIntro→InGame and Skippable→InGame; the Zig uses
+                // intro_state for the former and round_start_counter for the latter.
                 new_state = .chara_intro;
             }
         }
@@ -1328,8 +1346,11 @@ pub const NetplayManager = struct {
     /// by checkIntroDone().
     ///
     /// Mirrors the legacy Variable::RoundStart change-monitor in
-    /// DllMain.cpp:1266-1270, which fired the Skippable→InGame transition
-    /// whenever the round-start counter changed.
+    /// DllMain.cpp:1266-1270, which fired netplayStateChanged(InGame)
+    /// unconditionally on counter change (valid from CharaIntro, Skippable,
+    /// or Loading per CCCaster's isValidNext). The Zig only acts on this
+    /// signal for the Skippable→InGame case; CharaIntro→InGame is handled
+    /// separately by checkIntroDone() via CC_INTRO_STATE_ADDR.
     pub fn checkRoundStart(self: *NetplayManager) void {
         const current = asm_hacks.round_start_counter;
         if (current == self.last_round_start) return;
@@ -1500,10 +1521,11 @@ pub const NetplayManager = struct {
         self.pushSync(&self.remote_sync, &self.remote_sync_count, sh);
     }
 
-    /// Append to a bounded ring; drop the oldest when full. Matches the
-    /// legacy std::list semantics (front-pop on full) closely enough — since
-    /// exchanges resolve within a handful of frames, the ring never wraps in
-    /// practice.
+    /// Append to a bounded ring; drop the oldest when full. The legacy
+    /// code uses an unbounded std::list (DllMain.cpp:175) and never
+    /// discards on full — the bounded ring is a Zig-specific defensive
+    /// measure. In practice exchanges resolve within a handful of frames,
+    /// so the ring never wraps.
     fn pushSync(_: *NetplayManager, buf: *[sync_queue_len]SyncHash, count: *u8, sh: SyncHash) void {
         if (count.* < sync_queue_len) {
             buf[count.*] = sh;
@@ -1523,7 +1545,7 @@ pub const NetplayManager = struct {
         if (self.local_sync_count == 0 or self.remote_sync_count == 0) return;
 
         // Walk both queues in indexed_frame order, dropping entries that have
-        // no counterpart on the other side (legacy pops the higher one first).
+        // no counterpart on the other side (legacy pops the LOWER one first).
         var li: usize = 0;
         var ri: usize = 0;
         while (li < self.local_sync_count and ri < self.remote_sync_count) {

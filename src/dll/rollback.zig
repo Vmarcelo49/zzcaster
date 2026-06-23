@@ -102,7 +102,7 @@ pub const MemoryRegion = struct {
 pub const SavedState = struct {
     frame: u32,
     index: u32,
-    fpu_env: [28]u8, // x87 FPU control word save area (fenv_t on x86)
+    fpu_env: [28]u8, // x87 FPU environment save area (28-byte fnstenv/fldenv layout)
     data: []u8, // contiguous buffer for all memory regions
 };
 
@@ -138,7 +138,8 @@ pub const StatePool = struct {
         self.num_states = 0;
     }
 
-    /// Add a memory region to save/restore (from res/rollback.bin)
+    /// Add a memory region to save/restore (regions are sourced from
+    /// `rollback_regions.zig` at comptime; see `NetplayManager.onEnterInGame`).
     pub fn addRegion(self: *StatePool, addr: usize, size: usize) !void {
         try self.regions.append(self.allocator, .{ .addr = addr, .size = size });
     }
@@ -183,7 +184,7 @@ pub const StatePool = struct {
         } else if (self.saved_states.items.len > 0) {
             // Recycle the oldest entry. We don't return its slot to the
             // free_stack on the way out — we hand it straight to the new
-            // snapshot. The saved_states list shrinks below.
+            // snapshot. `orderedRemove(0)` shrinks `saved_states` by one.
             const oldest = self.saved_states.orderedRemove(0);
             slot = (@intFromPtr(oldest.data.ptr) - @intFromPtr(self.pool.ptr)) / self.state_size;
         } else {
@@ -204,8 +205,9 @@ pub const StatePool = struct {
         }
 
         // Save FPU environment (critical for deterministic re-simulation).
-        // fnstenv/fldenv are x86-only; on non-x86 targets (e.g. Linux x86_64
-        // host compilation) we skip — the DLL target is always x86 anyway.
+        // fnstenv/fldenv are x87-only; we guard with `builtin.cpu.arch == .x86`
+        // (32-bit only). On x86_64 host builds (e.g. unit tests) we skip — the
+        // real DLL target is always 32-bit x86 anyway.
         var fpu_env: [28]u8 = undefined;
         if (builtin.cpu.arch == .x86) {
             saveFpu(&fpu_env);
@@ -281,14 +283,15 @@ pub const StatePool = struct {
     // `src/dll/rollback_regions.zig` (`all_regions`) and is consumed directly
     // by `NetplayManager.onEnterInGame()`. `loadFromRbBin` had no callers
     // (verified by grep) and no tests; keeping it created a second, untested
-    // path for the same concern. If you need to load regions from a binary
-    // file again, port the rollback_regions.zig format instead of reviving
-    // this stale one.
+    // path for the same concern. If you need region-loading functionality
+    // again, extend `rollback_regions.zig` (comptime-hardcoded regions)
+    // rather than reviving this binary-file code path.
 };
 
 fn saveFpu(out: *[28]u8) void {
-    // Allocate a local stack slot and have fnstenv write to it via the
-    // pointer operand (input "=m" makes it an output).
+    // fnstenv writes the 28-byte x87 environment to the memory operand.
+    // The "=m" constraint marks `buf` as a write-only output so the
+    // compiler knows the asm modifies it.
     var buf: [28]u8 = undefined;
     asm volatile ("fnstenv %[fpu_env]"
         : [fpu_env] "=m" (buf),

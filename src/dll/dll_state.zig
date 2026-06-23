@@ -14,15 +14,16 @@ pub const game_mode_addr: *u32 = @ptrFromInt(0x54EEE8);
 /// Per-frame world timer; gates per-frame logic.
 pub const world_timer_addr: *u32 = @ptrFromInt(0x55D1D4);
 
-/// Skip-frames flag; 1 = skip, 0 = advance.
+/// Skip-frames flag; set to N to skip N frames of rendering, 0 to advance.
 pub const skip_frames_addr: *u32 = @ptrFromInt(0x55D25C);
 
 /// "Alive" flag; writing 0 forces MBAA to exit.
 pub const alive_flag_addr: *u8 = @ptrFromInt(0x76E650);
 
-// ptr_to_write_input_addr points to the base of the game's input struct. On
-// 64-bit targets usize wants 8-byte alignment but the field is 4-byte aligned,
-// so read through a u8 pointer and bit-cast.
+// ptr_to_write_input_addr points to the base of the game's input struct.
+// Read through a u8 pointer and bit-cast (defensive pattern; on the forced
+// 32-bit target usize=u32 and the field is 4-byte aligned, so a direct *u32
+// read would also be valid).
 const ptr_to_write_input_addr: [*]u8 = @ptrFromInt(0x76E6AC);
 const p1_off_dir: u32 = 0x18;
 const p1_off_btn: u32 = 0x24;

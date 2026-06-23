@@ -94,7 +94,8 @@ pub fn readInput() u16 {
     }
 
     // Direction to numpad notation (0=neutral, 1-9). Start at 5=neutral so
-    // +/-1 yields 4=L, 6=R (starting at 0 would wrap to 65535 on left).
+    // +/-1 yields 4=L, 6=R (starting at 0 with `-|=` would saturate at 0,
+    // yielding 0=neutral instead of 4=L on left input).
     var direction: u16 = 5;
     if (up) direction = 8 else if (down) direction = 2;
     if (left) direction -|= 1 else if (right) direction +|= 1;

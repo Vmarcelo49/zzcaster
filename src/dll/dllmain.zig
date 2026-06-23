@@ -124,7 +124,10 @@ const force_goto_addr: *u8 = @ptrFromInt(0x42B475);
 
 var log_storage: logging.Logger = undefined;
 var ipc_pipe: ?*anyopaque = null;
-var ipc_connected: bool = false;
+// `ipc_connected` is written by the lazy-init worker thread and read by the
+// game's main thread inside frameStep — declare it atomic so both threads
+// agree on a value without torn reads.
+var ipc_connected: std.atomic.Value(bool) = .init(false);
 var last_world_timer: u32 = 0;
 var prev_game_mode: u32 = 0;
 
@@ -137,15 +140,101 @@ var input_diag_logged: bool = false;
 var sdl_init_done: bool = false;
 var sdl_initialized: bool = false;
 
-var config_received: bool = false;
+// `config_received` is set by lazyInit (worker thread) and frameStep may set
+// it too — protect with an atomic so the cross-thread visibility is well
+// defined. The accompanying `is_training/is_netplay/is_spectator` flags are
+// only read AFTER `config_received` is observed true, which gives us a
+// release/acquire handoff for those flags as well.
+var config_received: std.atomic.Value(bool) = .init(false);
 var is_training: bool = false;
 var is_netplay: bool = false;
 var is_spectator: bool = false;
 
-// DllMain runs on the remote LoadLibraryA thread, which under Wine has a small
-// stack that Zig 0.16's std.Io blows (EXCEPTION_STACK_OVERFLOW). So DllMain
-// does the minimum and defers heavy init to a worker thread (see initThread).
-var dll_initialized: bool = false;
+// `dll_initialized` is written by lazyInit (worker thread) and read by
+// frameStep (game's main thread). Make it atomic for the same reason.
+var dll_initialized: std.atomic.Value(bool) = .init(false);
+
+// === IPC framing state machine ===
+//
+// The launcher sends: [4-byte LE length][payload of `length` bytes] in two
+// separate WriteFile calls. Because the pipe is opened as PIPE_TYPE_BYTE,
+// the OS does NOT preserve message boundaries — a ReadFile may return
+// fewer bytes than requested, and a subsequent ReadFile will pick up
+// where the previous one stopped. The previous implementation consumed
+// the 4-byte header even when the full payload hadn't arrived yet, then
+// returned without reading the payload; the next poll would then
+// interpret the first 4 bytes of payload as a NEW header, corrupting
+// the framing permanently.
+//
+// This state machine buffers partial reads until a full frame is available.
+const IpcReader = struct {
+    header_buf: [4]u8 = undefined,
+    header_read: usize = 0,
+    msg_len: u32 = 0,
+    payload_buf: [256]u8 = undefined,
+    payload_read: usize = 0,
+
+    fn reset(self: *IpcReader) void {
+        self.header_read = 0;
+        self.msg_len = 0;
+        self.payload_read = 0;
+    }
+
+    /// Returns true if a full message is in `payload_buf[0..msg_len]`.
+    fn poll(self: *IpcReader, pipe: ?*anyopaque) bool {
+        // Read header bytes (4 bytes total).
+        while (self.header_read < 4) {
+            var available: u32 = 0;
+            if (win32.PeekNamedPipe(pipe, null, 0, null, &available, null) == 0) {
+                self.reset();
+                return false;
+            }
+            if (available == 0) return false;
+            const want: u32 = @intCast(4 - self.header_read);
+            const to_read: u32 = @min(available, want);
+            var got: u32 = 0;
+            if (win32.ReadFile(pipe, self.header_buf[self.header_read..].ptr, to_read, &got, null) == 0) {
+                self.reset();
+                return false;
+            }
+            if (got == 0) return false;
+            self.header_read += got;
+        }
+
+        // Header fully read — decode length (only once).
+        if (self.msg_len == 0) {
+            self.msg_len = std.mem.readInt(u32, &self.header_buf, .little);
+            if (self.msg_len == 0 or self.msg_len > self.payload_buf.len) {
+                // Invalid framing — reset to resync (best-effort).
+                self.reset();
+                return false;
+            }
+        }
+
+        // Read payload bytes.
+        while (self.payload_read < self.msg_len) {
+            var available: u32 = 0;
+            if (win32.PeekNamedPipe(pipe, null, 0, null, &available, null) == 0) {
+                self.reset();
+                return false;
+            }
+            if (available == 0) return false;
+            const want: u32 = @intCast(self.msg_len - self.payload_read);
+            const to_read: u32 = @min(available, want);
+            var got: u32 = 0;
+            if (win32.ReadFile(pipe, self.payload_buf[self.payload_read..].ptr, to_read, &got, null) == 0) {
+                self.reset();
+                return false;
+            }
+            if (got == 0) return false;
+            self.payload_read += got;
+        }
+
+        return true;
+    }
+};
+
+var ipc_reader: IpcReader = .{};
 
 pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) callconv(.winapi) std.os.windows.BOOL {
     switch (fdwReason) {
@@ -153,21 +242,24 @@ pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) call
             dll_module_handle = hModule;
 
             state.setFrameCallback(frameStep);
-            dll_initialized = false;
+            dll_initialized.store(false, .release);
             // 8MB stack: Zig 0.16's std.Io call chain is deep enough to blow a
             // smaller stack (verified: 256KB still overflowed).
             _ = win32.CreateThread(null, 8 * 1024 * 1024, initThread, null, 0, null);
         },
         0 => { // DLL_PROCESS_DETACH
-            if (state.log) |l| {
-                l.info("hook.dll: DLL_PROCESS_DETACH", .{});
-                if (state.nm) |*n| n.deinit();
-                if (ipc_connected) _ = win32.CloseHandle(ipc_pipe);
-                if (state.reader) |*r| r.deinit();
-                if (sdl_initialized) c.SDL_Quit();
-                l.deinit();
+            // DllMain runs inside the loader lock. Doing heavy work here —
+            // tearing down ENet, calling SDL_Quit, calling ExitProcess — is
+            // forbidden territory. The OS is already tearing the process
+            // down (DETACH on process exit). Just do the minimum: close the
+            // IPC handle if we still have it, and let the process die on
+            // its own. Killing the host from inside DllMain has been a
+            // source of impossible-to-debug crashes in injected-DLL land.
+            if (ipc_connected.load(.acquire)) {
+                if (ipc_pipe) |p| _ = win32.CloseHandle(p);
+                ipc_pipe = null;
+                ipc_connected.store(false, .release);
             }
-            win32.ExitProcess(0);
         },
         else => {},
     }
@@ -182,7 +274,7 @@ fn connectPipe() void {
     while (i < 50) : (i += 1) {
         ipc_pipe = win32.CreateFileA(name.ptr, win32.GENERIC_READ | win32.GENERIC_WRITE, 0, null, win32.OPEN_EXISTING, 0, null);
         if (ipc_pipe != win32.INVALID_HANDLE_VALUE) {
-            ipc_connected = true;
+            ipc_connected.store(true, .release);
             state.log.?.info("Connected to IPC pipe", .{});
             return;
         }
@@ -192,28 +284,14 @@ fn connectPipe() void {
 }
 
 fn waitForConfig() void {
-    if (state.log == null or !ipc_connected) return;
-    state.log.?.info("Waiting for config...", .{});
+    if (state.log == null or !ipc_connected.load(.acquire)) return;
+    if (config_received.load(.acquire)) return;
+    if (ipc_pipe == null) return;
 
-    // Non-blocking: a blocking ReadFile here would deadlock with the launcher's
-    // WaitForSingleObject on LoadLibraryA. If config isn't ready yet, return
-    // and let frameStep pick it up.
-    var available: u32 = 0;
-    if (win32.PeekNamedPipe(ipc_pipe, null, 0, null, &available, null) == 0) return;
-    if (available < 4) return;
-
-    var header: [4]u8 = undefined;
-    var read: u32 = 0;
-    if (win32.ReadFile(ipc_pipe, &header, 4, &read, null) == 0) return;
-    const msg_len = std.mem.readInt(u32, &header, .little);
-    if (msg_len == 0 or msg_len > 256) return;
-
-    if (win32.PeekNamedPipe(ipc_pipe, null, 0, null, &available, null) == 0) return;
-    if (available < msg_len) return;
-
-    var payload: [256]u8 = undefined;
-    if (win32.ReadFile(ipc_pipe, &payload, msg_len, &read, null) == 0) return;
-    if (read == 0) return;
+    if (!ipc_reader.poll(ipc_pipe)) return;
+    // Full frame received: ipc_reader.payload_buf[0..ipc_reader.msg_len].
+    const read: usize = ipc_reader.msg_len;
+    const payload = ipc_reader.payload_buf[0..read];
 
     // [flags][delay][rollback][win_count][host_player][2 peer_port][N peer_addr]
     if (read >= 5) {
@@ -227,7 +305,8 @@ fn waitForConfig() void {
             state.nm = netman.NetplayManager.init(std.heap.page_allocator, app_io_backend.io(), state.log.?) catch {
                 state.log.?.err("NetplayManager init failed", .{});
                 is_netplay = false;
-                config_received = true;
+                config_received.store(true, .release);
+                ipc_reader.reset();
                 return;
             };
 
@@ -248,7 +327,9 @@ fn waitForConfig() void {
             @memcpy(cfg.peer_addr[0..addr_len], payload[7 .. 7 + addr_len]);
 
             state.nm.?.configure(cfg);
-            config_received = true;
+            // `config_received.store(release)` publishes `is_netplay/is_training/...`
+            // and `state.nm` to readers that observe the store with .acquire.
+            config_received.store(true, .release);
             state.log.?.info("Config: netplay={} host={} training={} spectator={} delay={d} rollback={d} port={d}", .{
                 is_netplay, cfg.is_host,  is_training,   is_spectator,
                 cfg.delay,  cfg.rollback, cfg.peer_port,
@@ -258,7 +339,8 @@ fn waitForConfig() void {
             state.log.?.info("Config: offline training={}", .{is_training});
         }
     }
-    config_received = true;
+    config_received.store(true, .release);
+    ipc_reader.reset();
 }
 
 // applyPreLoadHacks / writeBytes / rel32 etc. live in asm_hacks.zig.
@@ -415,8 +497,8 @@ fn initThread(_: ?*anyopaque) callconv(.winapi) u32 {
 /// ASM hook install, and config read — everything that used to live in
 /// DllMain's PROCESS_ATTACH.
 fn lazyInit() void {
-    if (dll_initialized) return;
-    dll_initialized = true;
+    if (dll_initialized.load(.acquire)) return;
+    dll_initialized.store(true, .release);
 
     const io = app_io_backend.io();
     var pid_buf: [32]u8 = undefined;
@@ -454,25 +536,25 @@ fn lazyInit() void {
     // Non-blocking: returns immediately if the launcher hasn't sent config
     // yet (frameStep will retry). If it's already here, apply post-load hacks now.
     waitForConfig();
-    if (config_received) applyPostLoadHacks();
+    if (config_received.load(.acquire)) applyPostLoadHacks();
 }
 
 fn frameStep() callconv(.c) void {
-    if (!dll_initialized) return;
+    if (!dll_initialized.load(.acquire)) return;
     if (state.log == null) return;
 
-    if (!config_received and ipc_connected) {
+    if (!config_received.load(.acquire) and ipc_connected.load(.acquire)) {
         waitForConfig();
-        if (config_received) {
+        if (config_received.load(.acquire)) {
             applyPostLoadHacks();
         }
     }
 
-    if (config_received and !sdl_init_done) {
+    if (config_received.load(.acquire) and !sdl_init_done) {
         initSdlOnMainThread();
     }
 
-    if (config_received and sdl_init_done and !input_diag_logged) {
+    if (config_received.load(.acquire) and sdl_init_done and !input_diag_logged) {
         input_diag_logged = true;
 
         const input_base_ptr: [*]u8 = @ptrFromInt(0x76E6AC);

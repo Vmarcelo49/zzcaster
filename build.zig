@@ -1,7 +1,16 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // both zzcaster and hook.dll are 32 bit applications, so we force the build to be x86
+    const user_target = b.standardTargetOptions(.{});
+    if (user_target.result.os.tag == .windows and user_target.result.cpu.arch != .x86) {
+        std.debug.panic(
+            "zzcaster requires -Dtarget=x86-windows-gnu on Windows (got {s}-windows). " ++
+                "hook.dll must be 32-bit to inject into MBAA.exe (also 32-bit).",
+            .{@tagName(user_target.result.cpu.arch)},
+        );
+    }
+    const target = user_target;
     const optimize = b.standardOptimizeOption(.{});
 
     // Detect vendored SDL2 MinGW copy (created by scripts/fetch-deps.sh).

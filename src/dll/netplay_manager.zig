@@ -1071,25 +1071,44 @@ pub const NetplayManager = struct {
     /// white-list; invalid transitions indicate a desync and should be logged.
     /// Returns true if the transition is valid, false otherwise.
     ///
-    /// Valid transitions (from CCCaster's isValidNext):
-    ///   pre_initial → initial
+    /// Valid transitions (from CCCaster's isValidNext, plus two pragmatic
+    /// additions noted below):
+    ///   pre_initial → initial | chara_select | loading | chara_intro | in_game
+    ///     ↑ ADDED: the original white-list only allowed `pre_initial → initial`,
+    ///       but nothing in the codebase ever fires that transition. The first
+    ///       gameplay mode the game enters after the launcher handshake is
+    ///       `mode_chara_select (20)`, so `onGameModeChanged(20)` would try
+    ///       `pre_initial → chara_select`, get refused by the strict white-list,
+    ///       and the FSM would be permanently stuck in `pre_initial` (user
+    ///       inputs ignored, no sync, no transitions). We allow `pre_initial`
+    ///       to transition directly to any gameplay state — the `initial`
+    ///       state was a vestigial placeholder that the legacy code used
+    ///       during a setup phase that the Zig port doesn't have.
     ///   initial → chara_select (netplay) | in_game (training)
     ///   chara_select → loading
     ///   loading → chara_intro (versus) | in_game (training)
     ///   chara_intro → in_game
-    ///   in_game → skippable
-    ///   skippable → in_game (next round) | retry_menu
+    ///   in_game → skippable | chara_select
+    ///   skippable → in_game (next round) | retry_menu | chara_select
+    ///     ↑ ADDED: when the match ends (someone hits `win_count` wins), the
+    ///       game returns to `chara_select (mode 20)`. Without this transition,
+    ///       `onGameModeChanged(20)` from `.skippable` would be refused, the
+    ///       FSM would get stuck in `.skippable`, and the user couldn't pick
+    ///       a character for the rematch (inputs filtered to Confirm/Cancel
+    ///       only while in `.skippable`). Allowing `skippable → chara_select`
+    ///       unblocks the rematch flow. A proper match-end detector that
+    ///       routes through `.retry_menu` is a follow-up.
     ///   retry_menu → loading (rematch) | chara_select
     fn isValidNext(self: *const NetplayManager, new: NetplayState) bool {
         const old = self.state;
         const valid = switch (old) {
-            .pre_initial => new == .initial,
+            .pre_initial => new == .initial or new == .chara_select or new == .loading or new == .chara_intro or new == .in_game,
             .initial => new == .chara_select or new == .in_game,
             .chara_select => new == .loading,
             .loading => new == .chara_intro or new == .in_game,
             .chara_intro => new == .in_game,
             .in_game => new == .skippable or new == .chara_select,
-            .skippable => new == .in_game or new == .retry_menu,
+            .skippable => new == .in_game or new == .retry_menu or new == .chara_select,
             .retry_menu => new == .loading or new == .chara_select,
         };
         if (!valid) {

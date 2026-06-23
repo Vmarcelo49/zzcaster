@@ -61,6 +61,15 @@ const Msg = enum(u8) {
 /// the internal handshake state machine by one iteration. This avoids all
 /// cross-thread std.Io issues — no background thread, no thread-local state,
 /// no races.
+///
+/// All timeouts are anchored to wall-clock milliseconds via
+/// `std.Io.Clock.now(.real, io)`. The previous implementation counted
+/// `phase_attempts` per `step()` call and assumed 60 fps — which broke on
+/// high-refresh-rate monitors (144 Hz / 240 Hz) where the UI loop runs at
+/// the monitor's refresh rate, not at 60 Hz. With wall-clock deadlines the
+/// session is correct regardless of the caller's frame rate, which matters
+/// because the GUI loop (`src/launcher/ui.zig`) is VSync-bound and the CLI
+/// loop (`src/launcher/game_launcher.zig`) sleeps ~16 ms between steps.
 pub const NetplaySession = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -86,13 +95,29 @@ pub const NetplaySession = struct {
     error_len: usize = 0,
 
     // --- Internal sub-state for the step-based handshake state machine ---
-    // Each handshake phase tracks its own attempt counter + timeout.
-    // The UI calls step() every frame; step() dispatches based on `state`.
-    phase_attempts: u32 = 0,
+    //
+    // `phase_deadline_ms` is the wall-clock millisecond timestamp at which
+    // the current phase should time out. It is set when entering a phase
+    // (via `setPhaseTimeout`) and checked at the top of each `stepXxx()`.
+    // 0 means "no deadline / not timing out" (used briefly between phases).
+    //
+    // `phase_start_ms` is the wall-clock ms when the current phase started;
+    // used by `remainingSeconds()` to render a countdown for the UI.
+    phase_deadline_ms: i64 = 0,
+    phase_start_ms: i64 = 0,
     ping_index: u32 = 0,
     ping_start_ms: i64 = 0,
-    ping_waited: u32 = 0,
     handshake_subphase: u8 = 0, // 0=version, 1=names, 2=pings, 3=config
+
+    // Wall-clock timeouts (milliseconds) for each handshake phase. Tuned
+    // to match the original 60-fps frame counts: 300 frames = 5 s,
+    // 1800 frames = 30 s, 216000 frames = 1 hour, 50 frames = ~833 ms.
+    const listen_timeout_ms: i64 = 60 * 60 * 1000; // 1 hour
+    const connect_timeout_ms: i64 = 30 * 1000; // 30 s
+    const version_timeout_ms: i64 = 5 * 1000; // 5 s
+    const name_timeout_ms: i64 = 5 * 1000; // 5 s (best-effort)
+    const host_wait_confirm_timeout_ms: i64 = 30 * 1000; // 30 s
+    const ping_per_attempt_timeout_ms: i64 = 833; // ~50 frames @ 60fps
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, log: *logging.Logger) NetplaySession {
         return .{
@@ -169,31 +194,36 @@ pub const NetplaySession = struct {
         return self.error_buf[0..self.error_len];
     }
 
-    /// Returns the remaining seconds for the current phase's timeout, or
-    /// null if the current state has no timeout. Used by the UI to show
-    /// a countdown. Approximate — based on phase_attempts / 60fps.
+    /// Returns the remaining whole seconds for the current phase's timeout,
+    /// or null if the current state has no active deadline. Used by the UI
+    /// to render a countdown. Wall-clock based, so the countdown runs at
+    /// real-time speed regardless of the UI's frame rate.
     pub fn remainingSeconds(self: *const NetplaySession) ?u32 {
-        const fps: u32 = 60;
-        return switch (self.state) {
-            .listening => blk: {
-                const max: u32 = 216000; // 1 hour
-                if (self.phase_attempts >= max) break :blk 0;
-                break :blk (max - self.phase_attempts) / fps;
-            },
-            .connecting => blk: {
-                const max: u32 = 1800; // 30s
-                if (self.phase_attempts >= max) break :blk 0;
-                break :blk (max - self.phase_attempts) / fps;
-            },
-            .handshaking => blk: {
-                // Version + name + config phases all use 300 frames (5s).
-                // Config confirm (host) uses 1800 frames (30s).
-                const max: u32 = if (self.handshake_subphase == 3 and self.config.is_host) 1800 else 300;
-                if (self.phase_attempts >= max) break :blk 0;
-                break :blk (max - self.phase_attempts) / fps;
-            },
-            else => null,
-        };
+        if (self.phase_deadline_ms == 0) return null;
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        const remaining_ms: i64 = self.phase_deadline_ms - now;
+        if (remaining_ms <= 0) return 0;
+        return @intCast(@divTrunc(remaining_ms, 1000));
+    }
+
+    /// Set the deadline for the current phase to `now + duration_ms` and
+    /// record the phase start time (for the countdown). Pass 0 to clear.
+    fn setPhaseTimeout(self: *NetplaySession, duration_ms: i64) void {
+        if (duration_ms == 0) {
+            self.phase_deadline_ms = 0;
+            self.phase_start_ms = 0;
+            return;
+        }
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        self.phase_start_ms = now;
+        self.phase_deadline_ms = now + duration_ms;
+    }
+
+    /// True if the current phase's wall-clock deadline has passed.
+    fn phaseTimedOut(self: *const NetplaySession) bool {
+        if (self.phase_deadline_ms == 0) return false;
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        return now >= self.phase_deadline_ms;
     }
 
     fn setError(self: *NetplaySession, msg: []const u8) void {
@@ -212,7 +242,7 @@ pub const NetplaySession = struct {
         self.config.remote_player = 2;
         self.config.peer_port = port;
         self.state = .listening;
-        self.phase_attempts = 0;
+        self.setPhaseTimeout(listen_timeout_ms);
         try self.transport.listen(port, self.log);
         self.log.info("Waiting for opponent to connect on port {d}...", .{port});
     }
@@ -228,7 +258,7 @@ pub const NetplaySession = struct {
         const addr_copy_len = @min(host_str.len, self.config.peer_addr.len);
         @memcpy(self.config.peer_addr[0..addr_copy_len], host_str[0..addr_copy_len]);
         self.state = .connecting;
-        self.phase_attempts = 0;
+        self.setPhaseTimeout(connect_timeout_ms);
         try self.transport.connect(host_str, port, self.log);
     }
 
@@ -261,40 +291,34 @@ pub const NetplaySession = struct {
     }
 
     fn stepListening(self: *NetplaySession) void {
-        // 1 hour timeout = 216000 frames at 60fps
-        if (self.phase_attempts >= 216000) {
+        if (self.phaseTimedOut()) {
             self.setError("Connection timed out (no opponent connected in 1 hour)");
             self.state = .failed;
             return;
         }
-        self.phase_attempts += 1;
 
         if (self.transport.poll(0)) |event| {
             if (event == .connected) {
                 self.log.info("Opponent connected!", .{});
                 self.recordPeerAddress();
                 self.state = .handshaking;
-                self.phase_attempts = 0;
                 self.startVersionExchange();
             }
         }
     }
 
     fn stepConnecting(self: *NetplaySession) void {
-        // 30s timeout = 1800 frames at 60fps.
-        if (self.phase_attempts >= 1800) {
+        if (self.phaseTimedOut()) {
             self.setError("Failed to connect to host (30s timeout)");
             self.state = .failed;
             return;
         }
-        self.phase_attempts += 1;
 
         if (self.transport.poll(0)) |event| {
             if (event == .connected) {
                 self.log.info("Connected to host!", .{});
                 self.recordPeerAddress();
                 self.state = .handshaking;
-                self.phase_attempts = 0;
                 self.startVersionExchange();
             }
         }
@@ -310,7 +334,7 @@ pub const NetplaySession = struct {
         @memcpy(ver_buf[2 .. 2 + ver_len], self.local_version[0..ver_len]);
         _ = self.transport.sendReliable(ver_buf[0 .. 2 + ver_len]);
         self.log.info("Sent version: {s}", .{self.local_version});
-        self.phase_attempts = 0;
+        self.setPhaseTimeout(version_timeout_ms);
     }
 
     fn stepHandshaking(self: *NetplaySession) void {
@@ -324,13 +348,11 @@ pub const NetplaySession = struct {
     }
 
     fn stepExchangeVersion(self: *NetplaySession) void {
-        // 5s timeout = 300 frames.
-        if (self.phase_attempts >= 300) {
+        if (self.phaseTimedOut()) {
             self.setError("Version exchange timed out");
             self.state = .failed;
             return;
         }
-        self.phase_attempts += 1;
 
         if (self.transport.poll(0)) |event| {
             if (event == .message_received) {
@@ -347,7 +369,6 @@ pub const NetplaySession = struct {
                     }
                     // Move to name exchange.
                     self.handshake_subphase = 1;
-                    self.phase_attempts = 0;
                     self.startNameExchange();
                 }
             }
@@ -372,18 +393,18 @@ pub const NetplaySession = struct {
         @memcpy(buf[3 + name_len .. 3 + name_len + ct_len], conn_type[0..ct_len]);
         _ = self.transport.sendReliable(buf[0 .. 3 + name_len + ct_len]);
         self.log.info("Sent display name: '{s}' (conn: {s})", .{ local, conn_type });
+        self.setPhaseTimeout(name_timeout_ms);
     }
 
     fn stepExchangeNames(self: *NetplaySession) void {
-        // 5s timeout = 300 frames. Name exchange is best-effort.
-        if (self.phase_attempts >= 300) {
+        // Name exchange is best-effort — on timeout we continue with an
+        // empty remote name rather than failing the handshake.
+        if (self.phaseTimedOut()) {
             self.log.warn("Name exchange timed out — continuing with empty remote name", .{});
             self.handshake_subphase = 2;
-            self.phase_attempts = 0;
             self.startPingExchange();
             return;
         }
-        self.phase_attempts += 1;
 
         if (self.transport.poll(0)) |event| {
             if (event == .message_received) {
@@ -406,7 +427,6 @@ pub const NetplaySession = struct {
 
                     self.log.info("Peer display name: '{s}' (conn: {s})", .{ self.remoteName(), self.remoteConnectionType() });
                     self.handshake_subphase = 2;
-                    self.phase_attempts = 0;
                     self.startPingExchange();
                 }
             }
@@ -420,7 +440,6 @@ pub const NetplaySession = struct {
     fn startPingExchange(self: *NetplaySession) void {
         self.state = .ping_exchanging;
         self.ping_index = 0;
-        self.ping_waited = 0;
         self.sendOnePing();
     }
 
@@ -430,12 +449,15 @@ pub const NetplaySession = struct {
         ping_msg[0] = @intFromEnum(Msg.ping);
         std.mem.writeInt(u64, ping_msg[1..9], @intCast(self.ping_start_ms), .little);
         _ = self.transport.sendReliable(&ping_msg);
-        self.ping_waited = 0;
+        // `ping_start_ms` doubles as the per-ping deadline anchor.
+        // stepPingExchanging checks (now - ping_start_ms) >= 833ms.
     }
 
     fn stepPingExchanging(self: *NetplaySession) void {
-        // Each ping waits up to 50 frames (~833ms) for a pong.
-        if (self.ping_waited >= 50) {
+        // Each ping waits up to ~833 ms for a pong. Wall-clock based so
+        // the per-ping timeout is correct regardless of UI frame rate.
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        if (now - self.ping_start_ms >= ping_per_attempt_timeout_ms) {
             // Timeout on this ping — move to next.
             self.ping_index += 1;
             if (self.ping_index >= 5) {
@@ -445,7 +467,6 @@ pub const NetplaySession = struct {
             self.sendOnePing();
             return;
         }
-        self.ping_waited += 1;
 
         if (self.transport.poll(0)) |event| {
             if (event == .message_received) {
@@ -496,10 +517,14 @@ pub const NetplaySession = struct {
         // - Client: wait for the host's config message (subphase 3).
         if (self.config.is_host) {
             self.state = .waiting_confirmation;
+            // No active deadline while we wait for the user to click Start.
+            self.setPhaseTimeout(0);
             self.log.info("Handshake complete — waiting for host to confirm start", .{});
         } else {
             self.handshake_subphase = 3;
-            self.phase_attempts = 0;
+            // Client waits for host's config — no explicit timeout (the
+            // transport-level heartbeat will catch a stale peer).
+            self.setPhaseTimeout(0);
             self.state = .handshaking;
         }
     }
@@ -518,12 +543,13 @@ pub const NetplaySession = struct {
     }
 
     fn stepExchangeConfig(self: *NetplaySession) void {
-        if (self.config.is_host and self.phase_attempts >= 1800) {
+        // Host waits up to 30 s for the client's confirm. Client has no
+        // explicit timeout — the transport heartbeat catches a stale host.
+        if (self.config.is_host and self.phaseTimedOut()) {
             self.setError("Client never confirmed config (30s timeout)");
             self.state = .failed;
             return;
         }
-        self.phase_attempts += 1;
 
         if (self.transport.poll(0)) |event| {
             if (event == .message_received) {
@@ -585,7 +611,7 @@ pub const NetplaySession = struct {
         self.sendConfigMessage();
         // Move to config-exchange sub-phase to wait for client confirm.
         self.handshake_subphase = 3;
-        self.phase_attempts = 0;
+        self.setPhaseTimeout(host_wait_confirm_timeout_ms);
         self.state = .handshaking;
         self.log.info("Host confirmed — sent config, waiting for client confirm (delay={d})", .{self.config.delay});
     }

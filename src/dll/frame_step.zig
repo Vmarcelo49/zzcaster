@@ -181,6 +181,19 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     }
 
     if (n.isRerunning()) {
+        // During a rollback re-run, the game still reads inputs from its
+        // input buffer each frame. We MUST write the corrected local +
+        // remote inputs to the game's input struct so the re-run replays
+        // with the actual inputs (not the stale predicted ones that were
+        // saved into the StatePool snapshot). Without this, the entire
+        // point of rollback — re-simulating with corrected inputs — is
+        // defeated.
+        //
+        // The legacy CCCaster calls writeGameInputs at the end of every
+        // frame, including re-run frames (DllMain.cpp's frameStepNormal
+        // → frameStepRerun). The Zig port's early `return` here was a
+        // regression that broke rollback correctness.
+        n.writeGameInputs();
         _ = n.checkRerunComplete();
         return;
     }

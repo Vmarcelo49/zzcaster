@@ -384,7 +384,21 @@ fn applyPostLoadHacks() void {
     }
     damage_level_addr.* = 2;
     timer_speed_addr.* = 2;
-    win_count_vs_addr.* = 2;
+    // Write the user-configured win count to the game's "best-of-N" address
+    // (CC_WIN_COUNT_VS_ADDR = 0x553FDC). The launcher's Game Config page
+    // sends `win_count` via the IPC config payload, NetplayManager.configure
+    // stores it in `config.win_count`. For offline training, `state.nm` is
+    // null and win_count is meaningless — fall back to 2 (best-of-3).
+    //
+    // The previous code hardcoded `2`, which silently ignored the user's
+    // Game Config selection (the value was negotiated through the launcher
+    // handshake → IPC → DLL config struct, then thrown away).
+    const win_count: u32 = if (is_netplay and state.nm != null)
+        state.nm.?.config.win_count
+    else
+        2;
+    win_count_vs_addr.* = win_count;
+    state.log.?.info("win_count_vs set to {d}", .{win_count});
 
     // SDL_Init is deferred to initSdlOnMainThread (see below) — SDL is not
     // thread-safe and must run on the main thread.

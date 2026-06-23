@@ -208,9 +208,11 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         // defeated.
         //
         // The legacy CCCaster calls writeGameInputs at the end of every
-        // frame, including re-run frames (DllMain.cpp's frameStepNormal
-        // → frameStepRerun). The Zig port's early `return` here was a
-        // regression that broke rollback correctness.
+        // frame, including re-run frames (DllMain.cpp's `frameStep` calls
+        // either `frameStepRerun` or `frameStepNormal` based on
+        // `fastFwdStopFrame`, then unconditionally writes inputs at lines
+        // 988-989). The Zig port's early `return` here was a regression
+        // that broke rollback correctness.
         n.writeGameInputs();
         _ = n.checkRerunComplete();
         return;

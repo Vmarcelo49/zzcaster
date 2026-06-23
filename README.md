@@ -6,21 +6,6 @@ launcher and DLL injector for **MELTY BLOOD Actress Again Current Code**
 
 Why the name? First Z from Zig the programming language, second from Z.ai which this project used(almost by its entirety).
 
-## Credits
-
-ZZCaster is a from-scratch rewrite of the CCCaster fork of **Rhekar**.
-The original project is a C++ Win32 application that has
-served the MBAACC community for years. This Zig port aims to modernize the
-codebase while preserving the same netcode algorithm and game compatibility.
-
-**Original project:** https://github.com/Rhekar/CCCaster
-
-Key components ported from the original:
-- Game memory addresses and ASM hacks (from `legacy_unused/targets/DllAsmHacks.cpp`)
-- Rollback state pool and SFX dedup (from `DllRollbackManager.cpp`)
-- Netplay state machine and input synchronization (from `DllNetplayManager.cpp`)
-- Spectator chain forwarding (from `SpectatorManager.cpp`)
-- Rollback memory regions (from `Generator.cpp`)
 
 ## What ZZCaster Does
 
@@ -90,56 +75,21 @@ A window opens with a sidebar menu:
   optional Air Dash Macro (see below). Saved to `mapping.ini` and loaded by
   `hook.dll` on game start.
 
+
+
+## New Features
+
 #### Air Dash Macro
 
-An optional input transform, enabled per-player in the **Controllers** tab
+An optional input macro, enabled per-player in the **Controllers** tab
 (off by default). When enabled, pressing `9AB` (up-forward + A+B) or `7AB`
-(up-back + A+B) is expanded into a 2-frame sequence — a jump on frame N
-followed by an air-dash on frame N+1 — before the input reaches the game.
-This helps players who can't reliably hit the 1-frame jump→dash window.
+(up-back + A+B) will perform a forward or backwards jump then an air dash.
 
-The transform runs before inputs enter the rollback InputBuffer, so in
-netplay the expanded sequence is what's sent to the peer and replayed by
-rollback re-runs; only the local client needs it enabled. Holding `9AB`
-across multiple frames produces alternating jump/dash cycles (one sequence
-every 2 frames). See `docs/air-dash-macro-design.md` for full design
-details.
+#### Wi-fi Indicator
 
-### CLI (non-interactive)
+When you play online, you can see if your opponent is using wifi or wired.
 
-```bash
-zzcaster.exe --mode=training
-zzcaster.exe --mode=versus
-zzcaster.exe --mode=host --port=46318
-zzcaster.exe --mode=join --peer=1.2.3.4:46318
-zzcaster.exe --mode=spectate --peer=1.2.3.4:46318
-```
 
-## Architecture
-
-```
-zzcaster.exe (launcher, 32-bit)
-  ├── Creates MBAA.exe suspended
-  ├── Injects hook.dll via CreateRemoteThread
-  ├── Sends config via named pipe IPC
-  └── Monitors process exit
-
-hook.dll (injected, 32-bit)
-  ├── DllMain: applies ASM hacks, connects IPC, inits SDL2
-  ├── frameStep (called every game frame via patched main loop):
-  │   ├── Reads local input (gamepad/keyboard)
-  │   ├── Sends inputs to peer via ENet (UDP)
-  │   ├── Receives remote inputs via ENet
-  │   ├── Lockstep wait (blocks until remote input ready)
-  │   ├── Rollback check (if remote input differs from prediction):
-  │   │   ├── Load saved game state from StatePool
-  │   │   ├── Set CC_SKIP_FRAMES=1 (skip rendering during re-run)
-  │   │   └── Re-run frames with corrected inputs
-  │   ├── Save current state to StatePool
-  │   └── Write both players' inputs to game memory
-  └── StatePool: saves/restores ~750KB of game memory per frame
-      (player structs, effects, camera, RNG, timers)
-```
 
 ### Netcode
 
@@ -163,19 +113,6 @@ closed-source binary-patched game):
    (player positions, health, velocities, effects, camera, RNG, timers)
    every frame. On rollback, the closest saved state is restored via memcpy.
 
-### Network protocol (ENet)
-
-| Channel | Type | Purpose |
-|---------|------|---------|
-| 0 | Reliable | RNG state sync, TransitionIndex (round change) |
-| 1 | Unreliable | Player inputs (30 frames per packet) |
-| 2 | Unreliable | Spectator BothInputs broadcast |
-
-Message types (1-byte tag prefix):
-- `0x01` — Player inputs: `[start_frame][index][N×2 inputs]`
-- `0x02` — RNG state: `[index][rng0][rng1][rng2][rng3(220 bytes)]`
-- `0x03` — TransitionIndex: `[index]` (sent on every round/state change)
-- `0x20` — BothInputs (spectator): `[frame][index][N×4 (P1+P2 inputs)]`
 
 ## Dependencies
 
@@ -186,29 +123,6 @@ Message types (1-byte tag prefix):
 | [cimgui](https://github.com/cimgui/cimgui) | master | MIT | C API wrapper for ImGui |
 | [SDL2](https://github.com/libsdl-org/SDL) | 2.32.10 | zlib | Window, input, gamepad |
 
-## Project layout
-
-```
-src/
-├── main.zig              # Entry point + CLI parsing
-├── ui.zig                # ImGui UI (SDL2 window + render loop)
-├── cimgui_shim.h         # Minimal C declarations for ImGui functions
-├── imgui_backend_wrap.cpp # C-linkage wrappers for ImGui SDL2/OpenGL3 backends
-├── config.zig            # INI config parser
-├── logging.zig           # File logger
-├── ipc.zig               # Named-pipe IPC (launcher ↔ hook.dll)
-├── launcher.zig          # CreateProcess + DLL injection (Win32)
-├── net.zig               # ENet transport wrapper
-├── session.zig           # Netplay session FSM (version handshake, pings)
-├── gamepad.zig           # SDL2 gamepad/keyboard reader
-├── keyboard.zig          # Win32 GetKeyState (in-game keyboard)
-├── rollback.zig          # InputBuffer + StatePool (with FPU env save)
-├── rollback_regions.zig  # Memory regions to save/restore (ported from Generator.cpp)
-├── dllmain.zig           # hook.dll entry: DllMain + frame loop + ASM hacks
-├── netplay_manager.zig   # Per-frame netplay state machine
-├── sfx_dedup.zig         # SFX dedup (rollback re-run audio cancellation)
-├── spectator_manager.zig # Spectator chain forwarding
-```
 
 ## Cross-compilation
 
@@ -217,6 +131,22 @@ ZZCaster cross-compiles from Linux to Windows. Both `hook.dll` and
 32-bit binary so `hook.dll` MUST be 32-bit; the launcher is also 32-bit
 so the two artifacts share types and ABI for the IPC config struct.
 The build script rejects any non-x86 Windows target with a clear error.
+
+## Credits
+
+ZZCaster is a from-scratch rewrite of the CCCaster fork of **Rhekar**.
+The original project is a C++ Win32 application that has
+served the MBAACC community for years. This Zig port aims to modernize the
+codebase while preserving the same netcode algorithm and game compatibility.
+
+**Original project:** https://github.com/Rhekar/CCCaster
+
+Key components ported from the original:
+- Game memory addresses and ASM hacks (from `legacy_unused/targets/DllAsmHacks.cpp`)
+- Rollback state pool and SFX dedup (from `DllRollbackManager.cpp`)
+- Netplay state machine and input synchronization (from `DllNetplayManager.cpp`)
+- Spectator chain forwarding (from `SpectatorManager.cpp`)
+- Rollback memory regions (from `Generator.cpp`)
 
 ## License
 

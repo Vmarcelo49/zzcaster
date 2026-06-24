@@ -1440,6 +1440,13 @@ pub const NetplayManager = struct {
             self.rng_send_cooldown = 0;
             self.rng_send_count = 0;
             self.should_sync_rng = true;
+            // Re-enable the defense-in-depth gate in syncRngState so the
+            // host actually sends (and the client accepts) the RNG state
+            // for round 1. Without this, intro_rng_enabled stays false from
+            // the prior chara_select transition (line below) and syncRngState
+            // silently no-ops every frame. Rounds 2+ are handled separately
+            // by checkIntroDone when game_state == 99.
+            self.intro_rng_enabled = true;
         }
 
         if (new == .loading or new == .chara_select) {
@@ -1480,12 +1487,13 @@ pub const NetplayManager = struct {
     pub fn maybeSendSyncHash(self: *NetplayManager) void {
         if (!self.enet_connected) return;
         if (self.config.is_spectator) return; // spectators don't initiate sync
-        // Only meaningful from CharaSelect onward.
-        const state_val = @intFromEnum(self.state);
-        if (state_val < @intFromEnum(NetplayState.chara_select)) return;
-        // Legacy excludes these states: no stable state to hash there.
-        if (self.state == .loading or self.state == .chara_intro or
-            self.state == .skippable or self.state == .retry_menu) return;
+        // Only meaningful during `.in_game`. Legacy CCCaster gates the hash
+        // check on InGame because the RNG state is explicitly synced at the
+        // `chara_intro → in_game` boundary; pre-in_game RNG draws are not
+        // guaranteed to be deterministic across peers (cursor animation,
+        // music selection, particle effects all touch RNG) and would
+        // produce false-positive desyncs. Mirrors the legacy exclusion.
+        if (self.state != .in_game) return;
 
         const frame = self.indexed_frame.frame;
         const due_period = (frame % sync_send_period == 0);
@@ -1542,6 +1550,11 @@ pub const NetplayManager = struct {
     /// Called once per frame; safe to call when queues are empty.
     pub fn checkSyncHashDesync(self: *NetplayManager) void {
         if (self.desync_detected) return; // already flagged
+        // Only meaningful during `.in_game` — matches the maybeSendSyncHash
+        // gate. Without this, any hashes enqueued in chara_select (where the
+        // RNG is not yet synced and not guaranteed deterministic) would
+        // produce spurious desyncs at the first 150-frame check.
+        if (self.state != .in_game) return;
         if (self.local_sync_count == 0 or self.remote_sync_count == 0) return;
 
         // Walk both queues in indexed_frame order, dropping entries that have

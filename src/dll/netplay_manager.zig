@@ -1665,9 +1665,33 @@ pub const NetplayManager = struct {
     /// Called when we receive a TransitionIndex message from the remote peer.
     /// Records their current transition index so isRemoteInputReady can
     /// decide whether to wait or predict.
+    ///
+    /// In addition to storing `remote_idx` for diagnostics, this MUST resize
+    /// the remote input container's outer dimension so that `getEndIndex()`
+    /// reflects the remote's new index. This mirrors CCCaster's
+    /// `NetplayManager::setRemoteIndex` (DllNetplayManager.cpp:1130-1138):
+    ///   _inputs[_remotePlayer - 1].resize ( remoteIndex - _startIndex, 0, 0 );
+    ///
+    /// Without the resize, the local peer's `isRemoteInputReady()` would not
+    /// see the remote's transition until the first `PlayerInputs` for the new
+    /// index arrives. In the "fast peer enters InGame, slow peer still in
+    /// CharaIntro" scenario, the fast peer's wait loop would correctly block
+    /// — but if the slow peer's `TransitionIndex(InGame)` arrives BEFORE its
+    /// first InGame `PlayerInputs`, the fast peer's `remote_end_index` would
+    /// NOT update, and once the slow peer's first InGame `PlayerInputs` did
+    /// arrive, the container's `end_index` would jump straight to that index
+    /// without the intermediate "remote has reached InGame, awaiting frames"
+    /// state that CCCaster relies on for its prediction-vs-wait decision.
+    ///
+    /// The `remote_index` field is retained for diagnostics but is now also
+    /// used to drive the resize — previously it was dead code (written but
+    /// never read).
     pub fn setRemoteIndex(self: *NetplayManager, remote_idx: u32) void {
         self.remote_index = remote_idx;
-        self.log.info("Remote transition index: {d}", .{remote_idx});
+        self.remote_inputs.resizeOuter(remote_idx);
+        self.log.info("Remote transition index: {d} (remote_inputs.end_index now {d})", .{
+            remote_idx, self.remote_inputs.getEndIndex(),
+        });
     }
 
     fn packedIndexedFrame(self: *const NetplayManager) u64 {

@@ -79,6 +79,39 @@ pub const InputBuffer = struct {
         self.last_changed_frame = null;
     }
 
+    /// Grow the outer dimension so that `index` is considered "reached" by
+    /// the remote peer, without populating any actual inputs for that index.
+    /// Mirrors CCCaster's `InputsContainer::resize(index, 0, 0)` called from
+    /// `NetplayManager::setRemoteIndex` (DllNetplayManager.cpp:1130-1138):
+    ///   _inputs[_remotePlayer - 1].resize ( remoteIndex - _startIndex, 0, 0 );
+    ///
+    /// This is what makes the local peer's `isRemoteInputReady()` see that the
+    /// remote peer has advanced to `index` even before any `PlayerInputs` for
+    /// that index has arrived. Without this, a lost `PlayerInputs` at the new
+    /// index (UDP-unreliable) combined with a lost/delayed `TransitionIndex`
+    /// (also unreliable in CCCaster) would leave the local container's
+    /// `end_index` stuck at the old value, and the local peer would wait
+    /// indefinitely for the remote to "catch up" even though the remote has
+    /// already moved on.
+    ///
+    /// In zzcaster's hashmap-based container there is no explicit "outer
+    /// vector"; the equivalent is to bump `end_index` and ensure `end_frames`
+    /// has an entry for `index` (defaulting to 0 = "no frames yet"). The
+    /// `last_inputs` map is NOT updated — there are no inputs at this index
+    /// yet, so `get(index, frame)` will fall through to the previous index's
+    /// last input via `lastInputBefore` logic in `get()`.
+    pub fn resizeOuter(self: *InputBuffer, index: u32) void {
+        // Bump end_index so getEndIndex() reports the remote has reached `index`.
+        if (index >= self.end_index) self.end_index = index + 1;
+        // Ensure end_frames has an entry for `index` (0 = no frames populated).
+        // Without this, getEndFrame(index) returns 0 via `.orelse 0`, which is
+        // correct, but having the entry present makes the "remote has reached
+        // this index but sent no frames yet" state explicit and inspectable.
+        if (!self.end_frames.contains(index)) {
+            self.end_frames.put(index, 0) catch {};
+        }
+    }
+
     pub fn getEndFrame(self: *const InputBuffer, index: u32) u32 {
         return self.end_frames.get(index) orelse 0;
     }

@@ -127,21 +127,50 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
-    // Lockstep wait for the remote's input. Skipped entirely while still
-    // connecting (the lazy-reconnect block above handles that). After connect,
-    // force-exit after 10s (matches CCCaster's MAX_WAIT_INPUTS_INTERVAL).
-    if (!n.enet_connected) {
-        n.writeGameInputs();
-        return;
-    }
-
+    // Lockstep wait for the remote's input.
+    //
+    // CCCaster's wait loop (DllMain.cpp:540-581) runs unconditionally inside
+    // `frameStepNormal()` — it does NOT skip when the socket is disconnected.
+    // When the remote hasn't connected yet, `isRemoteInputReady()` returns
+    // false (the remote input container is empty), so the loop blocks the
+    // game's main thread until the remote connects AND sends its first
+    // `PlayerInputs` for the current transition index. This is the mechanism
+    // that prevents the "fast peer enters gameplay before slow peer" desync:
+    // the faster peer's game freezes on InGame frame 0.
+    //
+    // The previous zzcaster code short-circuited this with:
+    //   if (!n.enet_connected) { n.writeGameInputs(); return; }
+    // which let the game run at FULL SPEED with no synchronization whenever
+    // ENet hadn't connected yet. This was the root cause of the user's bug:
+    // the lazy ENet reconnect (frame_step.zig:18-36) takes up to 15s, and if
+    // either peer reached InGame frame 0 during that window, the game would
+    // advance without waiting for the remote peer — causing the match to
+    // terminate or desync immediately.
+    //
+    // The fix: enter the wait loop unconditionally. The loop already polls
+    // ENet via `pollAndDispatch(10)`, which processes CONNECT events and
+    // establishes the connection. The 10s hard timeout only starts counting
+    // AFTER ENet connects — before that, the wait is bounded by the 15s
+    // lazy-reconnect cap (frame_step.zig:24). This matches CCCaster's
+    // behavior: the 10s `MAX_WAIT_INPUTS_INTERVAL` is a timeout on remote
+    // INPUT, not on socket connectivity.
     if (!n.isRemoteInputReady()) {
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
+        var connected_since: i64 = 0; // 0 = not yet connected
         var last_resend = wait_start;
         var warned = false;
         while (!n.isRemoteInputReady()) {
             n.pollAndDispatch(10);
             const now = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
+
+            // Track when ENet first connected so the 10s input-wait timeout
+            // only counts time AFTER connectivity is established. This prevents
+            // the timeout from firing while the lazy reconnect is still in
+            // progress (up to 15s), which would kill the match before the peer
+            // even has a chance to connect.
+            if (connected_since == 0 and n.enet_connected) {
+                connected_since = now;
+            }
 
             if (now - last_resend > 100) {
                 n.sendLocalInputs();
@@ -180,13 +209,32 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             }
 
             if (!warned and now - wait_start > 5000) {
-                state.log.?.warn("Waiting for remote input... (5s elapsed)", .{});
+                state.log.?.warn("Waiting for remote input... (5s elapsed, enet_connected={})", .{
+                    n.enet_connected,
+                });
                 warned = true;
             }
 
-            // TIMEOUT after 10s — force exit (matches CCCaster)
-            if (now - wait_start > 10000) {
-                state.log.?.err("Timed out waiting for remote input (10s) — forcing exit", .{});
+            // TIMEOUT after 10s of ENet connectivity without remote input —
+            // force exit (matches CCCaster's MAX_WAIT_INPUTS_INTERVAL).
+            //
+            // The timeout only fires AFTER ENet has connected. If ENet is
+            // still in the lazy-reconnect window (up to 15s), we keep waiting
+            // — the reconnect cap (frame_step.zig:24) will eventually either
+            // connect or exhaust attempts, at which point the next iteration
+            // will either get remote input or hit this timeout.
+            if (connected_since != 0 and now - connected_since > 10000) {
+                state.log.?.err("Timed out waiting for remote input (10s after connect) — forcing exit", .{});
+                state.alive_flag_addr.* = 0;
+                return;
+            }
+
+            // If the lazy reconnect gave up (connect_attempts_exhausted) and
+            // we still don't have a connection, the peer is unreachable. Don't
+            // block the game forever — force-exit so the user sees a clean
+            // termination instead of a permanent hang.
+            if (n.connect_attempts_exhausted and !n.enet_connected) {
+                state.log.?.err("ENet reconnect exhausted and peer unreachable — forcing exit", .{});
                 state.alive_flag_addr.* = 0;
                 return;
             }

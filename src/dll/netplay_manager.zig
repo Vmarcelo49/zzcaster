@@ -1495,6 +1495,27 @@ pub const NetplayManager = struct {
         // produce false-positive desyncs. Mirrors the legacy exclusion.
         if (self.state != .in_game) return;
 
+        // CRITICAL: Do not capture/send a SyncHash until RNG is synced for
+        // this round. Without this gate, the SyncHash fires at frame 0 of a
+        // new index (because `frame % sync_send_period == 0` is true when
+        // frame==0), which is BEFORE the client has received and applied the
+        // host's RNG packet for that index. The result: the host captures
+        // its authoritative RNG, the client captures its stale local RNG,
+        // and checkSyncHashDesync immediately flags a "RNG hash mismatch"
+        // desync — even though both sides will agree on RNG a few frames
+        // later once the packet arrives.
+        //
+        // `rng_synced` is set:
+        //   - On the client, by `applyRemoteRng` when the host's RNG packet
+        //     is received and written to game memory.
+        //   - On the host, by `confirmRngAck` when the client's RNG_ACK
+        //     arrives (proving the client has applied the RNG).
+        // Both sides reset `rng_synced = false` in `onStateTransition` and
+        // `checkIntroDone`, so this gate correctly blocks SyncHash for the
+        // first few frames of every round/index until the RNG exchange
+        // completes. The missed frame-0 SyncHash is harmless — the next
+        // one fires at frame 149 (or 300).
+        if (self.should_sync_rng and !self.rng_synced) return;
         const frame = self.indexed_frame.frame;
         const due_period = (frame % sync_send_period == 0);
         const due_149 = (frame % 150 == 149);

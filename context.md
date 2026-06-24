@@ -331,8 +331,14 @@ Message types (1-byte tag prefix):
   - Misc globals (timers, RNG, camera, effects, HUD)
   - 4× player structs (P1, P2, Puppet1, Puppet2) at 0x555130 + offset
   - Effects array (1000 elements × 0x33C bytes, saved as one contiguous block)
-- FPU environment save/restore via `fnstenv`/`fldenv` (x86 only, guarded by
-  `builtin.cpu.arch == .x86`)
+- FPU control-word save/restore via `fnstcw`/`fldcw` (x87 control word) and
+  `stmxcsr`/`ldmxcsr` (SSE MXCSR). x86 only, guarded by
+  `builtin.cpu.arch == .x86`. We deliberately do NOT use `fnstenv`/`fldenv`
+  — those restore the FPU stack TOP pointer and tag word from a stale
+  snapshot, which corrupts the FPU stack on rollback restore and crashes
+  the game with a #SF (stack fault) exception on the next `fild`. This
+  matches the behavior of CCCaster's `fegetenv`/`fesetenv` (which on
+  MinGW-w64 i686 only round-trips the control word + status word).
 - `loadStateForFrame(target_frame, target_index)` — finds the saved state
   closest to the target frame and restores all memory regions
 - Also supports loading regions from `res/rollback.bin` (binary format)

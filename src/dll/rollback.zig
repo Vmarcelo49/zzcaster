@@ -139,11 +139,40 @@ pub const MemoryRegion = struct {
     size: usize,
 };
 
+// FPU state snapshot — only what affects determinism.
+//
+// We save and restore the x87 control word (rounding mode, exception masks,
+// precision control) and the SSE MXCSR (control + status, since MBAACC is
+// built with -msse2). We deliberately do NOT touch:
+//   - the x87 data registers st(0)..st(7)
+//   - the x87 tag word
+//   - the x87 TOP pointer (stack top, bits 12-14 of the status word)
+//
+// Why: the previous implementation used `fnstenv`/`fldenv`, which save and
+// restore the FULL 28-byte x87 environment including TOP and the tag word.
+// On rollback restore, `fldenv` would write back a STALE TOP pointer captured
+// at save time. When the game's MBAACC code then executed `fild` instructions
+// (e.g. at 0x410721 in the per-frame character update), the FPU thought the
+// stack was non-empty and raised a #SF (stack fault) exception — crashing
+// both peers with "floating point stack check" as soon as the first rollback
+// fired after entering `in_game`.
+//
+// CCCaster's legacy C++ avoids this by using `fegetenv`/`fesetenv` from
+// <cfenv>. On MinGW-w64 i686, `fenv_t` is only 8 bytes (control word +
+// status word) and MinGW's `fesetenv` internally masks the TOP bits during
+// restore, leaving the FPU stack pointer untouched. Our `fnstcw`/`fldcw` +
+// `stmxcsr`/`ldmxcsr` approach is functionally equivalent and strictly safer
+// (no chance of restoring a stale TOP).
+pub const SavedFpu = struct {
+    cw: u16, // x87 control word
+    mxcsr: u32, // SSE control/status word
+};
+
 // Saved game state
 pub const SavedState = struct {
     frame: u32,
     index: u32,
-    fpu_env: [28]u8, // x87 FPU environment save area (28-byte fnstenv/fldenv layout)
+    fpu_env: SavedFpu, // x87 cw + SSE MXCSR only (see SavedFpu doc)
     data: []u8, // contiguous buffer for all memory regions
 };
 
@@ -245,16 +274,12 @@ pub const StatePool = struct {
             pos += r.size;
         }
 
-        // Save FPU environment (critical for deterministic re-simulation).
-        // fnstenv/fldenv are x87-only; we guard with `builtin.cpu.arch == .x86`
-        // (32-bit only). On x86_64 host builds (e.g. unit tests) we skip — the
-        // real DLL target is always 32-bit x86 anyway.
-        var fpu_env: [28]u8 = undefined;
-        if (builtin.cpu.arch == .x86) {
-            saveFpu(&fpu_env);
-        } else {
-            @memset(&fpu_env, 0);
-        }
+        // Save FPU control state (cw + MXCSR only — see SavedFpu doc).
+        // saveFpu() handles the arch guard internally: on non-x86 hosts
+        // (e.g. x86_64 unit-test runners) it writes benign defaults and
+        // restoreFpu() becomes a no-op.
+        var fpu_env: SavedFpu = undefined;
+        saveFpu(&fpu_env);
 
         // Store metadata
         self.saved_states.append(self.allocator, .{
@@ -273,10 +298,9 @@ pub const StatePool = struct {
         const state = self.saved_states.items[slot];
         const src = state.data;
 
-        // Restore FPU environment FIRST (before any float ops)
-        if (builtin.cpu.arch == .x86) {
-            restoreFpu(&state.fpu_env);
-        }
+        // Restore FPU control state FIRST (before any float ops).
+        // restoreFpu() handles the arch guard internally.
+        restoreFpu(&state.fpu_env);
 
         // Restore all memory regions
         var pos: usize = 0;
@@ -339,21 +363,51 @@ pub const StatePool = struct {
     // rather than reviving this binary-file code path.
 };
 
-fn saveFpu(out: *[28]u8) void {
-    // fnstenv writes the 28-byte x87 environment to the memory operand.
-    // The "=m" constraint marks `buf` as a write-only output so the
-    // compiler knows the asm modifies it.
-    var buf: [28]u8 = undefined;
-    asm volatile ("fnstenv %[fpu_env]"
-        : [fpu_env] "=m" (buf),
-    );
-    out.* = buf;
+// Save the FPU control state (x87 control word + SSE MXCSR).
+//
+// We intentionally use `fnstcw` (NOT `fnstenv`) and `stmxcsr` so that we
+// capture ONLY the control words that affect determinism. The x87 status
+// word (incl. TOP pointer), tag word, and data registers are NOT saved —
+// they describe transient execution state that should not be restored.
+//
+// On non-x86 hosts (e.g. x86_64 unit-test runners) we fall back to writing
+// the architecture's default control values so the SavedFpu struct is still
+// well-formed; restoreFpu() will be a no-op in that case.
+fn saveFpu(out: *SavedFpu) void {
+    if (builtin.cpu.arch == .x86) {
+        var cw: u16 = 0;
+        var mxcsr: u32 = 0;
+        asm volatile (
+            "fnstcw %[cw]\n\t"
+            "stmxcsr %[mxcsr]"
+            : [cw] "=m" (cw),
+              [mxcsr] "=m" (mxcsr),
+        );
+        out.cw = cw;
+        out.mxcsr = mxcsr;
+    } else {
+        // Defaults match what _fpreset / ldmxcsr would set on x86.
+        out.cw = 0x037F; // x87: 53-bit precision, round-to-nearest, all exceptions masked
+        out.mxcsr = 0x1F80; // SSE: all exceptions masked, round-to-nearest, no FZ/DAZ
+    }
 }
 
-fn restoreFpu(env: *const [28]u8) void {
-    const buf: [28]u8 = env.*;
-    asm volatile ("fldenv %[fpu_env]"
+// Restore the FPU control state (x87 control word + SSE MXCSR).
+//
+// Uses `fldcw` (NOT `fldenv`) and `ldmxcsr` so that ONLY the control words
+// are written. The x87 status word, tag word, TOP pointer, and data
+// registers are left untouched — eliminating the stale-TOP / FPU-stack-
+// overflow bug that the previous `fldenv`-based implementation triggered
+// on the first rollback after entering `in_game`.
+fn restoreFpu(env: *const SavedFpu) void {
+    if (builtin.cpu.arch != .x86) return;
+    var cw: u16 = env.cw;
+    var mxcsr: u32 = env.mxcsr;
+    asm volatile (
+        "fldcw %[cw]\n\t"
+        "ldmxcsr %[mxcsr]"
         :
-        : [fpu_env] "m" (buf),
+        : [cw] "m" (cw),
+          [mxcsr] "m" (mxcsr),
     );
 }

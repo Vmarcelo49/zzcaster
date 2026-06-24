@@ -378,8 +378,7 @@ fn saveFpu(out: *SavedFpu) void {
         var cw: u16 = 0;
         var mxcsr: u32 = 0;
         asm volatile (
-            "fnstcw %[cw]\n\t"
-            "stmxcsr %[mxcsr]"
+            "fnstcw %[cw]\n\tstmxcsr %[mxcsr]"
             : [cw] "=m" (cw),
               [mxcsr] "=m" (mxcsr),
         );
@@ -404,8 +403,7 @@ fn restoreFpu(env: *const SavedFpu) void {
     var cw: u16 = env.cw;
     var mxcsr: u32 = env.mxcsr;
     asm volatile (
-        "fldcw %[cw]\n\t"
-        "ldmxcsr %[mxcsr]"
+        "fldcw %[cw]\n\tldmxcsr %[mxcsr]"
         :
         : [cw] "m" (cw),
           [mxcsr] "m" (mxcsr),

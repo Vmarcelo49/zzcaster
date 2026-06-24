@@ -356,6 +356,21 @@ const rng_resend_period: u32 = 30;
 // DllMain.cpp:38.
 const rollback_round_over_delay: i32 = 5;
 
+// Size of the RNG state body: 4 bytes index + 4+4+4 bytes rng0/rng1/rng2 +
+// 220 bytes rng3 = 236 bytes. This is the payload that follows the 1-byte
+// type tag in the 0x02 RNG packet, and what `getCachedRngState` writes into
+// the caller's buffer.
+const rng_body_size: usize = 4 + 4 + 4 + 4 + rng_state3_size;
+
+// A cached RNG snapshot keyed by transition index. Used by the host to
+// forward the same RNG state it sent to the client on to spectators.
+// `valid` is false for unused slots.
+const CachedRngState = struct {
+    valid: bool = false,
+    index: u32 = 0,
+    body: [rng_body_size]u8 = [_]u8{0} ** rng_body_size,
+};
+
 pub const NetplayManager = struct {
     allocator: std.mem.Allocator,
 
@@ -409,6 +424,15 @@ pub const NetplayManager = struct {
     // `syncRngState` also gates on `intro_rng_enabled` as defense-in-depth.
     should_sync_rng: bool = false,
     rng_synced: bool = false,
+    // The transition index for which `rng_synced` was set. Used by
+    // `applyRemoteRng` to decide whether a received RNG packet is a re-send
+    // for the already-synced round (skip — idempotent) or a new round's RNG
+    // (apply — even if `rng_synced` is still true from the prior round).
+    // Without this, a spectator that synced index N and then receives
+    // index N+1's RNG (because the host sent it before the spectator's
+    // local state transition reset `rng_synced`) would wrongly skip the
+    // new round's RNG and desync.
+    rng_synced_index: u32 = 0,
 
     // RNG ack handshake: the host sends RNG state, but the peer must confirm
     // receipt before the host treats the sync as complete. The lazy-reconnect
@@ -429,6 +453,22 @@ pub const NetplayManager = struct {
     rng_send_count: u32 = 0, // diagnostic: how many times we sent
 
     intro_rng_enabled: bool = false,
+
+    // Host-side cache of the RNG state captured for each transition index.
+    // Populated by `syncRngState` when the host captures+sends RNG to the
+    // client. Looked up by `getCachedRngState` so the SpectatorManager can
+    // forward the same RNG state to spectators. Mirrors CCCaster's
+    // `NetplayManager::_rngStates` (DllNetplayManager.hpp:189), which is
+    // populated by the host at DllMain.cpp:523
+    // (`netMan.setRngState(msgRngState->getAs<RngState>())`) and read by
+    // `SpectatorManager::frameStepSpectators` at
+    // DllSpectatorManager.cpp:177 (`_netManPtr->getRngState(oldIndex)`).
+    //
+    // A small fixed-size ring is sufficient: the spectator is delayed by
+    // at most a few seconds (NUM_INPUTS * a few broadcast intervals), and
+    // the host's transition index advances slowly (once per round). We
+    // keep the last 8 indices' RNG states; older entries are overwritten.
+    cached_rng_states: [8]CachedRngState = [_]CachedRngState{.{}} ** 8,
 
     // Round-start detection: the detectRoundStart ASM hack (asm_hacks.zig)
     // increments a counter in DLL memory each time a round begins. We watch
@@ -644,6 +684,48 @@ pub const NetplayManager = struct {
                 // HELLO from spectator — promote to active.
                 const start_index: u32 = if (data.len >= 5) std.mem.readInt(u32, data[1..5], .little) else 0;
                 self.spectators.?.activateSpectator(peer, start_index);
+
+                // Send the host's cached RNG state to the newly-activated
+                // spectator, mirroring CCCaster's `SpectatorManager::pushSpectator`
+                // (DllSpectatorManager.cpp:70-85). Without this, the spectator
+                // would run without synchronized RNG until the next
+                // `frameStepSpectators` broadcast tick (which only fires on
+                // the broadcast pacing interval, not immediately).
+                //
+                // CCCaster selects the RNG index based on the host's current
+                // netplay state:
+                //   CharaSelect  →  spectator.pos.index          (the round they'll watch)
+                //   InGame/etc   →  spectator.pos.index + 2     (skip the current finishing round)
+                //   (training)   →  spectator.pos.index + 1     (training has no chara_intro round)
+                // The +2 for non-training accounts for the fact that a
+                // spectator joining mid-match is behind by ~1 index, and the
+                // current round is about to end — they need the NEXT round's RNG.
+                const rng_lookup_index: u32 = switch (self.state) {
+                    .chara_select => start_index,
+                    .loading, .chara_intro, .in_game, .skippable, .retry_menu => blk: {
+                        const offset: u32 = if (self.config.is_training) 1 else 2;
+                        break :blk start_index + offset;
+                    },
+                    .pre_initial, .initial => start_index,
+                };
+
+                var rng_buf: [1 + 4 + 4 + 4 + 4 + rng_state3_size]u8 = undefined;
+                rng_buf[0] = 0x02; // RNG state
+                if (self.getCachedRngState(rng_lookup_index, rng_buf[1..])) {
+                    if (peer) |p| {
+                        const pkt = enet.enet_packet_create(&rng_buf, rng_buf.len, enet.ENET_PACKET_FLAG_RELIABLE);
+                        if (pkt != null) {
+                            _ = enet.enet_peer_send(p, 0, pkt); // channel 0 = reliable
+                            enet.enet_host_flush(self.enet_host);
+                        }
+                    }
+                    self.log.info("Sent RNG state to new spectator at activation (index={d})", .{rng_lookup_index});
+                } else {
+                    // No cached RNG for this index yet — the spectator will
+                    // pick it up via `frameStepSpectators` on the next
+                    // broadcast tick once the host captures+sends RNG.
+                    self.log.info("No cached RNG for spectator at activation (index={d}) — will send on next broadcast", .{rng_lookup_index});
+                }
             },
             else => {
                 self.log.warn("Unknown spectator message type: 0x{x}", .{msg_type});
@@ -1082,6 +1164,13 @@ pub const NetplayManager = struct {
         @memcpy(rng_buf[17..][0..rng_state3_size], rng_state3_addr[0..rng_state3_size]);
         self.sendReliable(rng_buf[0..payload_len]);
 
+        // Cache the captured RNG body (bytes 1.., skipping the type tag) so
+        // the SpectatorManager can forward it to spectators. Mirrors CCCaster
+        // DllMain.cpp:523: `netMan.setRngState(msgRngState->getAs<RngState>())`
+        // which caches in `_rngStates` for later lookup by the spectator
+        // manager (DllSpectatorManager.cpp:177).
+        self.cacheRngState(rng_buf[1..1 + rng_body_size]);
+
         self.rng_send_count += 1;
         self.rng_send_cooldown = rng_resend_period;
         // NOTE: rng_synced / rng_acked are NOT set here. The host only treats
@@ -1101,24 +1190,55 @@ pub const NetplayManager = struct {
         // Only accept RNG for our current index or the one we're about to
         // enter. This prevents stale RNG from a previous round overwriting
         // the current round's state.
-        if (rng_index != self.indexed_frame.index and rng_index != self.indexed_frame.index + 1) {
-            self.log.warn("Ignoring RNG for index {d} (we're at {d})", .{ rng_index, self.indexed_frame.index });
-            return;
+        //
+        // For spectators we relax this to `rng_index <= current + 1` (i.e.
+        // accept any RNG that isn't from the future). The spectator's
+        // `indexed_frame.index` is driven by its own MBAACC state transitions,
+        // which may lag behind the host's because the spectator receives
+        // BothInputs at a delay. The host sends RNG keyed by the spectator's
+        // playback index (see SpectatorManager.frameStepSpectators), so the
+        // received `rng_index` will always be for an index the spectator is
+        // at or has already passed — but it may be strictly less than
+        // `self.indexed_frame.index` if the spectator has since advanced.
+        // Rejecting it would leave the spectator's RNG unsynchronized for
+        // that round. Mirrors CCCaster's spectator path, which looks up
+        // `_netManPtr->getRngState(oldIndex)` (DllSpectatorManager.cpp:177)
+        // and sends whatever is cached for that index without a forward-only
+        // guard on the spectator side.
+        if (self.config.is_spectator) {
+            if (rng_index > self.indexed_frame.index + 1) {
+                self.log.warn("Spectator: ignoring future RNG for index {d} (we're at {d})", .{
+                    rng_index, self.indexed_frame.index,
+                });
+                return;
+            }
+        } else {
+            if (rng_index != self.indexed_frame.index and rng_index != self.indexed_frame.index + 1) {
+                self.log.warn("Ignoring RNG for index {d} (we're at {d})", .{ rng_index, self.indexed_frame.index });
+                return;
+            }
         }
 
         // ----------------------------------------------------------------
         // Idempotent application: if we've already applied the host's RNG
-        // for this round (`rng_synced == true`), do NOT overwrite the
-        // game's RNG state again. The host re-sends every
-        // `rng_resend_period` frames while waiting for our ACK (see
-        // `syncRngState`), and by the time a re-send arrives our game has
-        // already advanced N frames past S_F. Overwriting with the stale
-        // S_F would undo those N advancements and silently diverge us from
-        // the host. We just re-ACK so the host stops re-sending.
+        // for THIS round (same `rng_index`), do NOT overwrite the game's
+        // RNG state again. The host re-sends every `rng_resend_period`
+        // frames while waiting for our ACK (see `syncRngState`), and by
+        // the time a re-send arrives our game has already advanced N
+        // frames past S_F. Overwriting with the stale S_F would undo
+        // those N advancements and silently diverge us from the host. We
+        // just re-ACK so the host stops re-sending.
+        //
+        // If `rng_index` differs from `rng_synced_index`, this is a NEW
+        // round's RNG (the host sent it before our local state transition
+        // reset `rng_synced`). Fall through and apply it.
         // ----------------------------------------------------------------
-        if (self.rng_synced) {
+        if (self.rng_synced and rng_index == self.rng_synced_index) {
             self.log.info("RNG already synced for index {d} — re-acking only", .{rng_index});
-            self.sendRngAck(rng_index);
+            // Spectators don't ACK (see comment below at the sendRngAck call).
+            if (!self.config.is_spectator) {
+                self.sendRngAck(rng_index);
+            }
             return;
         }
 
@@ -1127,13 +1247,23 @@ pub const NetplayManager = struct {
         rng_state2_addr.* = std.mem.readInt(u32, body[12..16], .little);
         @memcpy(rng_state3_addr[0..rng_state3_size], body[16 .. 16 + rng_state3_size]);
         self.rng_synced = true;
+        self.rng_synced_index = rng_index;
         self.log.info("Applied remote RNG state (index={d})", .{rng_index});
 
         // Acknowledge receipt so the host can stop re-sending. The host
         // may re-send several times before this arrives (see syncRngState);
         // replying to every received packet is fine — the host ignores
         // acks after the first (see `confirmRngAck`).
-        self.sendRngAck(rng_index);
+        //
+        // Spectators do NOT send ACKs: the host's `confirmRngAck` sets
+        // `rng_acked = true`, which tells the host the CLIENT has applied
+        // the RNG. A spectator ACK would falsely signal client receipt,
+        // causing the host to stop re-sending before the actual client
+        // has applied the RNG. Spectators are passive receivers — they
+        // just apply the RNG and continue.
+        if (!self.config.is_spectator) {
+            self.sendRngAck(rng_index);
+        }
     }
 
     /// Peer → host: confirm the RNG state for `rng_index` was applied.
@@ -1158,9 +1288,71 @@ pub const NetplayManager = struct {
         if (self.rng_acked) return; // already confirmed for this round
         self.rng_acked = true;
         self.rng_synced = true;
+        self.rng_synced_index = rng_index;
         self.log.info("RNG sync confirmed by peer ack (index={d}, after {d} send(s))", .{
             rng_index, self.rng_send_count,
         });
+    }
+
+    /// Host: cache a captured RNG state body so the SpectatorManager can
+    /// forward it to spectators. `body` is the 236-byte payload
+    /// [4 index][4 rng0][4 rng1][4 rng2][220 rng3] (i.e., the 0x02 packet
+    /// body without the 1-byte type tag). Mirrors CCCaster's
+    /// `NetplayManager::setRngState` (DllNetplayManager.cpp:1039-1052),
+    /// which stores into `_rngStates[index - _startIndex]`.
+    ///
+    /// Uses a simple linear scan + overwrite-if-exists + overwrite-oldest
+    /// strategy. The cache holds 8 entries — enough for ~8 rounds, which
+    /// exceeds any realistic MBAACC match (best-of-3 = max 4 rounds per
+    /// match including rematch).
+    fn cacheRngState(self: *NetplayManager, body: []const u8) void {
+        if (body.len < rng_body_size) return;
+        const index = std.mem.readInt(u32, body[0..4], .little);
+
+        // First pass: if we already have an entry for this index, update it
+        // in place (the host may re-capture at the same index if it re-sends).
+        for (&self.cached_rng_states) |*entry| {
+            if (entry.valid and entry.index == index) {
+                @memcpy(&entry.body, body[0..rng_body_size]);
+                return;
+            }
+        }
+
+        // Second pass: find the first invalid slot.
+        for (&self.cached_rng_states) |*entry| {
+            if (!entry.valid) {
+                entry.valid = true;
+                entry.index = index;
+                @memcpy(&entry.body, body[0..rng_body_size]);
+                return;
+            }
+        }
+
+        // All slots full: overwrite the one with the smallest index (oldest).
+        var oldest_idx: usize = 0;
+        for (self.cached_rng_states, 0..) |entry, i| {
+            if (entry.index < self.cached_rng_states[oldest_idx].index) {
+                oldest_idx = i;
+            }
+        }
+        self.cached_rng_states[oldest_idx].index = index;
+        @memcpy(&self.cached_rng_states[oldest_idx].body, body[0..rng_body_size]);
+    }
+
+    /// Host: look up a cached RNG state by transition index. If found,
+    /// copy the 236-byte body into `out` and return true. Used by the
+    /// SpectatorManager to forward the host's authoritative RNG state to
+    /// each spectator. Mirrors CCCaster's `NetplayManager::getRngState`
+    /// (DllNetplayManager.cpp:1024-1037).
+    pub fn getCachedRngState(self: *const NetplayManager, index: u32, out: []u8) bool {
+        if (out.len < rng_body_size) return false;
+        for (self.cached_rng_states) |entry| {
+            if (entry.valid and entry.index == index) {
+                @memcpy(out[0..rng_body_size], &entry.body);
+                return true;
+            }
+        }
+        return false;
     }
 
     // --- State transitions ---
@@ -1432,8 +1624,11 @@ pub const NetplayManager = struct {
         // place (see `isRemoteInputReady`), so CharaSelect arming COULD
         // be re-enabled for parity — but it's left disabled because
         // there's no gameplay simulation during CharaSelect to advance
-        // the RNG anyway, and the SyncHash detector only checks from
-        // CharaSelect onward.
+        // the RNG anyway (MBAACC's CharaSelect RNG draws are scoped to UI
+        // state that is overwritten when InGame starts). The SyncHash
+        // detector only runs during `.in_game` (see `maybeSendSyncHash`
+        // and `checkSyncHashDesync`), so CharaSelect RNG divergence is
+        // neither observable nor harmful.
         if (new == .in_game) {
             self.rng_synced = false;
             self.rng_acked = false;

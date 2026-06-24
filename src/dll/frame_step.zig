@@ -235,6 +235,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             n.indexed_frame.frame,
             world_timer,
             state.fillBothInputsCallback,
+            state.getCachedRngCallback,
         );
     }
 }

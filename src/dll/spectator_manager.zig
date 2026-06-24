@@ -212,12 +212,24 @@ pub const SpectatorManager = struct {
     /// `fill_inputs` is a function that fills a buffer with NUM_INPUTS
     /// frames of (P1 input, P2 input) starting at a given (index, frame).
     /// Returns the actual length written, or 0 if inputs aren't ready yet.
+    ///
+    /// `get_cached_rng` is a function that fills a buffer with the host's
+    /// cached RNG state for a given index. Returns true if a cached RNG
+    /// state exists for that index, false otherwise. The buffer format is
+    /// the same as the `0x02` RNG packet body (without the type tag):
+    /// [4 index][4 rng0][4 rng1][4 rng2][220 rng3] = 236 bytes.
+    /// Mirrors CCCaster's `SpectatorManager::frameStepSpectators`
+    /// (DllSpectatorManager.cpp:160-191), which looks up
+    /// `_netManPtr->getRngState(oldIndex)` and sends it once per spectator
+    /// per index, resetting `sentRngState` when the spectator's index
+    /// advances.
     pub fn frameStepSpectators(
         self: *SpectatorManager,
         current_index: u32,
         current_frame: u32,
         world_timer: u32,
         fill_inputs: *const fn (index: u32, frame: u32, out: []u8) usize,
+        get_cached_rng: *const fn (index: u32, out: []u8) bool,
     ) void {
         _ = current_index;
         _ = current_frame;
@@ -236,6 +248,9 @@ pub const SpectatorManager = struct {
         const interval: u32 = (multiplier * num_inputs_per_packet / 2) / n_spec;
         if (interval == 0 or world_timer % interval != 0) return;
 
+        // RNG packet buffer: [1 type=0x02][4 index][4+4+4+220 RNG state].
+        const rng_payload_len: usize = 1 + 4 + 4 + 4 + 4 + 220;
+
         var batch: u32 = 0;
         while (batch < multiplier) : (batch += 1) {
             // Wrap around the spectator list.
@@ -249,6 +264,30 @@ pub const SpectatorManager = struct {
             if (s.state != .active) {
                 self.broadcast_pos += 1;
                 continue;
+            }
+
+            // Record the spectator's index BEFORE advancing pos, so we can
+            // detect an index advance (new round) and reset sent_rng_state.
+            const old_index = s.pos_index;
+
+            // --- RNG state forwarding (mirrors DllSpectatorManager.cpp:177-191) ---
+            // Send the host's cached RNG state for the spectator's current
+            // playback index, ONCE per index. The spectator's MBAACC instance
+            // runs its own simulation with its own RNG; without the host's
+            // state, the spectator's hit sparks, dust, camera shake, etc.
+            // would diverge from the actual match within seconds.
+            if (!s.sent_rng_state) {
+                var rng_buf: [1 + 4 + 4 + 4 + 4 + 220]u8 = undefined;
+                rng_buf[0] = 0x02; // RNG state (same type as host→client)
+                if (get_cached_rng(old_index, rng_buf[1..])) {
+                    if (s.peer != null) {
+                        const packet = enet.enet_packet_create(&rng_buf, rng_payload_len, enet.ENET_PACKET_FLAG_RELIABLE);
+                        if (packet != null) {
+                            _ = enet.enet_peer_send(s.peer, 0, packet); // channel 0 = reliable
+                        }
+                    }
+                    s.sent_rng_state = true;
+                }
             }
 
             // Build the inputs packet. [1 type=0x20][4 frame][4 index][p1p2 × N]
@@ -270,6 +309,12 @@ pub const SpectatorManager = struct {
             // Update min index for preserveStartIndex.
             if (s.pos_index < self.current_min_index) {
                 self.current_min_index = s.pos_index;
+            }
+
+            // Clear sent flags whenever the index changes (new round).
+            // Mirrors DllSpectatorManager.cpp:187-191.
+            if (s.pos_index > old_index) {
+                s.sent_rng_state = false;
             }
 
             self.broadcast_pos += 1;

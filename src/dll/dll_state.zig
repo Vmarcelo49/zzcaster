@@ -86,3 +86,14 @@ pub fn fillBothInputsCallback(index: u32, frame: u32, out: []u8) usize {
     }
     return 0;
 }
+
+/// Routes SpectatorManager.frameStepSpectators' RNG-lookup callback into
+/// NetplayManager.getCachedRngState. Returns true if the host has a cached
+/// RNG state for the given transition index (i.e., the host has captured
+/// and sent RNG for that round), false otherwise.
+pub fn getCachedRngCallback(index: u32, out: []u8) bool {
+    if (nm) |*n| {
+        return n.getCachedRngState(index, out);
+    }
+    return false;
+}

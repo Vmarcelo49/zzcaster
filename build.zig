@@ -301,7 +301,21 @@ pub fn build(b: *std.Build) void {
     });
     const run_air_dash_tests = b.addRunArtifact(air_dash_tests);
 
+    // Standalone simulation tests (pure Zig, host-testable)
+    const simulation_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/dll/test_simulation.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    simulation_test_mod.addImport("common", common_mod);
+    const simulation_tests = b.addTest(.{
+        .root_module = simulation_test_mod,
+    });
+    const run_simulation_tests = b.addRunArtifact(simulation_tests);
+
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_common_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
+    test_step.dependOn(&run_simulation_tests.step);
 }

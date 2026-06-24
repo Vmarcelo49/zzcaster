@@ -110,7 +110,7 @@ const num_inputs: u32 = 30;
 const max_rollback: u8 = 15;
 
 // Health-check timeouts (ported from CCCaster's GoBackN keepalive + input-wait)
-const heartbeat_timeout_ms: i64 = 20000; // 20s — no packet → peer is dead
+const heartbeat_timeout_ms: i64 = 120000; // 120s — no packet → peer is dead
 const input_wait_timeout_ms: i64 = 10000; // 10s — no remote input → timed out
 
 pub const NetplayState = enum {
@@ -775,6 +775,9 @@ pub const NetplayManager = struct {
                 return null;
             },
             enet.ENET_EVENT_TYPE_CONNECT => {
+                if (peer_opt) |peer| {
+                    enet.enet_peer_timeout(peer, 0, 10000, 120000);
+                }
                 // Mark the main peer connected. For host the first CONNECT
                 // is the player-2 peer; subsequent ones are spectators.
                 self.log.info("DIAG: ENET_EVENT_TYPE_CONNECT received host={} connected_before={}", .{
@@ -1060,12 +1063,12 @@ pub const NetplayManager = struct {
         // keeps both sides synchronized — without it, one side can race
         // ahead (e.g. start the match while the other is still loading).
         //
-        // Loading / CharaIntro / Skippable / RetryMenu do NOT block:
+        // Loading / Skippable / RetryMenu do NOT block:
         // each side runs at its own pace, and the catch-up mash logic
         // in getNetplayInput() ensures the lagging side auto-skips.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .chara_intro, .skippable, .retry_menu => return true,
-            .chara_select, .in_game => {},
+            .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
+            .chara_select, .chara_intro, .in_game => {},
         }
 
         // Offline / spectator: always ready
@@ -1114,10 +1117,12 @@ pub const NetplayManager = struct {
         // Remote is ahead of us — use prediction, don't wait
         if (remote_end_index > our_index) return true;
 
-        // Same index — check if we have the frame we need
-        const needed = self.indexed_frame.frame + self.config.delay;
+        // Same index — check if we have the frame we need.
+        // If rollback is enabled, we can simulate up to `rollback` frames ahead.
+        const max_frames_ahead = if (self.isInRollback()) self.config.rollback else 0;
+        const needed = self.indexed_frame.frame;
         const end_frame = self.remote_inputs.getEndFrame(our_index);
-        return end_frame > needed;
+        return (end_frame + max_frames_ahead) > needed;
     }
 
     // --- Send local inputs to peer ---
@@ -1244,6 +1249,19 @@ pub const NetplayManager = struct {
                 self.log.warn("Ignoring RNG for index {d} (we're at {d})", .{ rng_index, self.indexed_frame.index });
                 return;
             }
+        }
+
+        // Cache the RNG state in the local cached_rng_states buffer.
+        self.cacheRngState(body);
+
+        // If this RNG is for the next index, cache it but defer application
+        // to game memory until onStateTransition transitions us to the new index.
+        if (rng_index == self.indexed_frame.index + 1) {
+            self.log.info("Cached future remote RNG state (index={d}, current={d})", .{rng_index, self.indexed_frame.index});
+            if (!self.config.is_spectator) {
+                self.sendRngAck(rng_index);
+            }
+            return;
         }
 
         // ----------------------------------------------------------------
@@ -1669,6 +1687,20 @@ pub const NetplayManager = struct {
             // silently no-ops every frame. Rounds 2+ are handled separately
             // by checkIntroDone when game_state == 99.
             self.intro_rng_enabled = true;
+
+            // Client/Spectator: apply the cached RNG state if we received and cached it early
+            if (!self.config.is_host) {
+                var cached_body: [rng_body_size]u8 = undefined;
+                if (self.getCachedRngState(self.indexed_frame.index, &cached_body)) {
+                    rng_state0_addr.* = std.mem.readInt(u32, cached_body[4..8], .little);
+                    rng_state1_addr.* = std.mem.readInt(u32, cached_body[8..12], .little);
+                    rng_state2_addr.* = std.mem.readInt(u32, cached_body[12..16], .little);
+                    @memcpy(rng_state3_addr[0..rng_state3_size], cached_body[16 .. 16 + rng_state3_size]);
+                    self.rng_synced = true;
+                    self.rng_synced_index = self.indexed_frame.index;
+                    self.log.info("Applied cached remote RNG state at transition (index={d})", .{self.indexed_frame.index});
+                }
+            }
         }
 
         if (new == .loading or new == .chara_select) {
@@ -1902,15 +1934,23 @@ pub const NetplayManager = struct {
     }
 
     fn onEnterInGame(self: *NetplayManager) void {
-        if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
-            for (rollback_regions.all_regions) |r| {
-                self.state_pool.addRegion(r.addr, r.size) catch {};
-            }
-            self.log.info("Loaded {d} rollback memory regions ({d} bytes per state)", .{ rollback_regions.all_regions.len, self.state_pool.totalRegionSize() });
+        self.local_inputs.reset();
+        self.remote_inputs.reset();
 
-            self.state_pool.allocate(60, 0) catch {
-                self.log.warn("StatePool allocate failed — rollback disabled", .{});
-            };
+        if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
+            if (self.state_pool.pool.len == 0) {
+                for (rollback_regions.all_regions) |r| {
+                    self.state_pool.addRegion(r.addr, r.size) catch {};
+                }
+                self.log.info("Loaded {d} rollback memory regions ({d} bytes per state)", .{ rollback_regions.all_regions.len, self.state_pool.totalRegionSize() });
+
+                self.state_pool.allocate(60, 0) catch {
+                    self.log.warn("StatePool allocate failed — rollback disabled", .{});
+                };
+            } else {
+                self.state_pool.reset();
+                self.log.info("Resetting rollback StatePool for rematch", .{});
+            }
         }
         self.rollback_timer = self.min_rollback_spacing;
 
@@ -1934,6 +1974,13 @@ pub const NetplayManager = struct {
         if (lcf_index != self.indexed_frame.index) return false;
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
+        const loaded_frame = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
+        if (loaded_frame == null) {
+            self.remote_inputs.clearLastChanged();
+            self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
+            return false;
+        }
+
         // Trigger rollback!
         const current_frame = self.indexed_frame.frame;
         self.fast_fwd_stop_frame = current_frame;
@@ -1943,16 +1990,11 @@ pub const NetplayManager = struct {
         // current frame, then mark with 0x80 sentinel so the play-hook
         // knows to suppress them.
         if (self.sfx_dedup) |*sd| {
-            sd.applyRollbackFilter(lcf_frame, current_frame);
+            sd.applyRollbackFilter(loaded_frame.?, current_frame);
         }
 
-        if (self.state_pool.loadStateForFrame(lcf_frame, lcf_index)) |loaded_frame| {
-            self.indexed_frame.frame = loaded_frame;
-            self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded_frame, current_frame });
-        } else {
-            self.indexed_frame.frame = lcf_frame;
-            self.log.warn("ROLLBACK: no saved state for frame {d}", .{lcf_frame});
-        }
+        self.indexed_frame.frame = loaded_frame.?;
+        self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded_frame.?, current_frame });
 
         self.remote_inputs.clearLastChanged();
         self.rollback_timer = 0;

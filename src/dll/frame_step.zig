@@ -118,10 +118,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
-    // Heartbeat check: if no packet received in 20s, the peer is dead.
+    // Heartbeat check: if no packet received in 120s, the peer is dead.
     // This catches crashes/kills that don't generate a DISCONNECT event.
     if (n.enet_connected and n.checkHeartbeat()) {
-        state.log.?.err("Peer heartbeat timeout (20s no packets) — forcing disconnect", .{});
+        state.log.?.err("Peer heartbeat timeout (120s no packets) — forcing disconnect", .{});
         n.enet_connected = false;
         state.alive_flag_addr.* = 0;
         return;
@@ -305,8 +305,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         // 988-989). The Zig port's early `return` here was a regression
         // that broke rollback correctness.
         n.writeGameInputs();
-        _ = n.checkRerunComplete();
-        return;
+        if (n.checkRerunComplete()) {
+            // Rerun completed on this frame. Fall through to normal frame logic so the frame
+            // is saved, spectator packets are sent, etc.
+        } else {
+            // Rerun still in progress. Save state for this re-simulated frame so we have
+            // correct intermediate checkpoints.
+            _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+            return;
+        }
     }
 
     if (n.rollback_timer < n.min_rollback_spacing) {

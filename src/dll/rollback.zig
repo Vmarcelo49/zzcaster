@@ -50,8 +50,8 @@ pub const InputBuffer = struct {
             const frame = start_frame + @as(u32, @intCast(i));
             const key = makeKey(index, frame);
             if (check_changes) {
-                const prev = self.inputs.get(key) orelse 0;
-                if (prev != input) {
+                const used_input = self.get(index, frame);
+                if (used_input != input) {
                     if (self.last_changed_frame == null or key < self.last_changed_frame.?) {
                         self.last_changed_frame = key;
                     }
@@ -77,6 +77,14 @@ pub const InputBuffer = struct {
 
     pub fn clearLastChanged(self: *InputBuffer) void {
         self.last_changed_frame = null;
+    }
+
+    pub fn reset(self: *InputBuffer) void {
+        self.inputs.clearRetainingCapacity();
+        self.end_frames.clearRetainingCapacity();
+        self.last_inputs.clearRetainingCapacity();
+        self.last_changed_frame = null;
+        self.end_index = 0;
     }
 
     /// Grow the outer dimension so that `index` is considered "reached" by
@@ -309,6 +317,16 @@ pub const StatePool = struct {
             return best_frame;
         }
         return null;
+    }
+
+    pub fn reset(self: *StatePool) void {
+        self.saved_states.clearRetainingCapacity();
+        self.free_stack.clearRetainingCapacity();
+        var i: usize = self.num_states;
+        while (i > 0) {
+            i -= 1;
+            self.free_stack.append(self.allocator, i) catch {};
+        }
     }
 
     // The previous `pub fn loadFromRbBin(self, path, io, log) !void` was

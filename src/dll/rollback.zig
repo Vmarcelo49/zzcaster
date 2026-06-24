@@ -400,8 +400,8 @@ fn saveFpu(out: *SavedFpu) void {
 // on the first rollback after entering `in_game`.
 fn restoreFpu(env: *const SavedFpu) void {
     if (builtin.cpu.arch != .x86) return;
-    var cw: u16 = env.cw;
-    var mxcsr: u32 = env.mxcsr;
+    const cw: u16 = env.cw;
+    const mxcsr: u32 = env.mxcsr;
     asm volatile (
         "fldcw %[cw]\n\tldmxcsr %[mxcsr]"
         :

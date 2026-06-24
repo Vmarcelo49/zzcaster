@@ -957,7 +957,34 @@ pub const NetplayManager = struct {
                 }
                 return input;
             },
-            .loading, .chara_intro, .skippable => {
+            .loading => {
+                // During the Loading screen, suppress ALL player input.
+                //
+                // The loading screen in MBAACC is a fixed-duration screen
+                // that loads character/stage data. It should NOT be skippable
+                // by the player — if one peer could advance past it while the
+                // other is still loading, the faster peer would enter InGame
+                // (and potentially CharaIntro) before the slower peer has
+                // finished loading, widening the synchronization gap.
+                //
+                // CCCaster's getSkippableInput (DllNetplayManager.cpp:158-179)
+                // technically allows Confirm+Cancel through during Loading, but
+                // MBAACC's loading screen doesn't respond to those buttons, so
+                // the effect is the same as suppressing them. In zzcaster we
+                // suppress explicitly to make the intent clear and to prevent
+                // any future change to the game's loading screen from
+                // accidentally making it skippable.
+                //
+                // The catch-up mash (shouldCatchUp) is ALSO suppressed during
+                // Loading — we don't want the faster peer's "remote is ahead"
+                // signal to mash Confirm and potentially advance the local
+                // game past the loading screen before the local game has
+                // finished loading character data. The catch-up mash is only
+                // appropriate for CharaIntro and Skippable, where skipping
+                // the intro animation is the intended behavior.
+                return 0;
+            },
+            .chara_intro, .skippable => {
                 // If remote is ahead, mash Confirm to catch up.
                 if (self.shouldCatchUp()) {
                     if (self.indexed_frame.frame % 2 == 0) {
@@ -967,7 +994,7 @@ pub const NetplayManager = struct {
                 }
                 // Otherwise, only allow Confirm/Cancel through — suppress
                 // all direction and action buttons so the player can't
-                // accidentally affect game state during loading/intro.
+                // accidentally affect game state during intro/skippable.
                 // Confirm = 0x0400 in btns = 0x4000 in combined.
                 // Cancel  = 0x0800 in btns = 0x8000 in combined.
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits

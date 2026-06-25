@@ -110,7 +110,7 @@ const num_inputs: u32 = 30;
 const max_rollback: u8 = 15;
 
 // Health-check timeouts (ported from CCCaster's GoBackN keepalive + input-wait)
-const heartbeat_timeout_ms: i64 = 20000; // 20s — no packet → peer is dead
+const heartbeat_timeout_ms: i64 = 120000; // 120s — no packet → peer is dead
 const input_wait_timeout_ms: i64 = 10000; // 10s — no remote input → timed out
 
 pub const NetplayState = enum {
@@ -775,6 +775,9 @@ pub const NetplayManager = struct {
                 return null;
             },
             enet.ENET_EVENT_TYPE_CONNECT => {
+                if (peer_opt) |peer| {
+                    enet.enet_peer_timeout(peer, 0, 10000, 120000);
+                }
                 // Mark the main peer connected. For host the first CONNECT
                 // is the player-2 peer; subsequent ones are spectators.
                 self.log.info("DIAG: ENET_EVENT_TYPE_CONNECT received host={} connected_before={}", .{
@@ -957,7 +960,62 @@ pub const NetplayManager = struct {
                 }
                 return input;
             },
-            .loading, .chara_intro, .skippable => {
+            .loading => {
+                // During the Loading screen, suppress ALL player input.
+                //
+                // The loading screen in MBAACC is a fixed-duration screen
+                // that loads character/stage data. It should NOT be skippable
+                // by the player — if one peer could advance past it while the
+                // other is still loading, the faster peer would enter InGame
+                // (and potentially CharaIntro) before the slower peer has
+                // finished loading, widening the synchronization gap.
+                //
+                // CCCaster's getSkippableInput (DllNetplayManager.cpp:158-179)
+                // technically allows Confirm+Cancel through during Loading, but
+                // MBAACC's loading screen doesn't respond to those buttons, so
+                // the effect is the same as suppressing them. In zzcaster we
+                // suppress explicitly to make the intent clear and to prevent
+                // any future change to the game's loading screen from
+                // accidentally making it skippable.
+                //
+                // The catch-up mash (shouldCatchUp) is ALSO suppressed during
+                // Loading — we don't want the faster peer's "remote is ahead"
+                // signal to mash Confirm and potentially advance the local
+                // game past the loading screen before the local game has
+                // finished loading character data. The catch-up mash is only
+                // appropriate for CharaIntro and Skippable, where skipping
+                // the intro animation is the intended behavior.
+                return 0;
+            },
+            .chara_intro => {
+                // CC_INTRO_STATE_ADDR values:
+                //   2 = character intro animation (players can't move yet)
+                //   1 = pre-game: characters are on the arena, players CAN
+                //       move (jumps, dashes, attacks all work), but the
+                //       round timer hasn't started. We pass input through
+                //       here so the player can warm up / test inputs before
+                //       "Round 1 Fight" fires. The FSM stays in .chara_intro
+                //       until intro_state drops to 0 (the actual round start),
+                //       keeping the invariant `state == .in_game ⇒
+                //       intro_state == 0` intact (rollback won't load a state
+                //       with intro_state != 0).
+                //   0 = already at the in-game threshold; checkIntroDone
+                //       will transition to .in_game this frame (or already
+                //       did).
+                if (intro_state_addr.* != 2) {
+                    return raw_input;
+                }
+                // Still in character intro animation: only allow Confirm/Cancel.
+                // If remote is ahead, mash Confirm to catch up.
+                if (self.shouldCatchUp()) {
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+                return raw_input & 0xC000; // keep only Confirm + Cancel bits
+            },
+            .skippable => {
                 // If remote is ahead, mash Confirm to catch up.
                 if (self.shouldCatchUp()) {
                     if (self.indexed_frame.frame % 2 == 0) {
@@ -967,7 +1025,7 @@ pub const NetplayManager = struct {
                 }
                 // Otherwise, only allow Confirm/Cancel through — suppress
                 // all direction and action buttons so the player can't
-                // accidentally affect game state during loading/intro.
+                // accidentally affect game state during skippable.
                 // Confirm = 0x0400 in btns = 0x4000 in combined.
                 // Cancel  = 0x0800 in btns = 0x8000 in combined.
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits
@@ -1033,12 +1091,12 @@ pub const NetplayManager = struct {
         // keeps both sides synchronized — without it, one side can race
         // ahead (e.g. start the match while the other is still loading).
         //
-        // Loading / CharaIntro / Skippable / RetryMenu do NOT block:
+        // Loading / Skippable / RetryMenu do NOT block:
         // each side runs at its own pace, and the catch-up mash logic
         // in getNetplayInput() ensures the lagging side auto-skips.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .chara_intro, .skippable, .retry_menu => return true,
-            .chara_select, .in_game => {},
+            .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
+            .chara_select, .chara_intro, .in_game => {},
         }
 
         // Offline / spectator: always ready
@@ -1087,10 +1145,12 @@ pub const NetplayManager = struct {
         // Remote is ahead of us — use prediction, don't wait
         if (remote_end_index > our_index) return true;
 
-        // Same index — check if we have the frame we need
-        const needed = self.indexed_frame.frame + self.config.delay;
+        // Same index — check if we have the frame we need.
+        // If rollback is enabled, we can simulate up to `rollback` frames ahead.
+        const max_frames_ahead = if (self.isInRollback()) self.config.rollback else 0;
+        const needed = self.indexed_frame.frame;
         const end_frame = self.remote_inputs.getEndFrame(our_index);
-        return end_frame > needed;
+        return (end_frame + max_frames_ahead) > needed;
     }
 
     // --- Send local inputs to peer ---
@@ -1217,6 +1277,19 @@ pub const NetplayManager = struct {
                 self.log.warn("Ignoring RNG for index {d} (we're at {d})", .{ rng_index, self.indexed_frame.index });
                 return;
             }
+        }
+
+        // Cache the RNG state in the local cached_rng_states buffer.
+        self.cacheRngState(body);
+
+        // If this RNG is for the next index, cache it but defer application
+        // to game memory until onStateTransition transitions us to the new index.
+        if (rng_index == self.indexed_frame.index + 1) {
+            self.log.info("Cached future remote RNG state (index={d}, current={d})", .{rng_index, self.indexed_frame.index});
+            if (!self.config.is_spectator) {
+                self.sendRngAck(rng_index);
+            }
+            return;
         }
 
         // ----------------------------------------------------------------
@@ -1382,6 +1455,15 @@ pub const NetplayManager = struct {
     ///   loading → chara_intro (versus) | in_game (training)
     ///     ↑ DROPPED vs CCCaster: Loading → Skippable.
     ///   chara_intro → in_game
+    ///     ↑ During chara_intro, the game has a "pre-game" sub-phase where
+    ///       CC_INTRO_STATE_ADDR == 1: characters are on the arena and
+    ///       players can move (input is passed through via the
+    ///       `chara_intro_intro_state != 2` check in getNetplayInput), but
+    ///       the round hasn't officially started. We do NOT add a separate
+    ///       `.pre_game` state because that would require an extra
+    ///       `TransitionIndex` packet and index increment per round, which
+    ///       complicates peer sync (host at index N+1 sending inputs while
+    ///       remote is still at index N in chara_intro).
     ///   in_game → skippable | chara_select
     ///     ↑ DROPPED vs CCCaster: InGame → RetryMenu (and ReplayMenu, no such state).
     ///   skippable → in_game (next round) | retry_menu | chara_select
@@ -1474,16 +1556,46 @@ pub const NetplayManager = struct {
             self.log.info("Intro done (game_state=99) — RNG sync enabled", .{});
         }
 
-        // chara_intro → in_game: CC_INTRO_STATE_ADDR drops to 0 when players
-        // can move. Only transition out of chara_intro — if we're already
-        // in_game this is a no-op.
+        // chara_intro → in_game: requires BOTH signals to fire.
+        //
+        //   1. intro_state_addr.* == 0: the game itself confirms players can
+        //      move (CC_INTRO_STATE_ADDR drops to 0). This is the legacy gate
+        //      and is required to preserve the invariant that
+        //      `state == .in_game` implies `intro_state == 0` — otherwise
+        //      rollback could load a state with intro_state != 0 and corrupt
+        //      the gameplay path (clearIntroStateDuringRollback only fires
+        //      past frame 224).
+        //
+        //   2. remote_inputs.getEndIndex() > indexed_frame.index: the remote
+        //      peer has reached our current transition index. This makes the
+        //      faster peer wait during chara_intro for the slower peer to
+        //      catch up before both enter in_game — otherwise the slower
+        //      peer would arrive in in_game alone (with no remote inputs to
+        //      lockstep against) and immediately stall on the first frame.
+        //
+        // The previous "remote-only" gate broke invariant #1 and caused a
+        // crash when the faster peer pressed any input in in_game. The
+        // original "intro-only" gate dropped invariant #2 and let the
+        // faster peer run ahead of the slower peer during the intro. The
+        // AND gate satisfies both.
         if (self.state == .chara_intro and intro_state_addr.* == 0) {
-            const old = self.state;
-            _ = self.isValidNext(.in_game);
-            self.state = .in_game;
-            self.onStateTransition(old, .in_game);
-            self.log.info("CharaIntro -> InGame (intro_state=0, players can move)", .{});
-            if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+            const remote_end_index = self.remote_inputs.getEndIndex();
+            if (remote_end_index > self.indexed_frame.index) {
+                const old = self.state;
+                _ = self.isValidNext(.in_game);
+                self.state = .in_game;
+                self.onStateTransition(old, .in_game);
+                self.log.info("CharaIntro -> InGame (intro_state=0, remote caught up at index {d})", .{self.indexed_frame.index});
+                if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+            } else {
+                // Faster peer: chara_intro finished visually but remote is
+                // still behind. Keep state == .chara_intro so getNetplayInput
+                // still suppresses direction/action buttons, and the next
+                // frame's checkIntroDone will re-evaluate.
+                self.log.info("CharaIntro intro_state=0 but remote behind (remote_end_index={d}, our_index={d}) — waiting", .{
+                    remote_end_index, self.indexed_frame.index,
+                });
+            }
         }
     }
 
@@ -1642,6 +1754,20 @@ pub const NetplayManager = struct {
             // silently no-ops every frame. Rounds 2+ are handled separately
             // by checkIntroDone when game_state == 99.
             self.intro_rng_enabled = true;
+
+            // Client/Spectator: apply the cached RNG state if we received and cached it early
+            if (!self.config.is_host) {
+                var cached_body: [rng_body_size]u8 = undefined;
+                if (self.getCachedRngState(self.indexed_frame.index, &cached_body)) {
+                    rng_state0_addr.* = std.mem.readInt(u32, cached_body[4..8], .little);
+                    rng_state1_addr.* = std.mem.readInt(u32, cached_body[8..12], .little);
+                    rng_state2_addr.* = std.mem.readInt(u32, cached_body[12..16], .little);
+                    @memcpy(rng_state3_addr[0..rng_state3_size], cached_body[16 .. 16 + rng_state3_size]);
+                    self.rng_synced = true;
+                    self.rng_synced_index = self.indexed_frame.index;
+                    self.log.info("Applied cached remote RNG state at transition (index={d})", .{self.indexed_frame.index});
+                }
+            }
         }
 
         if (new == .loading or new == .chara_select) {
@@ -1665,9 +1791,33 @@ pub const NetplayManager = struct {
     /// Called when we receive a TransitionIndex message from the remote peer.
     /// Records their current transition index so isRemoteInputReady can
     /// decide whether to wait or predict.
+    ///
+    /// In addition to storing `remote_idx` for diagnostics, this MUST resize
+    /// the remote input container's outer dimension so that `getEndIndex()`
+    /// reflects the remote's new index. This mirrors CCCaster's
+    /// `NetplayManager::setRemoteIndex` (DllNetplayManager.cpp:1130-1138):
+    ///   _inputs[_remotePlayer - 1].resize ( remoteIndex - _startIndex, 0, 0 );
+    ///
+    /// Without the resize, the local peer's `isRemoteInputReady()` would not
+    /// see the remote's transition until the first `PlayerInputs` for the new
+    /// index arrives. In the "fast peer enters InGame, slow peer still in
+    /// CharaIntro" scenario, the fast peer's wait loop would correctly block
+    /// — but if the slow peer's `TransitionIndex(InGame)` arrives BEFORE its
+    /// first InGame `PlayerInputs`, the fast peer's `remote_end_index` would
+    /// NOT update, and once the slow peer's first InGame `PlayerInputs` did
+    /// arrive, the container's `end_index` would jump straight to that index
+    /// without the intermediate "remote has reached InGame, awaiting frames"
+    /// state that CCCaster relies on for its prediction-vs-wait decision.
+    ///
+    /// The `remote_index` field is retained for diagnostics but is now also
+    /// used to drive the resize — previously it was dead code (written but
+    /// never read).
     pub fn setRemoteIndex(self: *NetplayManager, remote_idx: u32) void {
         self.remote_index = remote_idx;
-        self.log.info("Remote transition index: {d}", .{remote_idx});
+        self.remote_inputs.resizeOuter(remote_idx);
+        self.log.info("Remote transition index: {d} (remote_inputs.end_index now {d})", .{
+            remote_idx, self.remote_inputs.getEndIndex(),
+        });
     }
 
     fn packedIndexedFrame(self: *const NetplayManager) u64 {
@@ -1851,15 +2001,23 @@ pub const NetplayManager = struct {
     }
 
     fn onEnterInGame(self: *NetplayManager) void {
-        if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
-            for (rollback_regions.all_regions) |r| {
-                self.state_pool.addRegion(r.addr, r.size) catch {};
-            }
-            self.log.info("Loaded {d} rollback memory regions ({d} bytes per state)", .{ rollback_regions.all_regions.len, self.state_pool.totalRegionSize() });
+        self.local_inputs.reset();
+        self.remote_inputs.reset();
 
-            self.state_pool.allocate(60, 0) catch {
-                self.log.warn("StatePool allocate failed — rollback disabled", .{});
-            };
+        if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
+            if (self.state_pool.pool.len == 0) {
+                for (rollback_regions.all_regions) |r| {
+                    self.state_pool.addRegion(r.addr, r.size) catch {};
+                }
+                self.log.info("Loaded {d} rollback memory regions ({d} bytes per state)", .{ rollback_regions.all_regions.len, self.state_pool.totalRegionSize() });
+
+                self.state_pool.allocate(60, 0) catch {
+                    self.log.warn("StatePool allocate failed — rollback disabled", .{});
+                };
+            } else {
+                self.state_pool.reset();
+                self.log.info("Resetting rollback StatePool for rematch", .{});
+            }
         }
         self.rollback_timer = self.min_rollback_spacing;
 
@@ -1883,6 +2041,13 @@ pub const NetplayManager = struct {
         if (lcf_index != self.indexed_frame.index) return false;
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
+        const loaded_frame = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
+        if (loaded_frame == null) {
+            self.remote_inputs.clearLastChanged();
+            self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
+            return false;
+        }
+
         // Trigger rollback!
         const current_frame = self.indexed_frame.frame;
         self.fast_fwd_stop_frame = current_frame;
@@ -1892,16 +2057,11 @@ pub const NetplayManager = struct {
         // current frame, then mark with 0x80 sentinel so the play-hook
         // knows to suppress them.
         if (self.sfx_dedup) |*sd| {
-            sd.applyRollbackFilter(lcf_frame, current_frame);
+            sd.applyRollbackFilter(loaded_frame.?, current_frame);
         }
 
-        if (self.state_pool.loadStateForFrame(lcf_frame, lcf_index)) |loaded_frame| {
-            self.indexed_frame.frame = loaded_frame;
-            self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded_frame, current_frame });
-        } else {
-            self.indexed_frame.frame = lcf_frame;
-            self.log.warn("ROLLBACK: no saved state for frame {d}", .{lcf_frame});
-        }
+        self.indexed_frame.frame = loaded_frame.?;
+        self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded_frame.?, current_frame });
 
         self.remote_inputs.clearLastChanged();
         self.rollback_timer = 0;

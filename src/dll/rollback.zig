@@ -50,8 +50,8 @@ pub const InputBuffer = struct {
             const frame = start_frame + @as(u32, @intCast(i));
             const key = makeKey(index, frame);
             if (check_changes) {
-                const prev = self.inputs.get(key) orelse 0;
-                if (prev != input) {
+                const used_input = self.get(index, frame);
+                if (used_input != input) {
                     if (self.last_changed_frame == null or key < self.last_changed_frame.?) {
                         self.last_changed_frame = key;
                     }
@@ -79,6 +79,47 @@ pub const InputBuffer = struct {
         self.last_changed_frame = null;
     }
 
+    pub fn reset(self: *InputBuffer) void {
+        self.inputs.clearRetainingCapacity();
+        self.end_frames.clearRetainingCapacity();
+        self.last_inputs.clearRetainingCapacity();
+        self.last_changed_frame = null;
+        self.end_index = 0;
+    }
+
+    /// Grow the outer dimension so that `index` is considered "reached" by
+    /// the remote peer, without populating any actual inputs for that index.
+    /// Mirrors CCCaster's `InputsContainer::resize(index, 0, 0)` called from
+    /// `NetplayManager::setRemoteIndex` (DllNetplayManager.cpp:1130-1138):
+    ///   _inputs[_remotePlayer - 1].resize ( remoteIndex - _startIndex, 0, 0 );
+    ///
+    /// This is what makes the local peer's `isRemoteInputReady()` see that the
+    /// remote peer has advanced to `index` even before any `PlayerInputs` for
+    /// that index has arrived. Without this, a lost `PlayerInputs` at the new
+    /// index (UDP-unreliable) combined with a lost/delayed `TransitionIndex`
+    /// (also unreliable in CCCaster) would leave the local container's
+    /// `end_index` stuck at the old value, and the local peer would wait
+    /// indefinitely for the remote to "catch up" even though the remote has
+    /// already moved on.
+    ///
+    /// In zzcaster's hashmap-based container there is no explicit "outer
+    /// vector"; the equivalent is to bump `end_index` and ensure `end_frames`
+    /// has an entry for `index` (defaulting to 0 = "no frames yet"). The
+    /// `last_inputs` map is NOT updated — there are no inputs at this index
+    /// yet, so `get(index, frame)` will fall through to the previous index's
+    /// last input via `lastInputBefore` logic in `get()`.
+    pub fn resizeOuter(self: *InputBuffer, index: u32) void {
+        // Bump end_index so getEndIndex() reports the remote has reached `index`.
+        if (index >= self.end_index) self.end_index = index + 1;
+        // Ensure end_frames has an entry for `index` (0 = no frames populated).
+        // Without this, getEndFrame(index) returns 0 via `.orelse 0`, which is
+        // correct, but having the entry present makes the "remote has reached
+        // this index but sent no frames yet" state explicit and inspectable.
+        if (!self.end_frames.contains(index)) {
+            self.end_frames.put(index, 0) catch {};
+        }
+    }
+
     pub fn getEndFrame(self: *const InputBuffer, index: u32) u32 {
         return self.end_frames.get(index) orelse 0;
     }
@@ -98,11 +139,40 @@ pub const MemoryRegion = struct {
     size: usize,
 };
 
+// FPU state snapshot — only what affects determinism.
+//
+// We save and restore the x87 control word (rounding mode, exception masks,
+// precision control) and the SSE MXCSR (control + status, since MBAACC is
+// built with -msse2). We deliberately do NOT touch:
+//   - the x87 data registers st(0)..st(7)
+//   - the x87 tag word
+//   - the x87 TOP pointer (stack top, bits 12-14 of the status word)
+//
+// Why: the previous implementation used `fnstenv`/`fldenv`, which save and
+// restore the FULL 28-byte x87 environment including TOP and the tag word.
+// On rollback restore, `fldenv` would write back a STALE TOP pointer captured
+// at save time. When the game's MBAACC code then executed `fild` instructions
+// (e.g. at 0x410721 in the per-frame character update), the FPU thought the
+// stack was non-empty and raised a #SF (stack fault) exception — crashing
+// both peers with "floating point stack check" as soon as the first rollback
+// fired after entering `in_game`.
+//
+// CCCaster's legacy C++ avoids this by using `fegetenv`/`fesetenv` from
+// <cfenv>. On MinGW-w64 i686, `fenv_t` is only 8 bytes (control word +
+// status word) and MinGW's `fesetenv` internally masks the TOP bits during
+// restore, leaving the FPU stack pointer untouched. Our `fnstcw`/`fldcw` +
+// `stmxcsr`/`ldmxcsr` approach is functionally equivalent and strictly safer
+// (no chance of restoring a stale TOP).
+pub const SavedFpu = struct {
+    cw: u16, // x87 control word
+    mxcsr: u32, // SSE control/status word
+};
+
 // Saved game state
 pub const SavedState = struct {
     frame: u32,
     index: u32,
-    fpu_env: [28]u8, // x87 FPU environment save area (28-byte fnstenv/fldenv layout)
+    fpu_env: SavedFpu, // x87 cw + SSE MXCSR only (see SavedFpu doc)
     data: []u8, // contiguous buffer for all memory regions
 };
 
@@ -204,16 +274,12 @@ pub const StatePool = struct {
             pos += r.size;
         }
 
-        // Save FPU environment (critical for deterministic re-simulation).
-        // fnstenv/fldenv are x87-only; we guard with `builtin.cpu.arch == .x86`
-        // (32-bit only). On x86_64 host builds (e.g. unit tests) we skip — the
-        // real DLL target is always 32-bit x86 anyway.
-        var fpu_env: [28]u8 = undefined;
-        if (builtin.cpu.arch == .x86) {
-            saveFpu(&fpu_env);
-        } else {
-            @memset(&fpu_env, 0);
-        }
+        // Save FPU control state (cw + MXCSR only — see SavedFpu doc).
+        // saveFpu() handles the arch guard internally: on non-x86 hosts
+        // (e.g. x86_64 unit-test runners) it writes benign defaults and
+        // restoreFpu() becomes a no-op.
+        var fpu_env: SavedFpu = undefined;
+        saveFpu(&fpu_env);
 
         // Store metadata
         self.saved_states.append(self.allocator, .{
@@ -232,10 +298,9 @@ pub const StatePool = struct {
         const state = self.saved_states.items[slot];
         const src = state.data;
 
-        // Restore FPU environment FIRST (before any float ops)
-        if (builtin.cpu.arch == .x86) {
-            restoreFpu(&state.fpu_env);
-        }
+        // Restore FPU control state FIRST (before any float ops).
+        // restoreFpu() handles the arch guard internally.
+        restoreFpu(&state.fpu_env);
 
         // Restore all memory regions
         var pos: usize = 0;
@@ -278,6 +343,16 @@ pub const StatePool = struct {
         return null;
     }
 
+    pub fn reset(self: *StatePool) void {
+        self.saved_states.clearRetainingCapacity();
+        self.free_stack.clearRetainingCapacity();
+        var i: usize = self.num_states;
+        while (i > 0) {
+            i -= 1;
+            self.free_stack.append(self.allocator, i) catch {};
+        }
+    }
+
     // The previous `pub fn loadFromRbBin(self, path, io, log) !void` was
     // REMOVED — it was a legacy code path. The active path lives in
     // `src/dll/rollback_regions.zig` (`all_regions`) and is consumed directly
@@ -288,21 +363,49 @@ pub const StatePool = struct {
     // rather than reviving this binary-file code path.
 };
 
-fn saveFpu(out: *[28]u8) void {
-    // fnstenv writes the 28-byte x87 environment to the memory operand.
-    // The "=m" constraint marks `buf` as a write-only output so the
-    // compiler knows the asm modifies it.
-    var buf: [28]u8 = undefined;
-    asm volatile ("fnstenv %[fpu_env]"
-        : [fpu_env] "=m" (buf),
-    );
-    out.* = buf;
+// Save the FPU control state (x87 control word + SSE MXCSR).
+//
+// We intentionally use `fnstcw` (NOT `fnstenv`) and `stmxcsr` so that we
+// capture ONLY the control words that affect determinism. The x87 status
+// word (incl. TOP pointer), tag word, and data registers are NOT saved —
+// they describe transient execution state that should not be restored.
+//
+// On non-x86 hosts (e.g. x86_64 unit-test runners) we fall back to writing
+// the architecture's default control values so the SavedFpu struct is still
+// well-formed; restoreFpu() will be a no-op in that case.
+fn saveFpu(out: *SavedFpu) void {
+    if (builtin.cpu.arch == .x86) {
+        var cw: u16 = 0;
+        var mxcsr: u32 = 0;
+        asm volatile (
+            "fnstcw %[cw]\n\tstmxcsr %[mxcsr]"
+            : [cw] "=m" (cw),
+              [mxcsr] "=m" (mxcsr),
+        );
+        out.cw = cw;
+        out.mxcsr = mxcsr;
+    } else {
+        // Defaults match what _fpreset / ldmxcsr would set on x86.
+        out.cw = 0x037F; // x87: 53-bit precision, round-to-nearest, all exceptions masked
+        out.mxcsr = 0x1F80; // SSE: all exceptions masked, round-to-nearest, no FZ/DAZ
+    }
 }
 
-fn restoreFpu(env: *const [28]u8) void {
-    const buf: [28]u8 = env.*;
-    asm volatile ("fldenv %[fpu_env]"
+// Restore the FPU control state (x87 control word + SSE MXCSR).
+//
+// Uses `fldcw` (NOT `fldenv`) and `ldmxcsr` so that ONLY the control words
+// are written. The x87 status word, tag word, TOP pointer, and data
+// registers are left untouched — eliminating the stale-TOP / FPU-stack-
+// overflow bug that the previous `fldenv`-based implementation triggered
+// on the first rollback after entering `in_game`.
+fn restoreFpu(env: *const SavedFpu) void {
+    if (builtin.cpu.arch != .x86) return;
+    const cw: u16 = env.cw;
+    const mxcsr: u32 = env.mxcsr;
+    asm volatile (
+        "fldcw %[cw]\n\tldmxcsr %[mxcsr]"
         :
-        : [fpu_env] "m" (buf),
+        : [cw] "m" (cw),
+          [mxcsr] "m" (mxcsr),
     );
 }

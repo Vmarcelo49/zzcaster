@@ -118,30 +118,94 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
-    // Heartbeat check: if no packet received in 20s, the peer is dead.
+    // Heartbeat check: if no packet received in 120s, the peer is dead.
     // This catches crashes/kills that don't generate a DISCONNECT event.
     if (n.enet_connected and n.checkHeartbeat()) {
-        state.log.?.err("Peer heartbeat timeout (20s no packets) — forcing disconnect", .{});
+        state.log.?.err("Peer heartbeat timeout (120s no packets) — forcing disconnect", .{});
         n.enet_connected = false;
         state.alive_flag_addr.* = 0;
         return;
     }
 
-    // Lockstep wait for the remote's input. Skipped entirely while still
-    // connecting (the lazy-reconnect block above handles that). After connect,
-    // force-exit after 10s (matches CCCaster's MAX_WAIT_INPUTS_INTERVAL).
-    if (!n.enet_connected) {
-        n.writeGameInputs();
-        return;
-    }
-
+    // Lockstep wait for the remote's input.
+    //
+    // CCCaster's wait loop (DllMain.cpp:540-581) runs unconditionally inside
+    // `frameStepNormal()` — it does NOT skip when the socket is disconnected.
+    // When the remote hasn't connected yet, `isRemoteInputReady()` returns
+    // false (the remote input container is empty), so the loop blocks the
+    // game's main thread until the remote connects AND sends its first
+    // `PlayerInputs` for the current transition index. This is the mechanism
+    // that prevents the "fast peer enters gameplay before slow peer" desync:
+    // the faster peer's game freezes on InGame frame 0.
+    //
+    // The previous zzcaster code short-circuited this with:
+    //   if (!n.enet_connected) { n.writeGameInputs(); return; }
+    // which let the game run at FULL SPEED with no synchronization whenever
+    // ENet hadn't connected yet. This was the root cause of the user's bug:
+    // the lazy ENet reconnect (frame_step.zig:18-36) takes up to 15s, and if
+    // either peer reached InGame frame 0 during that window, the game would
+    // advance without waiting for the remote peer — causing the match to
+    // terminate or desync immediately.
+    //
+    // The fix: enter the wait loop unconditionally. The loop already polls
+    // ENet via `pollAndDispatch(10)`, which processes CONNECT events and
+    // establishes the connection.
+    //
+    // TIMEOUT POLICY:
+    // The 10s hard timeout (matching CCCaster's MAX_WAIT_INPUTS_INTERVAL)
+    // only fires when the remote peer has ALREADY reached the same transition
+    // index as the local peer but isn't sending frames — this indicates a
+    // real connectivity problem (peer crashed, packet loss, etc.).
+    //
+    // If the remote peer is still in an EARLIER transition index (i.e., still
+    // loading while the local peer has already reached InGame), the timeout
+    // does NOT fire. The faster peer's game simply freezes on InGame frame 0
+    // and waits for the slower peer to finish loading and catch up. This is
+    // the behavior the user described: "the player that loaded first should
+    // have their thread paused until the other catches up". A slow machine
+    // can take 15-30s to load, and terminating the session in that window
+    // would be incorrect — the slower peer is still making progress, just
+    // hasn't reached InGame yet.
+    //
+    // We detect "remote is still in an earlier state" by checking whether
+    // `remote_inputs.getEndIndex()` (which reflects the highest transition
+    // index the remote has sent inputs for) is less than the local peer's
+    // current `indexed_frame.index`. When the remote sends its
+    // `TransitionIndex` for InGame, `setRemoteIndex` → `resizeOuter` bumps
+    // `end_index` to InGame+1, so this check correctly transitions from
+    // "still loading" to "at InGame, awaiting frames" when the remote
+    // finishes loading.
     if (!n.isRemoteInputReady()) {
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
+        var connected_since: i64 = 0; // 0 = not yet connected
+        var remote_at_index_since: i64 = 0; // 0 = remote hasn't reached our index yet
         var last_resend = wait_start;
         var warned = false;
         while (!n.isRemoteInputReady()) {
             n.pollAndDispatch(10);
             const now = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
+
+            // Track when ENet first connected so timeouts that depend on
+            // connectivity don't fire during the lazy-reconnect window.
+            if (connected_since == 0 and n.enet_connected) {
+                connected_since = now;
+            }
+
+            // Track when the remote peer first reached our transition index.
+            // The 10s input-wait timeout only starts counting from this point.
+            // Before this, the remote is still in an earlier state (Loading,
+            // CharaIntro, etc.) and we wait for them to catch up without a
+            // hard timeout — a slow machine can take 30s+ to load.
+            const remote_end_index = if (n.remote_inputs.getEndIndex() > 0)
+                n.remote_inputs.getEndIndex() - 1
+            else
+                0;
+            if (remote_at_index_since == 0 and remote_end_index >= n.indexed_frame.index) {
+                remote_at_index_since = now;
+                state.log.?.info("Remote reached transition index {d} — starting 10s input-wait countdown", .{
+                    n.indexed_frame.index,
+                });
+            }
 
             if (now - last_resend > 100) {
                 n.sendLocalInputs();
@@ -154,8 +218,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             //      connected yet. By the time we're in this wait loop,
             //      `pollAndDispatch(10)` may have just established the
             //      connection — without this call the host would never
-            //      send the RNG and both sides would deadlock until the
-            //      10s timeout fires.
+            //      send the RNG and both sides would deadlock.
             //   2. The client is now blocking on `rng_synced` (see
             //      `isRemoteInputReady`), so the host MUST be able to
             //      (re-)send the RNG packet from inside this loop.
@@ -180,13 +243,41 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             }
 
             if (!warned and now - wait_start > 5000) {
-                state.log.?.warn("Waiting for remote input... (5s elapsed)", .{});
+                state.log.?.warn("Waiting for remote input... (5s elapsed, enet_connected={}, remote_end_index={d}, local_index={d})", .{
+                    n.enet_connected, remote_end_index, n.indexed_frame.index,
+                });
                 warned = true;
             }
 
-            // TIMEOUT after 10s — force exit (matches CCCaster)
-            if (now - wait_start > 10000) {
-                state.log.?.err("Timed out waiting for remote input (10s) — forcing exit", .{});
+            // TIMEOUT: 10s after the remote peer reached our transition index
+            // without sending any inputs for the current frame. This matches
+            // CCCaster's MAX_WAIT_INPUTS_INTERVAL (10s).
+            //
+            // This timeout ONLY fires when the remote has confirmed it reached
+            // our index (via TransitionIndex → resizeOuter) but hasn't sent any
+            // PlayerInputs for this frame. That indicates a real problem:
+            //   - The remote's game crashed after entering InGame
+            //   - Severe packet loss preventing PlayerInputs from arriving
+            //   - The remote is stuck in a bad state
+            //
+            // If the remote is STILL LOADING (remote_end_index < local_index),
+            // this timeout does NOT fire — we keep waiting. The slower peer
+            // will eventually finish loading, send TransitionIndex for InGame,
+            // and then the 10s countdown begins.
+            if (remote_at_index_since != 0 and now - remote_at_index_since > 10000) {
+                state.log.?.err("Timed out waiting for remote input (10s after remote reached index {d}) — forcing exit", .{
+                    n.indexed_frame.index,
+                });
+                state.alive_flag_addr.* = 0;
+                return;
+            }
+
+            // If the lazy reconnect gave up (connect_attempts_exhausted) and
+            // we still don't have a connection, the peer is unreachable. Don't
+            // block the game forever — force-exit so the user sees a clean
+            // termination instead of a permanent hang.
+            if (n.connect_attempts_exhausted and !n.enet_connected) {
+                state.log.?.err("ENet reconnect exhausted and peer unreachable — forcing exit", .{});
                 state.alive_flag_addr.* = 0;
                 return;
             }
@@ -214,8 +305,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         // 988-989). The Zig port's early `return` here was a regression
         // that broke rollback correctness.
         n.writeGameInputs();
-        _ = n.checkRerunComplete();
-        return;
+        if (n.checkRerunComplete()) {
+            // Rerun completed on this frame. Fall through to normal frame logic so the frame
+            // is saved, spectator packets are sent, etc.
+        } else {
+            // Rerun still in progress. Save state for this re-simulated frame so we have
+            // correct intermediate checkpoints.
+            _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+            return;
+        }
     }
 
     if (n.rollback_timer < n.min_rollback_spacing) {

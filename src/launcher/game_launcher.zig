@@ -96,6 +96,12 @@ pub fn launchGameImpl(
     log.info("Game launched (PID={d})", .{pid});
 
     if (ipc_server.*) |*srv| {
+        if (win_launcher.*) |*wl| {
+            if (!wl.isAlive()) {
+                setErr(error_msg, error_msg_len, "Game exited immediately");
+                return;
+            }
+        }
         srv.waitForConnection() catch {
             setErr(error_msg, error_msg_len, "IPC connection failed");
             return;
@@ -189,6 +195,12 @@ pub fn launchNetplayImpl(
     log.info("Game launched (PID={d})", .{pid});
 
     if (ipc_server.*) |*srv| {
+        if (win_launcher.*) |*wl| {
+            if (!wl.isAlive()) {
+                setErr(error_msg, error_msg_len, "Game exited immediately");
+                return;
+            }
+        }
         srv.waitForConnection() catch {
             setErr(error_msg, error_msg_len, "IPC connection failed");
             return;
@@ -306,6 +318,12 @@ pub fn launchGameAfterHandshake(
     log.info("Game launched (PID={d})", .{pid});
 
     if (ipc_server.*) |*srv| {
+        if (win_launcher.*) |*wl| {
+            if (!wl.isAlive()) {
+                setErr(error_msg, error_msg_len, "Game exited immediately");
+                return;
+            }
+        }
         srv.waitForConnection() catch {
             setErr(error_msg, error_msg_len, "IPC connection failed");
             return;
@@ -380,6 +398,11 @@ pub fn launchGame(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config,
     };
     log.info("Game launched (PID={d})", .{pid});
 
+    if (!win_launcher.isAlive()) {
+        log.err("Game exited immediately", .{});
+        return;
+    }
+
     ipc_server.waitForConnection() catch {
         log.warn("IPC connection failed", .{});
         return;
@@ -432,6 +455,11 @@ pub fn launchNetplayPeerImpl(allocator: std.mem.Allocator, io: std.Io, cfg: *con
         .high_priority = cfg.high_cpu_priority,
     }, log) catch return;
     log.info("Game launched (PID={d})", .{pid});
+
+    if (!win_launcher.isAlive()) {
+        log.err("Game exited immediately", .{});
+        return;
+    }
 
     ipc_server.waitForConnection() catch {};
     log.info("DLL connected via IPC", .{});
@@ -543,6 +571,11 @@ pub fn runCliNetplay(
         return;
     };
     log.info("Game launched (PID={d})", .{pid});
+
+    if (!win_launcher.isAlive()) {
+        log.err("Game exited immediately", .{});
+        return;
+    }
 
     ipc_server.waitForConnection() catch {
         log.warn("IPC connection failed", .{});

@@ -31,10 +31,14 @@ pub const Config = struct {
 };
 
 pub fn loadConfig(allocator: std.mem.Allocator, io: std.Io) !Config {
+    const app_dir = try allocator.dupe(u8, ".");
+    errdefer allocator.free(app_dir);
+    const game_dir = try allocator.dupe(u8, ".");
+
     var cfg = Config{
         .allocator = allocator,
-        .app_dir = try allocator.dupe(u8, "."),
-        .game_dir = try allocator.dupe(u8, "."),
+        .app_dir = app_dir,
+        .game_dir = game_dir,
     };
 
     // Try to read config.ini

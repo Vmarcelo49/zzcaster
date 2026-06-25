@@ -1519,16 +1519,46 @@ pub const NetplayManager = struct {
             self.log.info("Intro done (game_state=99) — RNG sync enabled", .{});
         }
 
-        // chara_intro → in_game: CC_INTRO_STATE_ADDR drops to 0 when players
-        // can move. Only transition out of chara_intro — if we're already
-        // in_game this is a no-op.
+        // chara_intro → in_game: requires BOTH signals to fire.
+        //
+        //   1. intro_state_addr.* == 0: the game itself confirms players can
+        //      move (CC_INTRO_STATE_ADDR drops to 0). This is the legacy gate
+        //      and is required to preserve the invariant that
+        //      `state == .in_game` implies `intro_state == 0` — otherwise
+        //      rollback could load a state with intro_state != 0 and corrupt
+        //      the gameplay path (clearIntroStateDuringRollback only fires
+        //      past frame 224).
+        //
+        //   2. remote_inputs.getEndIndex() > indexed_frame.index: the remote
+        //      peer has reached our current transition index. This makes the
+        //      faster peer wait during chara_intro for the slower peer to
+        //      catch up before both enter in_game — otherwise the slower
+        //      peer would arrive in in_game alone (with no remote inputs to
+        //      lockstep against) and immediately stall on the first frame.
+        //
+        // The previous "remote-only" gate broke invariant #1 and caused a
+        // crash when the faster peer pressed any input in in_game. The
+        // original "intro-only" gate dropped invariant #2 and let the
+        // faster peer run ahead of the slower peer during the intro. The
+        // AND gate satisfies both.
         if (self.state == .chara_intro and intro_state_addr.* == 0) {
-            const old = self.state;
-            _ = self.isValidNext(.in_game);
-            self.state = .in_game;
-            self.onStateTransition(old, .in_game);
-            self.log.info("CharaIntro -> InGame (intro_state=0, players can move)", .{});
-            if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+            const remote_end_index = self.remote_inputs.getEndIndex();
+            if (remote_end_index > self.indexed_frame.index) {
+                const old = self.state;
+                _ = self.isValidNext(.in_game);
+                self.state = .in_game;
+                self.onStateTransition(old, .in_game);
+                self.log.info("CharaIntro -> InGame (intro_state=0, remote caught up at index {d})", .{self.indexed_frame.index});
+                if (self.sfx_dedup) |*sd| sd.clearPerFrame();
+            } else {
+                // Faster peer: chara_intro finished visually but remote is
+                // still behind. Keep state == .chara_intro so getNetplayInput
+                // still suppresses direction/action buttons, and the next
+                // frame's checkIntroDone will re-evaluate.
+                self.log.info("CharaIntro intro_state=0 but remote behind (remote_end_index={d}, our_index={d}) — waiting", .{
+                    remote_end_index, self.indexed_frame.index,
+                });
+            }
         }
     }
 

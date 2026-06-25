@@ -987,7 +987,35 @@ pub const NetplayManager = struct {
                 // the intro animation is the intended behavior.
                 return 0;
             },
-            .chara_intro, .skippable => {
+            .chara_intro => {
+                // CC_INTRO_STATE_ADDR values:
+                //   2 = character intro animation (players can't move yet)
+                //   1 = pre-game: characters are on the arena, players CAN
+                //       move (jumps, dashes, attacks all work), but the
+                //       round timer hasn't started. We pass input through
+                //       here so the player can warm up / test inputs before
+                //       "Round 1 Fight" fires. The FSM stays in .chara_intro
+                //       until intro_state drops to 0 (the actual round start),
+                //       keeping the invariant `state == .in_game ⇒
+                //       intro_state == 0` intact (rollback won't load a state
+                //       with intro_state != 0).
+                //   0 = already at the in-game threshold; checkIntroDone
+                //       will transition to .in_game this frame (or already
+                //       did).
+                if (intro_state_addr.* != 2) {
+                    return raw_input;
+                }
+                // Still in character intro animation: only allow Confirm/Cancel.
+                // If remote is ahead, mash Confirm to catch up.
+                if (self.shouldCatchUp()) {
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+                return raw_input & 0xC000; // keep only Confirm + Cancel bits
+            },
+            .skippable => {
                 // If remote is ahead, mash Confirm to catch up.
                 if (self.shouldCatchUp()) {
                     if (self.indexed_frame.frame % 2 == 0) {
@@ -997,7 +1025,7 @@ pub const NetplayManager = struct {
                 }
                 // Otherwise, only allow Confirm/Cancel through — suppress
                 // all direction and action buttons so the player can't
-                // accidentally affect game state during intro/skippable.
+                // accidentally affect game state during skippable.
                 // Confirm = 0x0400 in btns = 0x4000 in combined.
                 // Cancel  = 0x0800 in btns = 0x8000 in combined.
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits
@@ -1427,6 +1455,15 @@ pub const NetplayManager = struct {
     ///   loading → chara_intro (versus) | in_game (training)
     ///     ↑ DROPPED vs CCCaster: Loading → Skippable.
     ///   chara_intro → in_game
+    ///     ↑ During chara_intro, the game has a "pre-game" sub-phase where
+    ///       CC_INTRO_STATE_ADDR == 1: characters are on the arena and
+    ///       players can move (input is passed through via the
+    ///       `chara_intro_intro_state != 2` check in getNetplayInput), but
+    ///       the round hasn't officially started. We do NOT add a separate
+    ///       `.pre_game` state because that would require an extra
+    ///       `TransitionIndex` packet and index increment per round, which
+    ///       complicates peer sync (host at index N+1 sending inputs while
+    ///       remote is still at index N in chara_intro).
     ///   in_game → skippable | chara_select
     ///     ↑ DROPPED vs CCCaster: InGame → RetryMenu (and ReplayMenu, no such state).
     ///   skippable → in_game (next round) | retry_menu | chara_select

@@ -1,11 +1,10 @@
 const std = @import("std");
 const logging = @import("common").logging;
 const mapper = @import("dll").controller_mapper;
+const zgui = @import("zgui");
 
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
-    @cInclude("SDL2/SDL_opengl.h");
-    @cInclude("cimgui_shim.h");
 });
 
 pub fn applyBinding(m: *mapper.ControllerMapping, target: mapper.BindingTarget, binding: mapper.InputBinding) void {
@@ -27,7 +26,7 @@ pub fn applyBinding(m: *mapper.ControllerMapping, target: mapper.BindingTarget, 
     }
 }
 
-pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapper.InputBinding, bind_target: *mapper.BindingTarget, cooldown_until_ms: *i64, now_ms: i64) void {
+pub fn bindButton(label: [:0]const u8, target: mapper.BindingTarget, binding: mapper.InputBinding, bind_target: *mapper.BindingTarget, cooldown_until_ms: *i64, now_ms: i64) void {
     var buf: [64]u8 = undefined;
     const bind_label = binding.label(&buf);
 
@@ -35,11 +34,11 @@ pub fn bindButton(label: []const u8, target: mapper.BindingTarget, binding: mapp
         // This button is currently being bound — show "Press input..."
         var btn_buf: [80]u8 = undefined;
         const btn_text = std.fmt.bufPrintZ(&btn_buf, "{s}: Press...", .{label}) catch label;
-        _ = c.igButton(btn_text.ptr, .{ .x = 90, .y = 0 });
+        _ = zgui.button(btn_text, .{ .w = 90, .h = 0 });
     } else {
         var btn_buf: [80]u8 = undefined;
         const btn_text = std.fmt.bufPrintZ(&btn_buf, "{s}: {s}", .{ label, bind_label }) catch label;
-        if (c.igButton(btn_text.ptr, .{ .x = 90, .y = 0 })) {
+        if (zgui.button(btn_text, .{ .w = 90, .h = 0 })) {
             bind_target.* = target;
             // 250 ms wall-clock cooldown so the same click that triggered
             // "press to bind" is not read back as the binding itself.
@@ -73,14 +72,27 @@ pub fn drawPlayerPanel(
     const id_suffix = std.fmt.bufPrintZ(&id_suffix_buf, "##{s}", .{name}) catch "##p";
 
     // Player label + device combo
-    var name_buf: [32]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch name;
-    c.igText("%s", @as([*:0]const u8, @ptrCast(name_z.ptr)));
-    c.igSameLine(0, 16);
+    zgui.text("{s}", .{name});
+    zgui.sameLine(.{ .spacing = 16 });
 
     var combo_label_buf: [48]u8 = undefined;
     const combo_label = std.fmt.bufPrintZ(&combo_label_buf, "##device_{s}", .{name}) catch "##device";
-    _ = c.igCombo_Str_arr(combo_label.ptr, @ptrCast(device_sel), @ptrCast(dev_names), dev_count, 8);
+
+    const preview = if (device_sel.* >= 0 and device_sel.* < dev_count) dev_names[@intCast(device_sel.*)] else "";
+    if (zgui.beginCombo(combo_label, .{ .preview_value = preview })) {
+        defer zgui.endCombo();
+        var i: i32 = 0;
+        while (i < dev_count) : (i += 1) {
+            const item_name = dev_names[@intCast(i)];
+            const is_selected = (device_sel.* == i);
+            if (zgui.selectable(std.mem.span(item_name), .{ .selected = is_selected })) {
+                device_sel.* = i;
+            }
+            if (is_selected) {
+                zgui.setItemDefaultFocus();
+            }
+        }
+    }
 
     // Open/close joystick when device changes
     const new_dev: c_int = device_sel.* - 1;
@@ -98,123 +110,123 @@ pub fn drawPlayerPanel(
         m.device_index = new_dev;
     }
 
-    c.igSpacing();
+    zgui.spacing();
 
     // Push a unique ID stack for this player's widgets
-    c.igPushID_Str(id_suffix.ptr);
+    zgui.pushStrId(id_suffix);
 
     // Top row: FN1, Start, FN2
-    c.igIndent(200);
+    zgui.indent(.{ .indent_w = 200 });
     bindButton("FN1", .fn1, m.fn1, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("Start", .start, m.start, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("FN2", .fn2, m.fn2, bind_target, cooldown_until_ms, now_ms);
-    c.igUnindent(200);
+    zgui.unindent(.{ .indent_w = 200 });
 
-    c.igSpacing();
-    c.igSeparator();
-    c.igSpacing();
+    zgui.spacing();
 
     // Two columns: Directions (left) + Buttons (right)
-    // Reduced height by ~30px (one button row) to tighten the layout.
-    _ = c.igBeginChild_Str("dir", .{ .x = 220, .y = 110 }, true, 0);
+    _ = zgui.beginChild("dir", .{ .w = 250, .h = 165, .child_flags = .{ .border = true }, .window_flags = .{ .no_scrollbar = true } });
+    zgui.indent(.{ .indent_w = 5 });
 
-    c.igText("Directions");
-    c.igSpacing();
+    const dir_title = "Directions";
+    const dir_w = zgui.calcTextSize(dir_title, .{})[0];
+    zgui.setCursorPosX((250.0 - dir_w) / 2 + 5);
+    zgui.text(dir_title, .{});
+    zgui.spacing();
 
     // Up (centered)
-    c.igIndent(60);
+    zgui.indent(.{ .indent_w = 72 });
     bindButton("Up", .up, m.up, bind_target, cooldown_until_ms, now_ms);
-    c.igUnindent(60);
+    zgui.unindent(.{ .indent_w = 72 });
 
     // Left + Right
     bindButton("Left", .left, m.left, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
-    c.igDummy(.{ .x = 30, .y = 0 });
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
+    zgui.dummy(.{ .w = 30, .h = 0 });
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("Right", .right, m.right, bind_target, cooldown_until_ms, now_ms);
 
     // Down (centered)
-    c.igIndent(60);
+    zgui.indent(.{ .indent_w = 72 });
     bindButton("Down", .down, m.down, bind_target, cooldown_until_ms, now_ms);
-    c.igUnindent(60);
+    zgui.unindent(.{ .indent_w = 72 });
 
-    c.igEndChild();
+    zgui.unindent(.{ .indent_w = 5 });
+    zgui.endChild();
 
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
 
-    _ = c.igBeginChild_Str("btn", .{ .x = 310, .y = 110 }, true, 0);
+    _ = zgui.beginChild("btn", .{ .w = 310, .h = 165, .child_flags = .{ .border = true }, .window_flags = .{ .no_scrollbar = true } });
+    zgui.indent(.{ .indent_w = 5 });
 
-    c.igText("Buttons");
-    c.igSpacing();
+    const btn_title = "Buttons";
+    const btn_w = zgui.calcTextSize(btn_title, .{})[0];
+    zgui.setCursorPosX((310.0 - btn_w) / 2 + 5);
+    zgui.text(btn_title, .{});
+    zgui.spacing();
 
     // Row 1: A, B, C
     bindButton("A", .a, m.a, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("B", .b, m.b, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("C", .c, m.c, bind_target, cooldown_until_ms, now_ms);
 
-    c.igSpacing();
+    zgui.spacing();
 
     // Row 2: D, E, AB
     bindButton("D", .d, m.d, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("E", .e, m.e, bind_target, cooldown_until_ms, now_ms);
-    c.igSameLine(0, 8);
+    zgui.sameLine(.{ .spacing = 8 });
     bindButton("A+B", .ab, m.ab, bind_target, cooldown_until_ms, now_ms);
 
-    c.igEndChild();
+    zgui.unindent(.{ .indent_w = 5 });
+    zgui.endChild();
 
-    c.igSpacing();
+    zgui.sameLine(.{ .spacing = 8 });
 
-    // SOCD mode radio buttons — "Default" removed since the default is
-    // already L+R neg (mode 1). Modes: 1=L+R neg, 2=U+D neg, 3=Both neg.
-    c.igText("SOCD:");
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("L+R neg", m.socd_mode == 1)) m.socd_mode = 1;
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("U+D neg", m.socd_mode == 2)) m.socd_mode = 2;
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("Both neg", m.socd_mode == 3)) m.socd_mode = 3;
-    // If the user had socd_mode == 0 (old "Default"), normalize to 1.
+    _ = zgui.beginChild("opt", .{ .w = 340, .h = 165, .child_flags = .{ .border = true }, .window_flags = .{ .no_scrollbar = true } });
+    zgui.indent(.{ .indent_w = 5 });
+
+    const opt_title = "Options";
+    const opt_w = zgui.calcTextSize(opt_title, .{})[0];
+    zgui.setCursorPosX((340.0 - opt_w) / 2 + 5);
+    zgui.text(opt_title, .{});
+    zgui.spacing();
+
+    // Line 1: SOCD mode
+    zgui.text("SOCD:", .{});
+    zgui.sameLine(.{ .spacing = 6 });
+    if (zgui.radioButton("L+R", .{ .active = m.socd_mode == 1 })) m.socd_mode = 1;
+    zgui.sameLine(.{ .spacing = 6 });
+    if (zgui.radioButton("U+D", .{ .active = m.socd_mode == 2 })) m.socd_mode = 2;
+    zgui.sameLine(.{ .spacing = 6 });
+    if (zgui.radioButton("Both", .{ .active = m.socd_mode == 3 })) m.socd_mode = 3;
     if (m.socd_mode == 0) m.socd_mode = 1;
 
-    c.igSpacing();
+    zgui.spacing();
 
-    // Air Dash Macro toggle. Per-player input option (see
-    // docs/air-dash-macro-design.md). When enabled, pressing 9AB/7AB is
-    // expanded into a 2-frame jump→air-dash sequence before the input reaches
-    // the game / network. Off by default.
-    _ = c.igCheckbox("Air Dash Macro (9AB/7AB)", &m.air_dash_macro);
-
-    c.igSpacing();
-
-    // Analog Deadzone as a 0.0-1.0 float slider.
-    // Internally stored as u32 (0-32767, matching SDL axis range), but
-    // displayed as a normalized float for user-friendliness.
-    // Use PushItemWidth to make the slider a small field (120px) instead
-    // of stretching to fill the available width.
+    // Line 2: Macro & Deadzone slider
+    _ = zgui.checkbox("AD Macro (9AB)", .{ .v = &m.air_dash_macro });
+    zgui.sameLine(.{ .spacing = 12 });
     var dz_float: f32 = @as(f32, @floatFromInt(m.deadzone)) / 32767.0;
-    c.igPushItemWidth(120.0);
-    _ = c.igSliderFloat("Analog Deadzone", &dz_float, 0.0, 1.0, "%.2f", 0);
-    c.igPopItemWidth();
+    zgui.pushItemWidth(65.0);
+    _ = zgui.sliderFloat("Deadzone", .{ .v = &dz_float, .min = 0.0, .max = 1.0, .cfmt = "%.2f" });
+    zgui.popItemWidth();
     m.deadzone = @intFromFloat(dz_float * 32767.0);
 
-    c.igSameLine(0, 16);
+    zgui.spacing();
 
-    if (c.igButton("Default Bindings", .{ .x = 130, .y = 0 })) {
+    // Line 3: Default Bindings / Clear
+    if (zgui.button("Default Bindings", .{ .w = 120, .h = 0 })) {
         m.* = mapper.defaultXboxMapping();
         m.device_index = device_sel.* - 1;
     }
-    c.igSameLine(0, 8);
-
-    if (c.igButton("Clear", .{ .x = 60, .y = 0 })) {
-        // Clear all bindings to .none (type=none, index=0). The struct
-        // defaults pre-fill buttons with sdl_button indices, so m.* = .{}
-        // does NOT actually clear — it resets to those defaults. We need
-        // to explicitly set each binding to an empty InputBinding.
+    zgui.sameLine(.{ .spacing = 8 });
+    if (zgui.button("Clear", .{ .w = 50, .h = 0 })) {
         m.a = .{};
         m.b = .{};
         m.c = .{};
@@ -228,10 +240,12 @@ pub fn drawPlayerPanel(
         m.down = .{};
         m.left = .{};
         m.right = .{};
-        // Keep device_index, stick axes, deadzone, socd_mode as-is.
     }
 
-    c.igPopID();
+    zgui.unindent(.{ .indent_w = 5 });
+    zgui.endChild();
+
+    zgui.popId();
 }
 
 pub fn drawListPanel(
@@ -252,18 +266,31 @@ pub fn drawListPanel(
     // Build unique ID suffix for ImGui ID stack
     var id_suffix_buf: [32]u8 = undefined;
     const id_suffix = std.fmt.bufPrintZ(&id_suffix_buf, "##list_{s}", .{name}) catch "##list_p";
-    c.igPushID_Str(id_suffix.ptr);
+    zgui.pushStrId(id_suffix);
 
     // Player name header
-    var name_buf: [32]u8 = undefined;
-    const name_z = std.fmt.bufPrintZ(&name_buf, "{s}", .{name}) catch name;
-    c.igText("%s", @as([*:0]const u8, @ptrCast(name_z.ptr)));
-    c.igSpacing();
+    zgui.text("{s}", .{name});
+    zgui.spacing();
 
     // Device combo
     var combo_label_buf: [48]u8 = undefined;
     const combo_label = std.fmt.bufPrintZ(&combo_label_buf, "##device_{s}", .{name}) catch "##device";
-    _ = c.igCombo_Str_arr(combo_label.ptr, @ptrCast(device_sel), @ptrCast(dev_names), dev_count, 8);
+
+    const preview = if (device_sel.* >= 0 and device_sel.* < dev_count) dev_names[@intCast(device_sel.*)] else "";
+    if (zgui.beginCombo(combo_label, .{ .preview_value = preview })) {
+        defer zgui.endCombo();
+        var i: i32 = 0;
+        while (i < dev_count) : (i += 1) {
+            const item_name = dev_names[@intCast(i)];
+            const is_selected = (device_sel.* == i);
+            if (zgui.selectable(std.mem.span(item_name), .{ .selected = is_selected })) {
+                device_sel.* = i;
+            }
+            if (is_selected) {
+                zgui.setItemDefaultFocus();
+            }
+        }
+    }
 
     // Open/close joystick when device changes
     const new_dev: c_int = device_sel.* - 1;
@@ -281,15 +308,15 @@ pub fn drawListPanel(
         m.device_index = new_dev;
     }
 
-    c.igSpacing();
-    c.igSeparator();
-    c.igSpacing();
+    zgui.spacing();
+    zgui.separator();
+    zgui.spacing();
 
     // Each row: [in-game button name (fixed width)] [bind button]
     // Use a table-like layout with align_text_to_frame_padding for clean
     // vertical alignment. The name column is 90px wide; the bind button
     // fills the rest.
-    const rows = [_]struct { label: []const u8, target: mapper.BindingTarget, binding: mapper.InputBinding }{
+    const rows = [_]struct { label: [:0]const u8, target: mapper.BindingTarget, binding: mapper.InputBinding }{
         .{ .label = "Up", .target = .up, .binding = m.up },
         .{ .label = "Down", .target = .down, .binding = m.down },
         .{ .label = "Left", .target = .left, .binding = m.left },
@@ -307,52 +334,50 @@ pub fn drawListPanel(
 
     for (rows) |row| {
         // In-game button name (left column, fixed width)
-        c.igAlignTextToFramePadding();
-        var label_buf: [32]u8 = undefined;
-        const label_z = std.fmt.bufPrintZ(&label_buf, "{s}", .{row.label}) catch row.label;
-        c.igText("%s", @as([*:0]const u8, @ptrCast(label_z.ptr)));
-        c.igSameLine(90, 8); // 90px name column + 8px spacing
+        zgui.alignTextToFramePadding();
+        zgui.text("{s}", .{row.label});
+        zgui.sameLine(.{ .offset_from_start_x = 90, .spacing = 8 }); // 90px name column + 8px spacing
         // Bind button (right column)
         bindButton(row.label, row.target, row.binding, bind_target, cooldown_until_ms, now_ms);
     }
 
-    c.igSpacing();
-    c.igSeparator();
-    c.igSpacing();
+    zgui.spacing();
+    zgui.separator();
+    zgui.spacing();
 
     // SOCD mode radio buttons
-    c.igText("SOCD:");
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("L+R neg", m.socd_mode == 1)) m.socd_mode = 1;
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("U+D neg", m.socd_mode == 2)) m.socd_mode = 2;
-    c.igSameLine(0, 8);
-    if (c.igRadioButton_Bool("Both neg", m.socd_mode == 3)) m.socd_mode = 3;
+    zgui.text("SOCD:", .{});
+    zgui.sameLine(.{ .spacing = 8 });
+    if (zgui.radioButton("L+R neg", .{ .active = m.socd_mode == 1 })) m.socd_mode = 1;
+    zgui.sameLine(.{ .spacing = 8 });
+    if (zgui.radioButton("U+D neg", .{ .active = m.socd_mode == 2 })) m.socd_mode = 2;
+    zgui.sameLine(.{ .spacing = 8 });
+    if (zgui.radioButton("Both neg", .{ .active = m.socd_mode == 3 })) m.socd_mode = 3;
     if (m.socd_mode == 0) m.socd_mode = 1;
 
-    c.igSpacing();
+    zgui.spacing();
 
     // Air Dash Macro toggle (per-player; see drawPlayerPanel for details).
-    _ = c.igCheckbox("Air Dash Macro (9AB/7AB)", &m.air_dash_macro);
+    _ = zgui.checkbox("Air Dash Macro (9AB/7AB)", .{ .v = &m.air_dash_macro });
 
-    c.igSpacing();
+    zgui.spacing();
 
     // Analog Deadzone (0.0-1.0 float, small field)
     var dz_float: f32 = @as(f32, @floatFromInt(m.deadzone)) / 32767.0;
-    c.igPushItemWidth(120.0);
-    _ = c.igSliderFloat("Analog Deadzone", &dz_float, 0.0, 1.0, "%.2f", 0);
-    c.igPopItemWidth();
+    zgui.pushItemWidth(120.0);
+    _ = zgui.sliderFloat("Analog Deadzone", .{ .v = &dz_float, .min = 0.0, .max = 1.0, .cfmt = "%.2f" });
+    zgui.popItemWidth();
     m.deadzone = @intFromFloat(dz_float * 32767.0);
 
-    c.igSpacing();
+    zgui.spacing();
 
     // Default Bindings + Clear buttons
-    if (c.igButton("Default Bindings", .{ .x = 130, .y = 0 })) {
+    if (zgui.button("Default Bindings", .{ .w = 130, .h = 0 })) {
         m.* = mapper.defaultXboxMapping();
         m.device_index = device_sel.* - 1;
     }
-    c.igSameLine(0, 8);
-    if (c.igButton("Clear", .{ .x = 60, .y = 0 })) {
+    zgui.sameLine(.{ .spacing = 8 });
+    if (zgui.button("Clear", .{ .w = 60, .h = 0 })) {
         m.a = .{};
         m.b = .{};
         m.c = .{};
@@ -368,7 +393,7 @@ pub fn drawListPanel(
         m.right = .{};
     }
 
-    c.igPopID();
+    zgui.popId();
 }
 
 /// Build the device-name combo box array used by the Controllers tab.

@@ -121,21 +121,35 @@ zgui.text("Big text!");
 
 ### From memory (embedded)
 
-For single-binary distribution, embed the TTF with `@embedFile`:
+For single-binary distribution, embed the TTF with `@embedFile` and load it directly. In `zgui` 0.6.0, `addFontFromMemory` automatically sets `FontDataOwnedByAtlas = false` internally, so it won't crash when the application exits:
 
 ```zig
 const roboto_ttf = @embedFile("../assets/Roboto-Medium.ttf");
-
-const config = zgui.io.FontConfig{
-    .font_data = @constCast(roboto_ttf.ptr),
-    .font_data_size = roboto_ttf.len,
-    .size_pixels = 18.0,
-};
-_ = zgui.io.addFontFromMemory(&config);
+const font = zgui.io.addFontFromMemory(roboto_ttf, 18.0);
+zgui.io.setDefaultFont(font);
 ```
 
-Note: `addFontFromMemory` takes ownership of the buffer if `font_data_owned_by_atlas =
-true`. For embedded fonts (which are static), set `font_data_owned_by_atlas = false`.
+### From memory with custom config (vertical alignment & offsets)
+
+If you need to customize settings (like shifting text up or down for serif fonts with large ascenders/descenders), use `addFontFromMemoryWithConfig`. 
+
+> [!WARNING]
+> When using `addFontFromMemoryWithConfig`, you **MUST** manually set `font_data_owned_by_atlas = false` in your `FontConfig`. Since `FontConfig.init()` uses the default ImGui constructor (which sets it to `true`), failing to set it to `false` will cause Dear ImGui to attempt to deallocate the embedded static buffer on exit, resulting in a segmentation fault.
+
+```zig
+const font_ttf = @embedFile("font.ttf");
+
+var font_config = zgui.FontConfig.init();
+// CRITICAL: Prevent crash on exit by telling ImGui not to free embedded memory
+font_config.font_data_owned_by_atlas = false;
+
+// Tweak glyph offset: Y offset shifts glyphs vertically (e.g. negative to shift text up).
+// This is extremely useful for serif fonts (like EB Garamond) which render too low.
+font_config.glyph_offset = .{ 0.0, -2.5 }; 
+
+const font = zgui.io.addFontFromMemoryWithConfig(font_ttf, 18.0, font_config, null);
+zgui.io.setDefaultFont(font);
+```
 
 ### With config
 

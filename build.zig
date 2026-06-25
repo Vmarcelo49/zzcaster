@@ -199,37 +199,21 @@ pub fn build(b: *std.Build) void {
     launcher_mod.addIncludePath(b.path("libs/enet/include"));
     launcher_mod.linkLibrary(enet);
 
-    // ImGui + cimgui
-    launcher_mod.addIncludePath(b.path("libs/imgui"));
-    launcher_mod.addIncludePath(b.path("libs/imgui/backends"));
-    launcher_mod.addIncludePath(b.path("libs/cimgui"));
-    launcher_mod.addIncludePath(b.path("src")); // for cimgui_shim.h
+    // ImGui + zgui
+    const zgui_dep = b.dependency("zgui", .{
+        .target = target,
+        .optimize = optimize,
+        .backend = .sdl2_opengl3,
+    });
+    launcher_mod.addImport("zgui", zgui_dep.module("root"));
+    launcher_mod.linkLibrary(zgui_dep.artifact("imgui"));
+
     if (sdl2_mingw_present) {
         const sdl2_inc = b.pathJoin(&.{ sdl2_arch_dir, "include/SDL2" });
-        launcher_mod.addIncludePath(.{ .cwd_relative = sdl2_inc });
+        zgui_dep.artifact("imgui").root_module.addIncludePath(.{ .cwd_relative = sdl2_inc });
         const sdl2_inc_parent = b.pathJoin(&.{ sdl2_arch_dir, "include" });
-        launcher_mod.addIncludePath(.{ .cwd_relative = sdl2_inc_parent });
+        zgui_dep.artifact("imgui").root_module.addIncludePath(.{ .cwd_relative = sdl2_inc_parent });
     }
-    launcher_mod.addCSourceFiles(.{
-        .files = &.{
-            "libs/imgui/imgui.cpp",
-            "libs/imgui/imgui_draw.cpp",
-            "libs/imgui/imgui_tables.cpp",
-            "libs/imgui/imgui_widgets.cpp",
-            "libs/imgui/imgui_demo.cpp",
-            "libs/cimgui/cimgui.cpp",
-            "libs/imgui/backends/imgui_impl_sdl2.cpp",
-            "libs/imgui/backends/imgui_impl_opengl3.cpp",
-            "src/imgui_backend_wrap.cpp",
-        },
-        .flags = &.{
-            "-DIMGUI_DISABLE_OBSOLETE_FUNCTIONS",
-            "-I",
-            "libs/imgui",
-            "-I",
-            "libs/cimgui",
-        },
-    });
     launcher_mod.linkSystemLibrary("opengl32", .{});
 
     // === zzcaster.exe ===

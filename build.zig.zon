@@ -13,8 +13,12 @@
     .minimum_zig_version = "0.16.0",
     // Dependencies (none yet — vendored C libs live in libs/, fetched by
     // scripts/fetch-deps.sh, not via the Zig package manager).
-    .dependencies = .{},
-    // Files and directories included in this package.
+    .dependencies = .{
+        .zgui = .{
+            .url = "git+https://github.com/zig-gamedev/zgui.git#bfbebed372723d1f585f86fc0a550232b3427f4d",
+            .hash = "zgui-0.6.0-dev--L6sZJhIbgAjWdK5h6xuVUrsOcD-RdqEOEPf03Zgi4mF",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

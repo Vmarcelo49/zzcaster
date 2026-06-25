@@ -1916,6 +1916,22 @@ pub const NetplayManager = struct {
             self.intro_rng_enabled = false;
         }
 
+        // When entering .chara_select (start of a new match cycle, typically
+        // from .retry_menu → .chara_select), reset all per-match state so
+        // stale data from the previous match doesn't corrupt the sync logic.
+        // Without this, the second match's chara_select/loading phases run
+        // with old input buffers, old sync-hash queues, and a non-reset
+        // state pool — leading to a false desync detection or stale-rollback
+        // crash when .in_game is eventually entered.
+        //
+        // The rematch path (.retry_menu → .loading) does NOT go through
+        // .chara_select, so it doesn't trigger this reset — but that's fine
+        // because onEnterInGame() (called when mode_in_game fires) already
+        // resets the per-match state for the rematch case.
+        if (new == .chara_select) {
+            self.resetForNewMatch();
+        }
+
         if (self.enet_connected and !self.config.is_spectator and self.config.is_netplay) {
             var buf: [5]u8 = undefined;
             buf[0] = 0x03; // TransitionIndex
@@ -1928,6 +1944,68 @@ pub const NetplayManager = struct {
         self.log.info("State transition: {s} -> {s}, index={d}", .{
             @tagName(old), @tagName(new), self.indexed_frame.index,
         });
+    }
+
+    /// Reset all per-match state. Called when entering .chara_select to start
+    /// a new match cycle (from .retry_menu → .chara_select). Without this,
+    /// stale data from the previous match corrupts the second match:
+    ///
+    ///   - local_sync / remote_sync queues retain old SyncHash entries →
+    ///     checkSyncHashDesync flags a false desync on the first .in_game frame
+    ///   - desync_detected stays true if the previous match had any desync →
+    ///     the second match force-exits immediately
+    ///   - local_inputs / remote_inputs retain old data → the lockstep wait
+    ///     and writeGameInputs use stale inputs during chara_select/loading
+    ///   - state_pool retains old saved states → rollback could load a state
+    ///     from the previous match
+    ///   - fast_fwd_stop_frame / rollback_timer / round_over_timer retain
+    ///     stale values → rollback logic misfires
+    ///   - rng_synced / rng_acked retain previous-match values → the RNG
+    ///     gate in isRemoteInputReady behaves incorrectly during chara_select
+    ///
+    /// The rematch path (.retry_menu → .loading → .chara_intro → .in_game)
+    /// does NOT go through .chara_select, so it doesn't call this method —
+    /// but that path is covered by onEnterInGame(), which resets the same
+    /// state when mode_in_game fires.
+    fn resetForNewMatch(self: *NetplayManager) void {
+        // Input buffers: clear all per-frame inputs and per-index metadata.
+        self.local_inputs.reset();
+        self.remote_inputs.reset();
+
+        // Sync-hash desync detection: clear the queues and the desync flag.
+        // Without this, leftover entries from the previous match cause a
+        // false desync on the first .in_game frame of the new match.
+        self.local_sync_count = 0;
+        self.remote_sync_count = 0;
+        self.desync_detected = false;
+        self.desync_local = null;
+        self.desync_remote = null;
+
+        // Rollback state: stop any in-flight rerun and re-arm the timer.
+        self.fast_fwd_stop_frame = 0;
+        self.rollback_timer = self.min_rollback_spacing;
+        self.round_over_timer = -1;
+
+        // RNG sync: reset so the host re-sends and the client re-waits for
+        // the new match's RNG state. should_sync_rng stays true — it's
+        // re-armed by onStateTransition(.in_game) and checkIntroDone.
+        self.rng_synced = false;
+        self.rng_acked = false;
+        self.rng_send_cooldown = 0;
+        self.rng_send_count = 0;
+
+        // State pool: reset if already allocated (from a previous match).
+        // onEnterInGame also does this, but we reset here so the pool is
+        // clean DURING chara_select/loading, not just when .in_game starts.
+        if (self.state_pool.pool.len > 0) {
+            self.state_pool.reset();
+        }
+
+        // SFX dedup + air dash macro: reset for the new match.
+        if (self.sfx_dedup) |*sd| sd.reset();
+        self.air_dash_macro.reset();
+
+        self.log.info("Reset netplay state for new match (chara_select entry)", .{});
     }
 
     /// Called when we receive a TransitionIndex message from the remote peer.

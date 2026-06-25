@@ -225,12 +225,29 @@ pub fn build(b: *std.Build) void {
     launcher_mod.addIncludePath(b.path("libs/enet/include"));
     launcher_mod.linkLibrary(enet);
 
+    // === Patch zgui's bundled imgui_impl_sdl2.cpp ===
+    // The pinned zgui commit (bfbebed3) bundles an imgui_impl_sdl2.cpp that
+    // redeclares `enum ImGui_ImplSDL2_GamepadMode` and re-specifies default
+    // arguments on `ImGui_ImplSDL2_SetGamepadMode` — both already declared
+    // in imgui_impl_sdl2.h (which the .cpp #includes at line 112). C++ forbids
+    // both forms of redeclaration, producing 3 compile errors that block the
+    // build. scripts/patch-zgui.sh strips the duplicate lines idempotently.
+    // We run it as a build step that the imgui artifact depends on, so the
+    // patch is applied before the .cpp is compiled.
+    // Safe to remove once zgui is bumped to a fixed upstream commit.
+    const patch_zgui = b.addSystemCommand(&.{ "bash", "scripts/patch-zgui.sh" });
+
     // ImGui + zgui
     const zgui_dep = b.dependency("zgui", .{
         .target = target,
         .optimize = optimize,
         .backend = .sdl2_opengl3,
     });
+    // Run the patch before imgui is compiled (the .cpp is read by the
+    // compiler at compile time, not at build.zig evaluation time, so
+    // patching the file on disk between dependency resolution and the
+    // compile step is sufficient).
+    zgui_dep.artifact("imgui").step.dependOn(&patch_zgui.step);
     launcher_mod.addImport("zgui", zgui_dep.module("root"));
     launcher_mod.linkLibrary(zgui_dep.artifact("imgui"));
 

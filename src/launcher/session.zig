@@ -108,6 +108,9 @@ pub const NetplaySession = struct {
     ping_index: u32 = 0,
     ping_start_ms: i64 = 0,
     handshake_subphase: u8 = 0, // 0=version, 1=names, 2=pings, 3=config
+    // Wall-clock ms of the last ENet heartbeat ping sent. Reset to 0 on
+    // init. Polled by maybeHeartbeat() in step().
+    last_heartbeat_ms: i64 = 0,
 
     // Wall-clock timeouts (milliseconds) for each handshake phase. Tuned
     // to match the original 60-fps frame counts: 300 frames = 5 s,
@@ -118,6 +121,11 @@ pub const NetplaySession = struct {
     const name_timeout_ms: i64 = 5 * 1000; // 5 s (best-effort)
     const host_wait_confirm_timeout_ms: i64 = 30 * 1000; // 30 s
     const ping_per_attempt_timeout_ms: i64 = 833; // ~50 frames @ 60fps
+    // ENet heartbeat interval. During phases where no handshake traffic
+    // flows (e.g., the host's "Start Match" confirmation screen), send an
+    // ENet ping every 2 s to reset the peer's timeout timer. Well within
+    // the 30 s minimum timeout set in enet_transport.zig.
+    const heartbeat_interval_ms: i64 = 2 * 1000; // 2 s
 
     pub fn init(allocator: std.mem.Allocator, io: std.Io, log: *logging.Logger) NetplaySession {
         return .{
@@ -270,6 +278,13 @@ pub const NetplaySession = struct {
             return;
         }
 
+        // Heartbeat: send an ENet ping every 2 s to keep the peer alive
+        // during phases where no other traffic flows (e.g., while the
+        // host is on the "Start Match" confirmation screen). Without this,
+        // ENet's peer timeout can fire and the peer disconnects — manifesting
+        // as "Peer disconnected waiting for confirm" on the host side.
+        self.maybeHeartbeat();
+
         switch (self.state) {
             .idle, .launching, .completed, .failed, .cancelled => return,
 
@@ -287,6 +302,20 @@ pub const NetplaySession = struct {
             .connecting => self.stepConnecting(),
             .handshaking => self.stepHandshaking(),
             .ping_exchanging => self.stepPingExchanging(),
+        }
+    }
+
+    /// Send an ENet ping every `heartbeat_interval_ms` to keep the peer
+    /// alive during phases where no other traffic flows. This is critical
+    /// for the GUI flow where the host may spend many seconds on the
+    /// "Start Match" confirmation screen — without heartbeats, ENet's
+    /// peer timeout fires and the client disconnects.
+    fn maybeHeartbeat(self: *NetplaySession) void {
+        if (self.transport.peer == null or !self.transport.connected) return;
+        const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+        if (now - self.last_heartbeat_ms >= heartbeat_interval_ms) {
+            self.transport.ping();
+            self.last_heartbeat_ms = now;
         }
     }
 

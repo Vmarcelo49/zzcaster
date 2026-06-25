@@ -263,6 +263,18 @@ pub fn launchGameAfterHandshake(
 
     // Tear down the transport so the OS frees the UDP port. No thread to
     // join — the session runs on the main thread.
+    //
+    // Client: wait a short delay before tearing down ENet so the host has
+    // time to receive and process our `confirm` packet. Without this, the
+    // enet_peer_disconnect (from s.deinit) can race with the confirm
+    // delivery — ENet may process the disconnect before the confirm,
+    // causing the host to fail with "Peer disconnected waiting for confirm".
+    // The host polls ENet once per SDL frame (~16ms), so 500ms is more than
+    // enough for the host to receive and process the confirm.
+    if (!snap.is_host) {
+        log.info("Client: waiting 500ms before ENet teardown (confirm delivery)...", .{});
+        std.Io.sleep(io, .{ .nanoseconds = 500 * std.time.ns_per_ms }, .real) catch {};
+    }
     if (np_session.*) |*s| {
         s.deinit();
     }
@@ -537,6 +549,13 @@ pub fn runCliNetplay(
     // Snapshot config and tear down the handshake socket before opening the
     // game (matches launchGameAfterHandshake in the GUI path).
     const snap = s.config;
+    // Client: wait a short delay before tearing down ENet so the host has
+    // time to receive and process our `confirm` packet (same rationale as
+    // launchGameAfterHandshake — see comment there).
+    if (!snap.is_host) {
+        log.info("Client: waiting 500ms before ENet teardown (confirm delivery)...", .{});
+        std.Io.sleep(io, .{ .nanoseconds = 500 * std.time.ns_per_ms }, .real) catch {};
+    }
     s.deinit();
 
     // 1s delay so the OS frees the UDP port before the DLL rebinds it.

@@ -121,6 +121,11 @@ pub const EnetTransport = struct {
             log.err("enet_host_connect failed", .{});
             return error.ConnectFailed;
         }
+        // Set a generous peer timeout so the connection survives the
+        // human-scale delay while the host reads the ping info and clicks
+        // "Start Match" on the GUI confirmation screen. ENet's defaults
+        // (5s minimum) are too short for interactive use.
+        enet.enet_peer_timeout(self.peer, 0, 30000, 120000);
         self.is_host = false;
         log.info("ENet connecting to {s}:{d}", .{ host_str, port });
     }
@@ -160,6 +165,10 @@ pub const EnetTransport = struct {
             enet.ENET_EVENT_TYPE_CONNECT => {
                 self.peer = event.peer;
                 self.connected = true;
+                // Set generous peer timeout (covers the host case where
+                // the peer arrives via the CONNECT event — connect()
+                // already sets it on the client side).
+                enet.enet_peer_timeout(self.peer, 0, 30000, 120000);
                 return .connected;
             },
             enet.ENET_EVENT_TYPE_RECEIVE => {
@@ -180,6 +189,17 @@ pub const EnetTransport = struct {
                 return .disconnected;
             },
             else => return null,
+        }
+    }
+
+    /// Send an ENet unreliable ping to reset the peer's timeout timer.
+    /// Called periodically by the session heartbeat to keep the connection
+    /// alive during phases where no other traffic flows (e.g., while the
+    /// host is on the "Start Match" confirmation screen). Without this,
+    /// ENet's peer timeout can fire and disconnect the peer.
+    pub fn ping(self: *EnetTransport) void {
+        if (self.peer != null and self.connected) {
+            enet.enet_peer_ping(self.peer);
         }
     }
 

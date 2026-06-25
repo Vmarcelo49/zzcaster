@@ -174,6 +174,15 @@ pub fn drawWaitingForPeer(
                 zgui.spacing();
                 ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(make sure the port is open / forwarded on the host's router)", .{});
 
+                const local_ct = s.localConnectionType();
+                if (std.mem.eql(u8, local_ct, "Wired")) {
+                    zgui.spacing();
+                    ui_theme.textColored(ui_theme.COL_MUTED, "Wired connection detected. You're good to go!", .{});
+                } else if (std.mem.eql(u8, local_ct, "Wireless")) {
+                    zgui.spacing();
+                    ui_theme.textColored(ui_theme.COL_RED, "Wi-Fi detected. A wired connection is recommended.", .{});
+                }
+
                 // Show remaining time for the current phase's timeout.
                 if (s.remainingSeconds()) |remaining| {
                     var timer_buf: [64]u8 = undefined;
@@ -215,7 +224,13 @@ pub fn drawWaitingForPeer(
                     ui_theme.textColored(ui_theme.COL_MUTED, "Opponent connection: {s}", .{remote_ct});
                 }
                 if (local_ct.len > 0) {
-                    ui_theme.textColored(ui_theme.COL_MUTED, "Your connection: {s}", .{local_ct});
+                    if (std.mem.eql(u8, local_ct, "Wired")) {
+                        ui_theme.textColored(ui_theme.COL_MUTED, "Wired connection detected. You're good to go!", .{});
+                    } else if (std.mem.eql(u8, local_ct, "Wireless")) {
+                        ui_theme.textColored(ui_theme.COL_RED, "Wi-Fi detected. A wired connection is recommended.", .{});
+                    } else {
+                        ui_theme.textColored(ui_theme.COL_MUTED, "Your connection: {s}", .{local_ct});
+                    }
                 }
                 zgui.spacing();
                 zgui.text("Ping: avg={d:.0}ms  min={d:.0}ms  max={d:.0}ms", .{ s.stats.avg_ms, s.stats.min_ms, s.stats.max_ms });

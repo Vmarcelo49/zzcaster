@@ -13,6 +13,32 @@ const win32 = struct {
     extern "kernel32" fn GetProcessHeap() callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn HeapAlloc(hHeap: ?*anyopaque, dwFlags: u32, dwBytes: usize) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn HeapFree(hHeap: ?*anyopaque, dwFlags: u32, lpMem: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetModuleHandleA(lpModuleName: ?[*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(hModule: ?*const anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*const anyopaque;
+    extern "kernel32" fn CreateFileA(
+        lpFileName: [*:0]const u8,
+        dwDesiredAccess: u32,
+        dwShareMode: u32,
+        lpSecurityAttributes: ?*anyopaque,
+        dwCreationDisposition: u32,
+        dwFlagsAndAttributes: u32,
+        hTemplateFile: ?*anyopaque,
+    ) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn ReadFile(
+        hFile: ?*anyopaque,
+        lpBuffer: [*]u8,
+        nNumberOfBytesToRead: u32,
+        lpNumberOfBytesRead: ?*u32,
+        lpOverlapped: ?*anyopaque,
+    ) callconv(.winapi) i32;
+    extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
+    extern "kernel32" fn GetFileAttributesA(lpFileName: [*:0]const u8) callconv(.winapi) u32;
+
+    const GENERIC_READ: u32 = 0x80000000;
+    const FILE_SHARE_READ: u32 = 1;
+    const OPEN_EXISTING: u32 = 3;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const INVALID_FILE_ATTRIBUTES: u32 = 0xFFFFFFFF;
 
     const AF_INET: u32 = 2;
     const AF_UNSPEC: u32 = 0;
@@ -48,9 +74,71 @@ const win32 = struct {
     const ERROR_BUFFER_OVERFLOW: u32 = 111;
 };
 
+fn isValidHandle(handle: ?*anyopaque) bool {
+    if (handle == null) return false;
+    if (handle == @as(?*anyopaque, @ptrFromInt(std.math.maxInt(usize)))) return false;
+    return true;
+}
+
+fn isWine() bool {
+    const ntdll = win32.GetModuleHandleA("ntdll.dll") orelse return false;
+    return win32.GetProcAddress(ntdll, "wine_get_version") != null;
+}
+
+fn getLinuxConnectionType() ?[]const u8 {
+    const handle = win32.CreateFileA(
+        "Z:\\proc\\net\\route",
+        win32.GENERIC_READ,
+        win32.FILE_SHARE_READ,
+        null,
+        win32.OPEN_EXISTING,
+        win32.FILE_ATTRIBUTE_NORMAL,
+        null,
+    );
+    if (!isValidHandle(handle)) return null;
+    defer _ = win32.CloseHandle(handle);
+
+    var buf: [2048]u8 = undefined;
+    var bytes_read: u32 = 0;
+    if (win32.ReadFile(handle, &buf, buf.len, &bytes_read, null) == 0) return null;
+
+    const content = buf[0..bytes_read];
+    var lines = std.mem.splitScalar(u8, content, '\n');
+
+    // Skip header line
+    _ = lines.next() orelse return null;
+
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \r\t");
+        if (trimmed.len == 0) continue;
+
+        var it = std.mem.tokenizeAny(u8, trimmed, " \t");
+        const iface = it.next() orelse continue;
+        const dest = it.next() orelse continue;
+
+        if (std.mem.eql(u8, dest, "00000000")) {
+            var sys_path_buf: [256]u8 = undefined;
+            const sys_path = std.fmt.bufPrintZ(&sys_path_buf, "Z:\\sys\\class\\net\\{s}\\wireless", .{iface}) catch return null;
+
+            const attrs = win32.GetFileAttributesA(sys_path.ptr);
+            if (attrs != win32.INVALID_FILE_ATTRIBUTES) {
+                return "Wireless";
+            }
+            return "Wired";
+        }
+    }
+    return null;
+}
+
 /// Detect whether the active network connection is WiFi or Ethernet.
 /// Returns "Wired", "Wireless", or "Unknown".
 pub fn getConnectionType() []const u8 {
+    if (isWine()) {
+        if (getLinuxConnectionType()) |conn_type| {
+            return conn_type;
+        }
+    }
+
     var buf_size: u32 = 0;
 
     // First call to get required buffer size.

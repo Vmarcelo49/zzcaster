@@ -5,8 +5,9 @@ const logging = @import("common").logging;
 const win32 = struct {
     extern "user32" fn GetKeyState(nVirtKey: i32) callconv(.winapi) i16;
     extern "user32" fn MapVirtualKeyA(uCode: u32, uMapType: u32) callconv(.winapi) u32;
-    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
 };
+
+const common_win32 = @import("common").win32;
 
 const keyboard_config_offset: u32 = 0x14D2C0;
 
@@ -33,15 +34,14 @@ pub fn init(log: *logging.Logger, io: std.Io) void {
     if (initialized) return;
 
     // Read the 10-byte keyboard config from MBAA.exe
-    var exe_path: [260]u8 = undefined;
-    const len = win32.GetModuleFileNameA(null, &exe_path, exe_path.len);
-    if (len == 0) {
-        log.err("KeyboardReader: GetModuleFileNameA failed", .{});
+    var exe_path_buf: [512]u8 = undefined;
+    const exe_path = common_win32.getModuleFileNameUtf8(null, &exe_path_buf) orelse {
+        log.err("KeyboardReader: GetModuleFileNameW failed", .{});
         return;
-    }
+    };
 
-    const file = std.Io.Dir.cwd().openFile(io, exe_path[0..len], .{}) catch {
-        log.err("KeyboardReader: cannot open {s}", .{exe_path[0..len]});
+    const file = std.Io.Dir.cwd().openFile(io, exe_path, .{}) catch {
+        log.err("KeyboardReader: cannot open {s}", .{exe_path});
         return;
     };
     defer file.close(io);

@@ -48,6 +48,9 @@ pub fn bindButton(label: [:0]const u8, target: mapper.BindingTarget, binding: ma
     }
 }
 
+/// Draw the player panel (grid view) and return `true` if the user
+/// changed any configuration (device, SOCD, deadzone, macro, defaults,
+/// clear). The caller uses this to trigger autosave.
 pub fn drawPlayerPanel(
     name: []const u8,
     m: *mapper.ControllerMapping,
@@ -60,7 +63,8 @@ pub fn drawPlayerPanel(
     log: *logging.Logger,
     io: std.Io,
     cooldown_until_ms: *i64,
-) void {
+) bool {
+    var changed: bool = false;
     _ = num_joy;
 
     // Capture wall-clock ms once per panel draw — passed to each bindButton
@@ -87,6 +91,7 @@ pub fn drawPlayerPanel(
             const is_selected = (device_sel.* == i);
             if (zgui.selectable(std.mem.span(item_name), .{ .selected = is_selected })) {
                 device_sel.* = i;
+                changed = true;
             }
             if (is_selected) {
                 zgui.setItemDefaultFocus();
@@ -108,6 +113,7 @@ pub fn drawPlayerPanel(
             }
         }
         m.device_index = new_dev;
+        changed = true;
     }
 
     zgui.spacing();
@@ -198,6 +204,7 @@ pub fn drawPlayerPanel(
     zgui.spacing();
 
     // Line 1: SOCD mode
+    const old_socd = m.socd_mode;
     zgui.text("SOCD:", .{});
     zgui.sameLine(.{ .spacing = 6 });
     if (zgui.radioButton("L+R", .{ .active = m.socd_mode == 1 })) m.socd_mode = 1;
@@ -206,17 +213,22 @@ pub fn drawPlayerPanel(
     zgui.sameLine(.{ .spacing = 6 });
     if (zgui.radioButton("Both", .{ .active = m.socd_mode == 3 })) m.socd_mode = 3;
     if (m.socd_mode == 0) m.socd_mode = 1;
+    if (m.socd_mode != old_socd) changed = true;
 
     zgui.spacing();
 
     // Line 2: Macro & Deadzone slider
+    const old_macro = m.air_dash_macro;
     _ = zgui.checkbox("AD Macro (9AB)", .{ .v = &m.air_dash_macro });
+    if (m.air_dash_macro != old_macro) changed = true;
     zgui.sameLine(.{ .spacing = 12 });
+    const old_dz = m.deadzone;
     var dz_float: f32 = @as(f32, @floatFromInt(m.deadzone)) / 32767.0;
     zgui.pushItemWidth(65.0);
     _ = zgui.sliderFloat("Deadzone", .{ .v = &dz_float, .min = 0.0, .max = 1.0, .cfmt = "%.2f" });
     zgui.popItemWidth();
     m.deadzone = @intFromFloat(dz_float * 32767.0);
+    if (m.deadzone != old_dz) changed = true;
 
     zgui.spacing();
 
@@ -224,6 +236,7 @@ pub fn drawPlayerPanel(
     if (zgui.button("Default Bindings", .{ .w = 120, .h = 0 })) {
         m.* = mapper.defaultXboxMapping();
         m.device_index = device_sel.* - 1;
+        changed = true;
     }
     zgui.sameLine(.{ .spacing = 8 });
     if (zgui.button("Clear", .{ .w = 50, .h = 0 })) {
@@ -240,14 +253,18 @@ pub fn drawPlayerPanel(
         m.down = .{};
         m.left = .{};
         m.right = .{};
+        changed = true;
     }
 
     zgui.unindent(.{ .indent_w = 5 });
     zgui.endChild();
 
     zgui.popId();
+    return changed;
 }
 
+/// Draw the player panel (list view) and return `true` if the user
+/// changed any configuration. The caller uses this to trigger autosave.
 pub fn drawListPanel(
     name: []const u8,
     m: *mapper.ControllerMapping,
@@ -259,7 +276,8 @@ pub fn drawListPanel(
     log: *logging.Logger,
     io: std.Io,
     cooldown_until_ms: *i64,
-) void {
+) bool {
+    var changed: bool = false;
     // Capture wall-clock ms once per panel draw — passed to each bindButton
     // so cooldowns are anchored to real time, not UI frame rate.
     const now_ms: i64 = std.Io.Clock.now(.real, io).toMilliseconds();
@@ -285,6 +303,7 @@ pub fn drawListPanel(
             const is_selected = (device_sel.* == i);
             if (zgui.selectable(std.mem.span(item_name), .{ .selected = is_selected })) {
                 device_sel.* = i;
+                changed = true;
             }
             if (is_selected) {
                 zgui.setItemDefaultFocus();
@@ -306,6 +325,7 @@ pub fn drawListPanel(
             }
         }
         m.device_index = new_dev;
+        changed = true;
     }
 
     zgui.spacing();
@@ -346,6 +366,7 @@ pub fn drawListPanel(
     zgui.spacing();
 
     // SOCD mode radio buttons
+    const old_socd = m.socd_mode;
     zgui.text("SOCD:", .{});
     zgui.sameLine(.{ .spacing = 8 });
     if (zgui.radioButton("L+R neg", .{ .active = m.socd_mode == 1 })) m.socd_mode = 1;
@@ -354,20 +375,25 @@ pub fn drawListPanel(
     zgui.sameLine(.{ .spacing = 8 });
     if (zgui.radioButton("Both neg", .{ .active = m.socd_mode == 3 })) m.socd_mode = 3;
     if (m.socd_mode == 0) m.socd_mode = 1;
+    if (m.socd_mode != old_socd) changed = true;
 
     zgui.spacing();
 
     // Air Dash Macro toggle (per-player; see drawPlayerPanel for details).
+    const old_macro = m.air_dash_macro;
     _ = zgui.checkbox("Air Dash Macro (9AB/7AB)", .{ .v = &m.air_dash_macro });
+    if (m.air_dash_macro != old_macro) changed = true;
 
     zgui.spacing();
 
     // Analog Deadzone (0.0-1.0 float, small field)
+    const old_dz = m.deadzone;
     var dz_float: f32 = @as(f32, @floatFromInt(m.deadzone)) / 32767.0;
     zgui.pushItemWidth(120.0);
     _ = zgui.sliderFloat("Analog Deadzone", .{ .v = &dz_float, .min = 0.0, .max = 1.0, .cfmt = "%.2f" });
     zgui.popItemWidth();
     m.deadzone = @intFromFloat(dz_float * 32767.0);
+    if (m.deadzone != old_dz) changed = true;
 
     zgui.spacing();
 
@@ -375,6 +401,7 @@ pub fn drawListPanel(
     if (zgui.button("Default Bindings", .{ .w = 130, .h = 0 })) {
         m.* = mapper.defaultXboxMapping();
         m.device_index = device_sel.* - 1;
+        changed = true;
     }
     zgui.sameLine(.{ .spacing = 8 });
     if (zgui.button("Clear", .{ .w = 60, .h = 0 })) {
@@ -391,9 +418,11 @@ pub fn drawListPanel(
         m.down = .{};
         m.left = .{};
         m.right = .{};
+        changed = true;
     }
 
     zgui.popId();
+    return changed;
 }
 
 /// Build the device-name combo box array used by the Controllers tab.

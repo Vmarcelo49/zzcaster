@@ -64,7 +64,7 @@ const win32 = struct {
     extern "kernel32" fn SetThreadExecutionState(esFlags: u32) callconv(.winapi) u32;
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
-    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
+
     extern "kernel32" fn CreateThread(
         lpThreadAttributes: ?*anyopaque,
         dwStackSize: usize,
@@ -359,28 +359,27 @@ fn waitForConfig() void {
     ipc_reader.reset();
 }
 
-// applyPreLoadHacks / writeBytes / rel32 etc. live in asm_hacks.zig.
 /// Resolve mapping.ini next to the DLL itself (avoids CWD-dependent bugs).
 /// The DLL is at `<MBAACC>/zzcaster/hook.dll`, so mapping.ini lives in the
 /// same directory. Returns a slice into `buf`, or null.
 fn resolveMappingIniPath(buf: []u8) ?[]const u8 {
-    var dll_path: [512]u8 = undefined;
-    const len = win32.GetModuleFileNameA(dll_module_handle, &dll_path, dll_path.len);
-    if (len == 0) return null;
+    const common_win32 = @import("common").win32;
+    const dll_path = common_win32.getModuleFileNameUtf8(dll_module_handle, buf) orelse return null;
+    const len = dll_path.len;
 
     var last_sep: usize = 0;
-    for (dll_path[0..len], 0..) |ch, i| {
+    for (buf[0..len], 0..) |ch, i| {
         if (ch == '\\' or ch == '/') last_sep = i;
     }
     if (last_sep == 0) return null; // no separator found — shouldn't happen
 
-    const dir = dll_path[0 .. last_sep + 1]; // include trailing separator
+    const dir_len = last_sep + 1; // include trailing separator
     const filename = "mapping.ini";
-    if (dir.len + filename.len + 1 > buf.len) return null; // +1 for NUL
+    if (dir_len + filename.len + 1 > buf.len) return null; // +1 for NUL
 
-    @memcpy(buf[0..dir.len], dir);
-    @memcpy(buf[dir.len .. dir.len + filename.len], filename);
-    const total = dir.len + filename.len;
+    // dir is already in buf at the right offset, just append filename
+    @memcpy(buf[dir_len .. dir_len + filename.len], filename);
+    const total = dir_len + filename.len;
     buf[total] = 0; // null-terminate for Win32 APIs
     return buf[0..total];
 }

@@ -116,15 +116,12 @@ zzcaster/
 ├── libs/                   ← created by fetch-deps.sh
 │   ├── enet/               ← from lsalzman/enet
 │   ├── imgui/              ← from ocornut/imgui
-│   ├── cimgui/             ← from cimgui/cimgui (pinned commit)
 │   └── sdl2-mingw/         ← from libsdl-org/SDL
 └── src/
     ├── common/             ← config, logging, ipc (shared by launcher + dll)
     ├── net/                ← enet_transport, ip_discovery
     ├── launcher/           ← zzcaster.exe (main, ui, game_launcher, ...)
-    ├── dll/                ← hook.dll (dllmain, netplay_manager, rollback, ...)
-    ├── cimgui_shim.h       ← minimal C declarations for ImGui functions
-    └── imgui_backend_wrap.cpp ← C-linkage wrappers for ImGui SDL2/OpenGL3 backends
+    └── dll/                ← hook.dll (dllmain, netplay_manager, rollback, ...)
 ```
 
 To build everything (zzcaster.exe + hook.dll) for the 32-bit Windows

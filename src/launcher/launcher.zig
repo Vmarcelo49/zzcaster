@@ -2,18 +2,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const config = @import("common").config;
 const logging = @import("common").logging;
+const common_win32 = @import("common").win32;
 
 const win32 = struct {
-    extern "kernel32" fn CreateProcessA(
-        lpApplicationName: ?[*:0]const u8,
-        lpCommandLine: ?[*:0]u8,
+    extern "kernel32" fn CreateProcessW(
+        lpApplicationName: ?[*:0]const u16,
+        lpCommandLine: ?[*:0]u16,
         lpProcessAttributes: ?*anyopaque,
         lpThreadAttributes: ?*anyopaque,
         bInheritHandles: i32,
         dwCreationFlags: u32,
         lpEnvironment: ?*anyopaque,
-        lpCurrentDirectory: ?[*:0]const u8,
-        lpStartupInfo: *StartupInfo,
+        lpCurrentDirectory: ?[*:0]const u16,
+        lpStartupInfo: *StartupInfoW,
         lpProcessInformation: *ProcessInformation,
     ) callconv(.winapi) i32;
 
@@ -82,11 +83,11 @@ const win32 = struct {
         lpValue: [*:0]const u8,
     ) callconv(.winapi) i32;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
-    extern "kernel32" fn GetFullPathNameA(
-        lpFileName: [*:0]const u8,
+    extern "kernel32" fn GetFullPathNameW(
+        lpFileName: [*:0]const u16,
         nBufferLength: u32,
-        lpBuffer: [*]u8,
-        lpFilePart: ?*?[*:0]u8,
+        lpBuffer: [*]u16,
+        lpFilePart: ?*?[*:0]u16,
     ) callconv(.winapi) u32;
 
     const CREATE_SUSPENDED: u32 = 0x00000004;
@@ -102,7 +103,7 @@ const win32 = struct {
     const WAIT_TIMEOUT: u32 = 0x00000102;
     const CONTEXT_CONTROL: u32 = 0x100001;
 
-    const StartupInfo = extern struct {
+    const StartupInfoW = extern struct {
         cb: u32,
         lpReserved: ?*anyopaque = null,
         lpDesktop: ?*anyopaque = null,
@@ -173,24 +174,30 @@ pub const WindowsLauncher = struct {
     pid: u32 = 0,
 
     pub fn launch(self: *WindowsLauncher, cfg: LaunchConfig, log: *logging.Logger) !u32 {
-        // Build command line (writable)
-        var cmd_buf: [512]u8 = undefined;
-        const cmd_len = std.fmt.bufPrintZ(&cmd_buf, "\"{s}\"", .{cfg.game_exe}) catch return error.PathTooLong;
+        // Convert UTF-8 exe path to UTF-16LE for CreateProcessW
+        var exe_wide: [512]u16 = undefined;
+        const exe_wide_len = std.unicode.utf8ToUtf16Le(&exe_wide, cfg.game_exe) catch return error.PathTooLong;
+        exe_wide[exe_wide_len] = 0;
 
-        var si = std.mem.zeroes(win32.StartupInfo);
-        si.cb = @sizeOf(win32.StartupInfo);
+        // Build command line as wide string: "\"<exe>\""
+        var cmd_wide: [600]u16 = undefined;
+        cmd_wide[0] = '"';
+        @memcpy(cmd_wide[1 .. 1 + exe_wide_len], exe_wide[0..exe_wide_len]);
+        cmd_wide[1 + exe_wide_len] = '"';
+        cmd_wide[2 + exe_wide_len] = 0;
+
+        var si = std.mem.zeroes(win32.StartupInfoW);
+        si.cb = @sizeOf(win32.StartupInfoW);
         var pi = std.mem.zeroes(win32.ProcessInformation);
 
         var flags: u32 = win32.CREATE_SUSPENDED;
         if (cfg.high_priority) flags |= win32.HIGH_PRIORITY_CLASS;
 
-        // Create exe path as null-terminated
-        var exe_buf: [256]u8 = undefined;
-        const exe_z = std.fmt.bufPrintZ(&exe_buf, "{s}", .{cfg.game_exe}) catch return error.PathTooLong;
-
         log.info("Creating MBAA.exe suspended...", .{});
 
-        if (win32.CreateProcessA(exe_z.ptr, cmd_len.ptr, null, null, 0, flags, null, null, &si, &pi) == 0) {
+        const exe_z: [*:0]const u16 = exe_wide[0..exe_wide_len :0];
+        const cmd_z: [*:0]u16 = cmd_wide[0 .. 2 + exe_wide_len :0];
+        if (win32.CreateProcessW(exe_z, cmd_z, null, null, 0, flags, null, null, &si, &pi) == 0) {
             log.err("CreateProcess failed: {d}", .{win32.GetLastError()});
             return error.CreateProcessFailed;
         }
@@ -233,17 +240,24 @@ pub const WindowsLauncher = struct {
 
         log.info("Injecting {s}...", .{cfg.dll_path});
 
-        var full_dll_buf: [512]u8 = undefined;
-        var dll_path_z: [512]u8 = undefined;
-        const dll_path_z_slice = std.fmt.bufPrintZ(&dll_path_z, "{s}", .{cfg.dll_path}) catch return error.PathTooLong;
-        const full_len = win32.GetFullPathNameA(dll_path_z_slice.ptr, full_dll_buf.len, &full_dll_buf, null);
-        const inject_path: []const u8 = if (full_len > 0 and full_len < full_dll_buf.len) blk: {
-            // Re-null-terminate the resolved absolute path.
-            full_dll_buf[full_len] = 0;
-            break :blk full_dll_buf[0..full_len :0];
-        } else cfg.dll_path;
-        log.info("Injecting (absolute) {s}", .{inject_path});
-        if (!injectDll(pi.hProcess, inject_path, log)) {
+        // Resolve absolute path using GetFullPathNameW (Unicode-safe)
+        var dll_path_wide: [512]u16 = undefined;
+        const dll_wide_len = std.unicode.utf8ToUtf16Le(&dll_path_wide, cfg.dll_path) catch return error.PathTooLong;
+        dll_path_wide[dll_wide_len] = 0;
+
+        var full_dll_wide: [512]u16 = undefined;
+        const full_len = win32.GetFullPathNameW(@ptrCast(dll_path_wide[0..dll_wide_len :0]), full_dll_wide.len, &full_dll_wide, null);
+        const inject_wide: []const u16 = if (full_len > 0 and full_len < full_dll_wide.len) blk: {
+            full_dll_wide[full_len] = 0;
+            break :blk full_dll_wide[0..full_len];
+        } else dll_path_wide[0..dll_wide_len];
+
+        // Log the inject path as UTF-8 for readability
+        var inject_utf8_buf: [512]u8 = undefined;
+        const inject_utf8_len = std.unicode.utf16LeToUtf8(&inject_utf8_buf, inject_wide) catch 0;
+        log.info("Injecting (absolute) {s}", .{inject_utf8_buf[0..inject_utf8_len]});
+
+        if (!injectDllW(pi.hProcess, inject_wide, log)) {
             log.err("Failed to inject {s}", .{cfg.dll_path});
             return error.InjectFailed;
         }
@@ -293,31 +307,45 @@ fn patchMemory(process: ?*anyopaque, addr: u32, data: []const u8) bool {
     return ok;
 }
 
-fn injectDll(process: ?*anyopaque, dll_path: []const u8, log: *logging.Logger) bool {
-    // Allocate memory in target process for DLL path string
-    const remote_str = win32.VirtualAllocEx(process, null, dll_path.len + 1, win32.MEM_COMMIT | win32.MEM_RESERVE, win32.PAGE_READWRITE) orelse {
+/// Inject a DLL into the target process using the Unicode (W) API.
+/// `dll_path_wide` is a UTF-16LE slice (without null terminator); the
+/// function writes it + null into the remote process and calls LoadLibraryW.
+fn injectDllW(process: ?*anyopaque, dll_path_wide: []const u16, log: *logging.Logger) bool {
+    const byte_len = (dll_path_wide.len + 1) * @sizeOf(u16); // +1 for null terminator
+
+    // Allocate memory in target process for the wide DLL path string
+    const remote_str = win32.VirtualAllocEx(process, null, byte_len, win32.MEM_COMMIT | win32.MEM_RESERVE, win32.PAGE_READWRITE) orelse {
         log.err("inject: VirtualAllocEx failed (gle={d})", .{win32.GetLastError()});
         return false;
     };
     defer _ = win32.VirtualFreeEx(process, remote_str, 0, win32.MEM_RELEASE);
 
-    // Write DLL path
-    if (win32.WriteProcessMemory(process, remote_str, dll_path.ptr, dll_path.len + 1, null) == 0) {
+    // Write wide DLL path (including null terminator)
+    // Build a null-terminated copy in a local buffer
+    var local_wide: [512]u16 = undefined;
+    if (dll_path_wide.len >= local_wide.len) {
+        log.err("inject: DLL path too long ({d} chars)", .{dll_path_wide.len});
+        return false;
+    }
+    @memcpy(local_wide[0..dll_path_wide.len], dll_path_wide);
+    local_wide[dll_path_wide.len] = 0;
+
+    if (win32.WriteProcessMemory(process, remote_str, @ptrCast(&local_wide), byte_len, null) == 0) {
         log.err("inject: WriteProcessMemory failed (gle={d})", .{win32.GetLastError()});
         return false;
     }
 
-    // Get LoadLibraryA address
+    // Get LoadLibraryW address
     const k32 = win32.GetModuleHandleA("kernel32.dll") orelse {
         log.err("inject: GetModuleHandleA(kernel32) failed", .{});
         return false;
     };
-    const load_library = win32.GetProcAddress(k32, "LoadLibraryA") orelse {
-        log.err("inject: GetProcAddress(LoadLibraryA) failed", .{});
+    const load_library = win32.GetProcAddress(k32, "LoadLibraryW") orelse {
+        log.err("inject: GetProcAddress(LoadLibraryW) failed", .{});
         return false;
     };
 
-    log.info("inject: LoadLibraryA({s}) in remote thread", .{dll_path});
+    log.info("inject: LoadLibraryW in remote thread", .{});
 
     // Create remote thread
     const thread = win32.CreateRemoteThread(process, null, 0, load_library, remote_str, 0, null) orelse {
@@ -333,14 +361,14 @@ fn injectDll(process: ?*anyopaque, dll_path: []const u8, log: *logging.Logger) b
     switch (wait_res) {
         win32.WAIT_OBJECT_0 => {
             if (exit_code == 0) {
-                log.err("inject: LoadLibraryA returned 0 — DLL FAILED TO LOAD (path not found in target CWD, or DLL missing a dependency). Path was: {s}", .{dll_path});
+                log.err("inject: LoadLibraryW returned 0 — DLL FAILED TO LOAD (path not found or DLL missing dependency, gle={d})", .{win32.GetLastError()});
                 return false;
             }
-            log.info("inject: LoadLibraryA returned module handle {x} — DLL loaded OK", .{exit_code});
+            log.info("inject: LoadLibraryW returned module handle {x} — DLL loaded OK", .{exit_code});
             return true;
         },
         win32.WAIT_TIMEOUT => {
-            log.err("inject: remote thread timed out (10s) — DLL may be stuck in DllMain. Path was: {s}", .{dll_path});
+            log.err("inject: remote thread timed out (10s) — DLL may be stuck in DllMain", .{});
             return false;
         },
         else => {

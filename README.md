@@ -32,7 +32,7 @@ This is how CCCaster works too.
 |-----------|---------------|
 | **Zig 0.16** | https://ziglang.org/download/ → extract → add to PATH or your package manager |
 
-All C/C++ dependencies (ENet, Dear ImGui, cimgui, SDL2 MinGW) are
+All C/C++ dependencies (ENet, Dear ImGui, SDL2 MinGW) are
 auto-downloaded by `scripts/fetch-deps.sh`.
 
 ### Quick start
@@ -98,7 +98,6 @@ When you play online, you can see if your opponent is using wifi or wired.
 |---------|---------|---------|---------|
 | [ENet](https://github.com/lsalzman/enet) | 1.3.18 | MIT | Reliable UDP transport |
 | [Dear ImGui](https://github.com/ocornut/imgui) | 1.92.8 | MIT | UI rendering |
-| [cimgui](https://github.com/cimgui/cimgui) | master | MIT | C API wrapper for ImGui |
 | [SDL2](https://github.com/libsdl-org/SDL) | 2.32.10 | zlib | Window, input, gamepad |
 
 

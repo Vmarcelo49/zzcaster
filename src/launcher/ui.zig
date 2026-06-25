@@ -14,26 +14,23 @@ const ui_waiting_for_peer = @import("ui_waiting_for_peer.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui_theme = @import("ui_theme.zig");
 
-// Win32 for GetModuleFileNameA — used to resolve mapping.ini relative to
+// Win32 Unicode helper — used to resolve mapping.ini relative to
 // the exe's own directory, matching how the DLL resolves it relative to
 // hook.dll. This ensures GUI and DLL agree on the file location.
-const win32 = struct {
-    extern "kernel32" fn GetModuleFileNameA(hModule: ?*anyopaque, lpFilename: [*]u8, nSize: u32) callconv(.winapi) u32;
-};
+const common_win32 = @import("common").win32;
 
 fn resolveMappingPath(buf: []u8) []const u8 {
-    var exe_path: [512]u8 = undefined;
-    const len = win32.GetModuleFileNameA(null, &exe_path, exe_path.len);
-    if (len == 0) return "zzcaster/mapping.ini";
+    const exe_path = common_win32.getModuleFileNameUtf8(null, buf) orelse return "zzcaster/mapping.ini";
+    const len = exe_path.len;
 
     // Find last path separator
     var last_sep: usize = 0;
-    for (exe_path[0..len], 0..) |ch, i| {
+    for (buf[0..len], 0..) |ch, i| {
         if (ch == '\\' or ch == '/') last_sep = i;
     }
     if (last_sep == 0) return "zzcaster/mapping.ini";
 
-    const exe_dir = exe_path[0 .. last_sep + 1]; // include trailing sep
+    const exe_dir = buf[0 .. last_sep + 1]; // include trailing sep
 
     // Check if the exe directory itself is named "zzcaster" — if so,
     // mapping.ini is in the same directory (matching hook.dll's location).
@@ -42,19 +39,19 @@ fn resolveMappingPath(buf: []u8) []const u8 {
         var name_start: usize = 0;
         var i: usize = name_end;
         while (i > 0) : (i -= 1) {
-            if (exe_path[i - 1] == '\\' or exe_path[i - 1] == '/') {
+            if (buf[i - 1] == '\\' or buf[i - 1] == '/') {
                 name_start = i;
                 break;
             }
         }
-        break :blk exe_path[name_start..name_end];
+        break :blk buf[name_start..name_end];
     };
 
     const filename = "mapping.ini";
     if (std.mem.eql(u8, dir_name, "zzcaster")) {
         // exe is in zzcaster/ subdir — mapping.ini is right here
         if (exe_dir.len + filename.len + 1 <= buf.len) {
-            @memcpy(buf[0..exe_dir.len], exe_dir);
+            // exe_dir already in buf at the right offset, just append filename
             @memcpy(buf[exe_dir.len .. exe_dir.len + filename.len], filename);
             const total = exe_dir.len + filename.len;
             buf[total] = 0;
@@ -65,7 +62,7 @@ fn resolveMappingPath(buf: []u8) []const u8 {
     // exe is in MBAACC root — mapping.ini is in zzcaster/ subdir
     const subdir = "zzcaster\\";
     if (exe_dir.len + subdir.len + filename.len + 1 <= buf.len) {
-        @memcpy(buf[0..exe_dir.len], exe_dir);
+        // exe_dir already in buf, shift right content and append
         @memcpy(buf[exe_dir.len .. exe_dir.len + subdir.len], subdir);
         @memcpy(buf[exe_dir.len + subdir.len .. exe_dir.len + subdir.len + filename.len], filename);
         const total = exe_dir.len + subdir.len + filename.len;

@@ -398,6 +398,7 @@ fn drawControllersPage(
     zgui.setCursorPosY(zgui.getCursorPosY() - 5.0);
 
     // Poll for bind input if active.
+    var binding_changed = false;
     const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
     const cooldown_done = bind_cooldown_until_ms.* == 0 or now_ms >= bind_cooldown_until_ms.*;
     if (bind_cooldown_until_ms.* != 0 and cooldown_done) {
@@ -409,6 +410,7 @@ fn drawControllersPage(
         if (mapper.pollForBindInput(p1_joystick.*, dev_idx)) |binding| {
             ui_controller_mapper.applyBinding(p1_mapping, p1_bind_target.*, binding);
             p1_bind_target.* = .none;
+            binding_changed = true;
         }
     }
     if (p2_bind_target.* != .none and cooldown_done) {
@@ -416,6 +418,7 @@ fn drawControllersPage(
         if (mapper.pollForBindInput(p2_joystick.*, dev_idx)) |binding| {
             ui_controller_mapper.applyBinding(p2_mapping, p2_bind_target.*, binding);
             p2_bind_target.* = .none;
+            binding_changed = true;
         }
     }
 
@@ -424,46 +427,48 @@ fn drawControllersPage(
     var dev_names: [16][*:0]const u8 = undefined;
     const dev_count = ui_controller_mapper.buildDeviceList(&dev_names_buf, &dev_names, num_joy);
 
+    var panel_changed = false;
+
     if (list_view.*) {
         // List view: two side-by-side cards (Player 1 / Player 2).
         const avail = zgui.getContentRegionAvail();
         const col_w: f32 = (avail[0] - ui_theme.CONTENT_PAD) / 2;
-        const col_h: f32 = avail[1] - 48; // leave room for Save button
+        const col_h: f32 = avail[1];
 
         if (ui_theme.beginCard("##p1_card", col_w, col_h, false)) {
-            ui_controller_mapper.drawListPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, log, io, bind_cooldown_until_ms);
+            if (ui_controller_mapper.drawListPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, log, io, bind_cooldown_until_ms))
+                panel_changed = true;
         }
         ui_theme.endCard();
         zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
         if (ui_theme.beginCard("##p2_card", col_w, col_h, false)) {
-            ui_controller_mapper.drawListPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, log, io, bind_cooldown_until_ms);
+            if (ui_controller_mapper.drawListPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, log, io, bind_cooldown_until_ms))
+                panel_changed = true;
         }
         ui_theme.endCard();
     } else {
         // Grid view: two stacked cards.
         const avail = zgui.getContentRegionAvail();
         const card_w: f32 = avail[0];
-        const card_h: f32 = (avail[1] - 48 - 3.0) / 2; // gap between cards is 3px
+        const card_h: f32 = (avail[1] - 3.0) / 2; // gap between cards is 3px
 
         if (ui_theme.beginCardWithFlags("##p1_grid", card_w, card_h, false, .{ .no_scrollbar = true })) {
-            ui_controller_mapper.drawPlayerPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, num_joy, log, io, bind_cooldown_until_ms);
+            if (ui_controller_mapper.drawPlayerPanel("Player 1", p1_mapping, p1_bind_target, p1_joystick, p1_device_sel, &dev_names, dev_count, num_joy, log, io, bind_cooldown_until_ms))
+                panel_changed = true;
         }
         ui_theme.endCard();
         zgui.setCursorPosY(zgui.getCursorPosY() + 3.0);
         if (ui_theme.beginCardWithFlags("##p2_grid", card_w, card_h, false, .{ .no_scrollbar = true })) {
-            ui_controller_mapper.drawPlayerPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, num_joy, log, io, bind_cooldown_until_ms);
+            if (ui_controller_mapper.drawPlayerPanel("Player 2", p2_mapping, p2_bind_target, p2_joystick, p2_device_sel, &dev_names, dev_count, num_joy, log, io, bind_cooldown_until_ms))
+                panel_changed = true;
         }
         ui_theme.endCard();
-
-        zgui.spacing();
     }
 
-    // Save button — primary CTA, full card-aligned.
-    if (ui_theme.primaryButton("Save Mapping", 220, 36)) {
+    // Autosave: persist mapping whenever anything changes.
+    if (binding_changed or panel_changed) {
         p1_mapping.device_index = p1_device_sel.* - 1;
         p2_mapping.device_index = p2_device_sel.* - 1;
         mapper.saveMapping(p1_mapping.*, p2_mapping.*, mapping_path, io, log);
     }
-    zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
-    ui_theme.textColored(ui_theme.COL_MUTED, "(loaded by hook.dll on game start)", .{});
 }

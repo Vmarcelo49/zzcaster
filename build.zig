@@ -355,17 +355,19 @@ pub fn build(b: *std.Build) void {
     //   zig build bench -Doptimize=ReleaseFast           # recommended
     //   zig build bench -Dcpu=baseline                    # no SIMD
     //   zig build bench -Dcpu=haswell                     # SIMD enabled
-    const bench_exe = b.addExecutable(.{
-        .name = "bench-rollback",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/dll/bench_rollback.zig"),
-            .target = target,
-            .optimize = optimize,
-            .link_libc = true,
-        }),
-    });
-    b.installArtifact(bench_exe);
-    const run_bench = b.addRunArtifact(bench_exe);
-    const bench_step = b.step("bench", "Run rollback save/load micro-benchmark");
-    bench_step.dependOn(&run_bench.step);
+    //
+    // Disabled for now — uncomment to re-enable building bench-rollback.exe.
+    // const bench_exe = b.addExecutable(.{
+    //     .name = "bench-rollback",
+    //     .root_module = b.createModule(.{
+    //         .root_source_file = b.path("src/dll/bench_rollback.zig"),
+    //         .target = target,
+    //         .optimize = optimize,
+    //         .link_libc = true,
+    //     }),
+    // });
+    // b.installArtifact(bench_exe);
+    // const run_bench = b.addRunArtifact(bench_exe);
+    // const bench_step = b.step("bench", "Run rollback save/load micro-benchmark");
+    // bench_step.dependOn(&run_bench.step);
 }

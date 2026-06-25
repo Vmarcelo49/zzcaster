@@ -11,6 +11,7 @@ const ui_pages = @import("ui_pages.zig");
 const ui_controller_mapper = @import("ui_controller_mapper.zig");
 const ui_waiting_for_peer = @import("ui_waiting_for_peer.zig");
 const game_launcher = @import("game_launcher.zig");
+const ui_theme = @import("ui_theme.zig");
 
 // Win32 for GetModuleFileNameA — used to resolve mapping.ini relative to
 // the exe's own directory, matching how the DLL resolves it relative to
@@ -191,6 +192,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     defer c.cccaster_imgui_opengl3_shutdown();
 
     c.igStyleColorsDark(null);
+    ui_theme.applyModernTheme();
+    defer ui_theme.popModernTheme();
 
     // State
     var ui_state: UiState = .idle;
@@ -293,9 +296,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
         _ = c.igSetNextWindowPos(.{ .x = 0, .y = 0 }, c.ImGuiCond_Always, .{ .x = 0, .y = 0 });
         const window_flags = c.ImGuiWindowFlags_NoTitleBar | c.ImGuiWindowFlags_NoResize |
             c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoCollapse |
-            c.ImGuiWindowFlags_NoBringToFrontOnFocus;
+            c.ImGuiWindowFlags_NoBringToFrontOnFocus | c.ImGuiWindowFlags_NoScrollbar;
 
         _ = c.igBegin("ZZCaster", null, window_flags);
+        // Draw the vertical gradient background first, so every page sits
+        // on top of the dark→mid gradient instead of a flat fill.
+        ui_theme.drawGradientBackground();
 
         switch (ui_state) {
             .idle => {
@@ -354,35 +360,60 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                 );
             },
             .in_game => {
-                c.igText("Game running (PID: %d)", game_pid);
-                c.igSpacing();
-
-                if (win_launcher) |*wl| {
-                    if (!wl.isAlive()) {
-                        c.igText("Game exited.");
-                        c.igSpacing();
-                        if (c.igButton("OK", .{ .x = 120, .y = 30 })) {
-                            game_launcher.cleanupGame(&win_launcher, &game_pid, &ipc_server);
-                            ui_state = .idle;
-                        }
-                    } else {
-                        c.igText("Waiting for game to exit...");
-                        c.igSpacing();
-                        if (c.igButton("Force Kill", .{ .x = 120, .y = 30 })) {
-                            if (win_launcher) |*wl2| {
-                                wl2.terminate();
+                // Centered card showing game status.
+                const cw: f32 = 420;
+                const ch: f32 = 220;
+                const cx = (1024 - cw) / 2;
+                const cy = (768 - ch) / 2;
+                c.igSetCursorPos(.{ .x = cx, .y = cy });
+                if (ui_theme.beginCard("##in_game_card", cw, ch, false)) {
+                    ui_theme.cardTitle("GAME RUNNING");
+                    c.igText("PID: %d", game_pid);
+                    c.igSpacing();
+                    if (win_launcher) |*wl| {
+                        if (!wl.isAlive()) {
+                            ui_theme.textColored(ui_theme.COL_MUTED, "Game exited.", .{});
+                            c.igSpacing();
+                            if (ui_theme.primaryButton("OK", 160, 36)) {
+                                game_launcher.cleanupGame(&win_launcher, &game_pid, &ipc_server);
+                                ui_state = .idle;
+                            }
+                        } else {
+                            ui_theme.textColored(ui_theme.COL_MUTED, "Waiting for game to exit...", .{});
+                            c.igSpacing();
+                            if (ui_theme.secondaryButton("Force Kill", 160, 36)) {
+                                if (win_launcher) |*wl2| {
+                                    wl2.terminate();
+                                }
                             }
                         }
                     }
+                    ui_theme.endCard();
                 }
             },
             .error_state => {
-                c.igText("Error:");
-                c.igSpacing();
-                c.igText("%s", @as([*]const u8, @ptrCast(&error_msg)));
-                c.igSpacing();
-                if (c.igButton("OK", .{ .x = 120, .y = 30 })) {
-                    ui_state = .idle;
+                // Centered error card with red border accent.
+                const cw: f32 = 480;
+                const ch: f32 = 200;
+                const cx = (1024 - cw) / 2;
+                const cy = (768 - ch) / 2;
+                c.igSetCursorPos(.{ .x = cx, .y = cy });
+                if (ui_theme.beginCard("##error_card", cw, ch, false)) {
+                    ui_theme.pushStyleColor(c.ImGuiCol_Text, ui_theme.COL_RED);
+                    c.igText("ERROR");
+                    ui_theme.popStyleColor(1);
+                    c.igSpacing();
+                    c.igSeparator();
+                    c.igSpacing();
+                    c.igPushTextWrapPos(0.0);
+                    c.igText("%s", @as([*]const u8, @ptrCast(&error_msg)));
+                    c.igPopTextWrapPos();
+                    c.igSpacing();
+                    c.igSpacing();
+                    if (ui_theme.primaryButton("OK", 160, 36)) {
+                        ui_state = .idle;
+                    }
+                    ui_theme.endCard();
                 }
             },
         }

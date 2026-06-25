@@ -118,7 +118,7 @@ pub fn drawPlayerPanel(
 
     // Two columns: Directions (left) + Buttons (right)
     // Reduced height by ~30px (one button row) to tighten the layout.
-    _ = c.igBeginChild_Str("dir", .{ .x = 220, .y = 110 }, true, 0);
+    _ = c.igBeginChild_Str("dir", .{ .x = 220, .y = 110 }, c.ImGuiChildFlags_Borders, 0);
 
     c.igText("Directions");
     c.igSpacing();
@@ -144,7 +144,7 @@ pub fn drawPlayerPanel(
 
     c.igSameLine(0, 8);
 
-    _ = c.igBeginChild_Str("btn", .{ .x = 310, .y = 110 }, true, 0);
+    _ = c.igBeginChild_Str("btn", .{ .x = 310, .y = 110 }, c.ImGuiChildFlags_Borders, 0);
 
     c.igText("Buttons");
     c.igSpacing();

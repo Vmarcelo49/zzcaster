@@ -65,6 +65,17 @@ const off_y: u32 = 0x10C; // i32
 const off_no_input_flag: u32 = 0x177; // u8
 const off_puppet_state: u32 = 0x178; // u8
 
+// Match score (wins per player, in the current best-of-N match). Used by
+// checkRoundOver to distinguish a round-over (continue to .skippable) from
+// a match-over (transition to .retry_menu, where the player chooses
+// rematch vs character-select with the full d-pad).
+//
+// Addresses match the rollback regions in rollback_regions.zig:32-33
+// (CC_P1_WINS_ADDR / CC_P2_WINS_ADDR). u32: number of rounds won in the
+// current match; resets to 0 when a new match starts (chara_select).
+const p1_wins_addr: *u32 = @ptrFromInt(0x559550);
+const p2_wins_addr: *u32 = @ptrFromInt(0x559580);
+
 // Character select selectors (only valid in chara-select state).
 const p1_character_addr: *u32 = @ptrFromInt(0x74D8FC);
 const p2_character_addr: *u32 = @ptrFromInt(0x74D920);
@@ -88,6 +99,14 @@ const mode_main: u32 = 25;
 const mode_chara_select: u32 = 20;
 const mode_loading: u32 = 8;
 const mode_in_game: u32 = 1;
+// CC_GAME_MODE_RETRY: the post-match "Rematch / Character Select" menu.
+// CCCaster routes this directly to NetplayState::RetryMenu
+// (DllMain.cpp:1162-1166), which lets getRetryMenuInput pass through the
+// d-pad for cursor navigation. Without recognizing this mode, the FSM
+// stays in .skippable (which only allows Confirm/Cancel) and the user
+// can only confirm Rematch — moving the cursor down to Character Select
+// is impossible.
+const mode_retry: u32 = 5;
 
 // Buttons
 pub const button_confirm: u16 = 0x0400;
@@ -1464,8 +1483,14 @@ pub const NetplayManager = struct {
     ///       `TransitionIndex` packet and index increment per round, which
     ///       complicates peer sync (host at index N+1 sending inputs while
     ///       remote is still at index N in chara_intro).
-    ///   in_game → skippable | chara_select
-    ///     ↑ DROPPED vs CCCaster: InGame → RetryMenu (and ReplayMenu, no such state).
+    ///   in_game → skippable | chara_select | retry_menu
+    ///     ↑ retry_menu: the post-match menu (game_mode=5) opens directly
+    ///       from the in-game round when the deciding round ends. Also
+    ///       accepts the inter-round .skippable → retry_menu transition.
+    ///       The CCCaster reference allows both InGame→RetryMenu and
+    ///       Skippable→RetryMenu (DllNetplayManager.hpp:1151-1152).
+    ///       DROPPED vs CCCaster: InGame → RetryMenu → ReplayMenu (we have
+    ///       no replay playback path).
     ///   skippable → in_game (next round) | retry_menu | chara_select
     ///     ↑ ADDED: when the match ends (someone hits `win_count` wins), the
     ///       game returns to `chara_select (mode 20)`. Without this transition,
@@ -1473,8 +1498,11 @@ pub const NetplayManager = struct {
     ///       FSM would get stuck in `.skippable`, and the user couldn't pick
     ///       a character for the rematch (inputs filtered to Confirm/Cancel
     ///       only while in `.skippable`). Allowing `skippable → chara_select`
-    ///       unblocks the rematch flow. A proper match-end detector that
-    ///       routes through `.retry_menu` is a follow-up.
+    ///       unblocks the rematch flow.
+    ///   in_game → retry_menu (match-over only, detected by routeRoundOver
+    ///     checking CC_P1_WINS_ADDR / CC_P2_WINS_ADDR against win_count).
+    ///     The post-match menu lets the player choose rematch or character
+    ///     select with the d-pad (input passes through in .retry_menu).
     ///   retry_menu → loading (rematch) | chara_select
     fn isValidNext(self: *const NetplayManager, new: NetplayState) bool {
         const old = self.state;
@@ -1484,7 +1512,7 @@ pub const NetplayManager = struct {
             .chara_select => new == .loading,
             .loading => new == .chara_intro or new == .in_game,
             .chara_intro => new == .in_game,
-            .in_game => new == .skippable or new == .chara_select,
+            .in_game => new == .skippable or new == .chara_select or new == .retry_menu,
             .skippable => new == .in_game or new == .retry_menu or new == .chara_select,
             .retry_menu => new == .loading or new == .chara_select,
         };
@@ -1504,6 +1532,20 @@ pub const NetplayManager = struct {
             new_state = .chara_select;
         } else if (new_mode == mode_loading) {
             new_state = .loading;
+        } else if (new_mode == mode_retry) {
+            // Post-match "Rematch / Character Select" menu. The game sets
+            // game_mode = 5 when the deciding round ends; transitioning to
+            // .retry_menu enables raw_input in getNetplayInput so the
+            // player can navigate the cursor with the d-pad. Without this,
+            // the FSM remains in .skippable (Confirm/Cancel only) and the
+            // d-pad is ignored — the user can only confirm Rematch.
+            //
+            // Either routeRoundOver already sent us here (.in_game → .retry_menu),
+            // or the game_mode change arrives first while we're still in
+            // .in_game / .skippable (race with the round_over countdown).
+            // isValidNext accepts .in_game → .retry_menu and
+            // .skippable → .retry_menu.
+            new_state = .retry_menu;
         } else if (new_mode == mode_in_game) {
             if (self.config.is_training or !self.config.is_netplay or self.config.is_spectator) {
                 new_state = .in_game;
@@ -1616,7 +1658,7 @@ pub const NetplayManager = struct {
                 if (self.round_over_timer == 0) {
                     // Countdown reached zero while still over — fire.
                     self.round_over_timer = -1;
-                    self.transitionTo(.skippable);
+                    self.routeRoundOver();
                 } else if (self.round_over_timer < 0) {
                     // First frame we've seen is_over — arm the countdown.
                     self.round_over_timer = @as(i32, self.config.rollback) + rollback_round_over_delay;
@@ -1628,6 +1670,60 @@ pub const NetplayManager = struct {
         } else if (is_over and !self.config.is_training) {
             // Non-rollback path: immediate transition. Legacy also skips
             // replay mode, but ZZCaster has no replay playback path.
+            self.routeRoundOver();
+        }
+    }
+
+    /// Decide where to send the FSM after a round ends.
+    ///
+    /// Round-over (`.skippable`): inter-round "Round X Winner" / "Continue?"
+    ///   screen. Inputs are filtered to Confirm/Cancel only. The game
+    ///   fires `round_start_counter` after a brief delay, and `checkRoundStart`
+    ///   catches that to transition back to `.in_game` for the next round.
+    ///
+    /// Match-over (`.retry_menu`): post-match "Rematch" / "Character Select"
+    ///   screen. Inputs are passed through (`getNetplayInput` returns
+    ///   `raw_input`), so the player can move the cursor with the d-pad.
+    ///   Confirm → either loads the next match (`.retry_menu → .loading`)
+    ///   or returns to chara_select (`.retry_menu → .chara_select`); both
+    ///   transitions are driven by the game's own `game_mode` changes via
+    ///   `onGameModeChanged` (8 → loading, 20 → chara_select).
+    ///
+    /// We detect match-over by reading the per-player wins counters that
+    /// the game itself maintains at CC_P1_WINS_ADDR / CC_P2_WINS_ADDR.
+    /// When either player has at least `config.win_count` rounds won in
+    /// the current match, the round that just ended was the deciding
+    /// round. The legacy CCCaster implementation routes this same logic
+    /// (DllMain.cpp:netplayStateChanged).
+    ///
+    /// Read AFTER the round-over countdown has decided to fire — by this
+    /// point the game has already incremented the loser's no_input_flag
+    /// (see playerRoundOver), and the per-round win counter has been
+    /// updated. We don't need to wait or re-read; a single read here is
+    /// the authoritative state.
+    ///
+    /// Note on rollback: this runs from the live frame loop path (not
+    /// from a re-run), and the round_over_timer is gated on rollback
+    /// spacing. If a rollback reverts to a frame before this transition
+    /// fires, the timer is reset (round_over_timer = -1 in the
+    /// `!is_over` branch above), and we'll re-evaluate on the next
+    /// frame. The wins counter is also part of the rollback state pool
+    /// (rollback_regions.zig:32-33), so a rollback reverts any premature
+    /// win increments — safe to read here.
+    fn routeRoundOver(self: *NetplayManager) void {
+        const p1_wins: u32 = p1_wins_addr.*;
+        const p2_wins: u32 = p2_wins_addr.*;
+        const win_count: u32 = self.config.win_count;
+        const match_over = (win_count > 0) and (p1_wins >= win_count or p2_wins >= win_count);
+        if (match_over) {
+            self.log.info("Match over (P1 wins={d}, P2 wins={d}, target={d}) — routing to RetryMenu", .{
+                p1_wins, p2_wins, win_count,
+            });
+            self.transitionTo(.retry_menu);
+        } else {
+            self.log.info("Round over (P1 wins={d}, P2 wins={d}, target={d}) — routing to Skippable", .{
+                p1_wins, p2_wins, win_count,
+            });
             self.transitionTo(.skippable);
         }
     }

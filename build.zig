@@ -10,7 +10,33 @@ pub fn build(b: *std.Build) void {
             .{@tagName(user_target.result.cpu.arch)},
         );
     }
-    const target = user_target;
+
+    // Default the 32-bit x86 build to the Haswell micro-architecture when the
+    // user did NOT pass `-Dcpu=...`. This enables AVX2 / SSE4.2 code generation
+    // in `@memcpy`, which the rollbacks hot path benefits from heavily. Users
+    // can still opt out with `-Dcpu=baseline` for legacy x86 CPUs.
+    //
+    // Why Haswell (not Skylake / Zen3+): Haswell is the lowest-tier x86 with
+    // AVX2 — every MBAACC player machine (Intel Haswell+, AMD Zen+) supports
+    // it. Going higher (znver3, skylake) adds tuning hints that aren't worth
+    // the risk of breaking on older CPUs (e.g. first-gen Zen / Broadwell-Iris).
+    // Users on newer hardware can pass `-Dcpu=znver3` (or whatever) explicitly.
+    //
+    // See docs/dll-optimization-plan.md Strategy B + the experiment table there
+    // for the SHA-256/size delta that confirms `-Dcpu=haswell` produces distinct
+    // machine code.
+    //
+    // `user_target.query.cpu_model == .determined_by_arch_os` is the default
+    // when the user did not pass `-Dcpu=...` (see standardTargetOptionsQueryOnly
+    // and Target.Query.parse). We override only that case.
+    var target_query = user_target.query;
+    if (user_target.result.cpu.arch == .x86 and
+        target_query.cpu_model == .determined_by_arch_os)
+    {
+        target_query.cpu_model = .{ .explicit = &std.Target.x86.cpu.haswell };
+    }
+    const target = b.resolveTargetQuery(target_query);
+
     const optimize = b.standardOptimizeOption(.{});
 
     // Detect vendored SDL2 MinGW copy (created by scripts/fetch-deps.sh).
@@ -302,4 +328,27 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_common_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
     test_step.dependOn(&run_simulation_tests.step);
+
+    // Rollback micro-benchmark: measures save/load throughput for both
+    // pre- and post-coalesced region layouts. Cross-compiled to the same
+    // target as the DLL (x86-windows-gnu) so the numbers reflect the
+    // 32-bit memcpy throughput that hook.dll will actually see, not the
+    // host CPU's native 64-bit throughput. Run with:
+    //   zig build bench
+    //   zig build bench -Doptimize=ReleaseFast           # recommended
+    //   zig build bench -Dcpu=baseline                    # no SIMD
+    //   zig build bench -Dcpu=haswell                     # SIMD enabled
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-rollback",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/dll/bench_rollback.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(bench_exe);
+    const run_bench = b.addRunArtifact(bench_exe);
+    const bench_step = b.step("bench", "Run rollback save/load micro-benchmark");
+    bench_step.dependOn(&run_bench.step);
 }

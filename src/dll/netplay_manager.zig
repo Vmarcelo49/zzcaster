@@ -7,6 +7,52 @@ const net = @import("net").enet_transport;
 const rollback_regions = @import("rollback_regions.zig");
 const air_dash = @import("air_dash_macro.zig");
 const asm_hacks = @import("asm_hacks.zig");
+const builtin = @import("builtin");
+
+/// Minimal Win32 surface for the rollback thread-priority boost (Strategy 2B
+/// in docs/dll-optimization-plan.md). `SetThreadPriority` raises the calling
+/// thread's base priority so the OS scheduler is less likely to preempt us
+/// mid-rerun; we restore to `THREAD_PRIORITY_NORMAL` when the rerun completes.
+const win32 = struct {
+    extern "kernel32" fn GetCurrentThread() callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn SetThreadPriority(
+        hThread: ?*anyopaque,
+        nPriority: i32,
+    ) callconv(.winapi) i32;
+    extern "kernel32" fn SetThreadPriorityBoost(
+        hThread: ?*anyopaque,
+        bDisablePriorityBoost: i32,
+    ) callconv(.winapi) i32;
+
+    // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
+    const THREAD_PRIORITY_NORMAL: i32 = 0;
+    const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
+
+    /// Boost the calling thread to time-critical priority. Called right
+    /// before `loadStateForFrame` so the Windows scheduler doesn't preempt
+    /// the rollback rerun. Safe to call multiple times — Win32 treats it
+    /// as a "set base to value", not a relative bump.
+    ///
+    /// No-op on non-Windows targets (the host test runner). We guard with
+    /// `builtin.os.tag == .windows` so cross-platform unit tests compile
+    /// cleanly.
+    fn boostForRerun() void {
+        if (builtin.os.tag != .windows) return;
+        const h = GetCurrentThread();
+        _ = SetThreadPriorityBoost(h, 1); // 1 = disable dynamic priority boost
+        _ = SetThreadPriority(h, THREAD_PRIORITY_TIME_CRITICAL);
+    }
+
+    /// Restore the calling thread to normal priority. Called from
+    /// `finishedRerun` so we don't keep starving other threads between
+    /// rollbacks. Idempotent.
+    fn restoreAfterRerun() void {
+        if (builtin.os.tag != .windows) return;
+        const h = GetCurrentThread();
+        _ = SetThreadPriority(h, THREAD_PRIORITY_NORMAL);
+        _ = SetThreadPriorityBoost(h, 0); // 0 = re-enable dynamic priority boost
+    }
+};
 
 const Md5 = std.crypto.hash.Md5;
 
@@ -2144,6 +2190,18 @@ pub const NetplayManager = struct {
             return false;
         }
 
+        // Strategy 2B (docs/dll-optimization-plan.md): raise the calling
+        // thread to TIME_CRITICAL priority for the duration of the rerun.
+        // A rollback can fast-forward 8+ frames in a single 16.6ms tick; if
+        // the Windows scheduler preempts us mid-rerun (e.g. a background
+        // AV scan thread, or another high-priority process), the rerun
+        // misses its deadline and the next 16.6ms frame starts late —
+        // causing a stutter. Bumping to TIME_CRITICAL for the rerun window
+        // makes preemption ~10x less likely without permanently starving
+        // other threads. We restore priority inside `checkRerunComplete`
+        // once `fast_fwd_stop_frame == 0`.
+        win32.boostForRerun();
+
         // Trigger rollback!
         const current_frame = self.indexed_frame.frame;
         self.fast_fwd_stop_frame = current_frame;
@@ -2200,6 +2258,11 @@ pub const NetplayManager = struct {
             // Re-run finished — cancel any SFX that was queued pre-rollback
             // but didn't actually re-fire during the re-run.
             if (self.sfx_dedup) |*sd| sd.finishedRerun();
+            // Strategy 2B: restore the calling thread to NORMAL priority
+            // (we boosted to TIME_CRITICAL in `checkRollback` before the
+            // load). Pairs with the boost so we don't keep starving other
+            // threads between rollbacks.
+            win32.restoreAfterRerun();
             return true;
         }
         skip_frames_addr.* = 1; // keep skipping

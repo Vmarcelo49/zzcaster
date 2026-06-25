@@ -1192,8 +1192,16 @@ pub const NetplayManager = struct {
         // and sends its own RNG, and naturally blocks on remote input
         // because the client can't send inputs while it's waiting for
         // RNG).
+        //
+        // This gate only applies during .chara_intro and .in_game — NOT
+        // during .chara_select. The host never sends RNG during chara_select
+        // (intro_rng_enabled is false), so gating during chara_select would
+        // deadlock the client until the 10s timeout force-exits the game.
+        // RNG sync is only meaningful for gameplay (chara_intro/in_game).
         // ----------------------------------------------------------------
-        if (self.should_sync_rng and !self.config.is_host and !self.rng_synced) {
+        if (self.state != .chara_select and
+            self.should_sync_rng and !self.config.is_host and !self.rng_synced)
+        {
             return false;
         }
 
@@ -1986,11 +1994,19 @@ pub const NetplayManager = struct {
         self.rollback_timer = self.min_rollback_spacing;
         self.round_over_timer = -1;
 
-        // RNG sync: reset so the host re-sends and the client re-waits for
-        // the new match's RNG state. should_sync_rng stays true — it's
-        // re-armed by onStateTransition(.in_game) and checkIntroDone.
-        self.rng_synced = false;
-        self.rng_acked = false;
+        // NOTE: rng_synced and rng_acked are NOT reset here. They are reset
+        // later by onStateTransition when entering .in_game (line ~1887).
+        // If we reset them here during .chara_select, the client's
+        // isRemoteInputReady() RNG gate (should_sync_rng && !rng_synced)
+        // would block for the entire chara_select phase — the host never
+        // sends RNG during chara_select (intro_rng_enabled is false), so
+        // the client would deadlock until the 10s timeout force-exits the
+        // game. Keeping rng_synced=true from the previous match lets the
+        // client pass the RNG gate during chara_select; the actual reset
+        // happens when .in_game is entered for the new match.
+        //
+        // rng_send_cooldown and rng_send_count ARE reset so the host starts
+        // fresh when the new match's .in_game triggers RNG sync.
         self.rng_send_cooldown = 0;
         self.rng_send_count = 0;
 

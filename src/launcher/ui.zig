@@ -5,6 +5,7 @@ const launcher = @import("launcher.zig");
 const ipc = @import("common").ipc;
 const mapper = @import("dll").controller_mapper;
 const session = @import("session.zig");
+const zgui = @import("zgui");
 
 // Split-out modules — see file headers for what each one owns.
 const ui_pages = @import("ui_pages.zig");
@@ -78,7 +79,6 @@ fn resolveMappingPath(buf: []u8) []const u8 {
 const c = @cImport({
     @cInclude("SDL2/SDL.h");
     @cInclude("SDL2/SDL_opengl.h");
-    @cInclude("cimgui_shim.h");
 });
 
 pub const CliMode = @import("main.zig").CliMode;
@@ -86,7 +86,7 @@ pub const CliMode = @import("main.zig").CliMode;
 // Re-exported so ui_pages.zig and ui_waiting_for_peer.zig can import the
 // same enum values via `const UiState = @import("ui.zig").UiState;`.
 pub const UiState = enum { idle, waiting_for_peer, in_game, error_state };
-pub const MenuPage = enum { netplay, offline, game_config, controllers };
+pub const MenuPage = enum { play, game_config, controllers };
 
 pub fn runCli(
     allocator: std.mem.Allocator,
@@ -182,47 +182,44 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
 
     _ = c.SDL_GL_SetSwapInterval(1);
 
-    const ctx = c.igCreateContext(null);
-    defer c.igDestroyContext(ctx);
+    zgui.init(allocator);
+    defer zgui.deinit();
 
-    _ = c.cccaster_imgui_sdl2_init(window, gl_ctx);
-    defer c.cccaster_imgui_sdl2_shutdown();
+    // Load custom font from memory
+    const font_ttf = @embedFile("font.ttf");
+    const font = zgui.io.addFontFromMemory(font_ttf, 18.0);
+    zgui.io.setDefaultFont(font);
 
-    _ = c.cccaster_imgui_opengl3_init("#version 130");
-    defer c.cccaster_imgui_opengl3_shutdown();
+    zgui.backend.initWithGlSlVersion(window, gl_ctx, "#version 130");
+    defer zgui.backend.deinit();
 
-    c.igStyleColorsDark(null);
+    zgui.styleColorsDark(zgui.getStyle());
     ui_theme.applyModernTheme();
     defer ui_theme.popModernTheme();
 
     // State
     var ui_state: UiState = .idle;
-    var current_page: MenuPage = .netplay;
+    var current_page: MenuPage = .play;
     var error_msg: [256]u8 = undefined;
     var error_msg_len: usize = 0;
 
     // Input buffers — sentinel-terminated for ImGui InputText
-    var port_buf: [16]u8 = "46318\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00".*;
-    var peer_buf: [128]u8 = "127.0.0.1:46318\x00".* ++ [_]u8{0} ** 112;
+    var port_buf = [_:0]u8{ '4', '6', '3', '1', '8' } ++ [_]u8{0} ** 10;
+    var peer_buf = [_:0]u8{ '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '4', '6', '3', '1', '8' } ++ [_]u8{0} ** 112;
 
-    // Text input buffers for config (ImGui InputInt requires int* but we use
-    // InputText with manual parse so the user can type freely)
-    var wincount_buf: [8]u8 = "2\x00\x00\x00\x00\x00\x00\x00".*;
-    var rollback_buf: [8]u8 = "4\x00\x00\x00\x00\x00\x00\x00".*;
-    // Delay override buffer for the host confirmation screen. Initialized
-    // empty — when the host reaches waiting_confirmation, the auto-computed
-    // delay is loaded into this buffer so the host can edit it.
-    var delay_buf: [4]u8 = [_]u8{0} ** 4;
+    // Text input buffers for config
+    var wincount_buf = [_:0]u8{ '2' } ++ [_]u8{0} ** 6;
+    var rollback_buf = [_:0]u8{ '4' } ++ [_]u8{0} ** 6;
+    // Delay override buffer for the host confirmation screen
+    var delay_buf = [_:0]u8{0} ** 3;
     var delay_override_active: bool = false;
 
-    // Display name input buffer (sentinel-terminated for ImGui). Initialized
-    // from cfg.display_name on startup; saved back when the user clicks Apply.
-    var name_buf: [40]u8 = [_]u8{0} ** 40;
+    // Display name input buffer
+    var name_buf = [_:0]u8{0} ** 39;
     {
         const dn = cfg.display_name;
-        const n = @min(dn.len, name_buf.len - 1);
+        const n = @min(dn.len, name_buf.len);
         @memcpy(name_buf[0..n], dn[0..n]);
-        name_buf[n] = 0;
     }
 
     // Game tracking
@@ -248,9 +245,6 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var p2_device_sel: c_int = 0;
     var bind_cooldown_until_ms: i64 = 0; // wall-clock ms; 0 = no cooldown active
     // View mode toggle: false = classic grid layout, true = list layout.
-    // List layout shows both players side-by-side, each as a vertical list
-    // of (in-game button name | bind button) rows. Easier to scan when
-    // the user has many bindings to review at a glance.
     var list_view: bool = false;
 
     // Resolve mapping.ini path relative to the exe's own directory, so
@@ -283,147 +277,149 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     while (!quit) {
         var event: c.SDL_Event = undefined;
         while (c.SDL_PollEvent(&event) != 0) {
-            _ = c.cccaster_imgui_sdl2_process_event(&event);
+            _ = zgui.backend.processEvent(&event);
             if (event.type == c.SDL_QUIT) quit = true;
         }
 
-        _ = c.cccaster_imgui_opengl3_newframe();
-        _ = c.cccaster_imgui_sdl2_newframe();
-        c.igNewFrame();
+        zgui.backend.newFrame(1024, 768);
 
         // Main fullscreen window
-        _ = c.igSetNextWindowSize(.{ .x = 1024, .y = 768 }, c.ImGuiCond_Always);
-        _ = c.igSetNextWindowPos(.{ .x = 0, .y = 0 }, c.ImGuiCond_Always, .{ .x = 0, .y = 0 });
-        const window_flags = c.ImGuiWindowFlags_NoTitleBar | c.ImGuiWindowFlags_NoResize |
-            c.ImGuiWindowFlags_NoMove | c.ImGuiWindowFlags_NoCollapse |
-            c.ImGuiWindowFlags_NoBringToFrontOnFocus | c.ImGuiWindowFlags_NoScrollbar;
+        zgui.setNextWindowSize(.{ .w = 1024, .h = 768, .cond = .always });
+        zgui.setNextWindowPos(.{ .x = 0, .y = 0, .cond = .always });
+        const window_flags = zgui.WindowFlags{
+            .no_title_bar = true,
+            .no_resize = true,
+            .no_move = true,
+            .no_collapse = true,
+            .no_bring_to_front_on_focus = true,
+            .no_scrollbar = true,
+        };
 
-        _ = c.igBegin("ZZCaster", null, window_flags);
-        // Draw the vertical gradient background first, so every page sits
-        // on top of the dark→mid gradient instead of a flat fill.
-        ui_theme.drawGradientBackground();
+        if (zgui.begin("ZZCaster", .{ .flags = window_flags })) {
+            // Draw the vertical gradient background first, so every page sits
+            // on top of the dark→mid gradient instead of a flat fill.
+            ui_theme.drawGradientBackground();
 
-        switch (ui_state) {
-            .idle => {
-                ui_pages.drawIdlePage(
-                    allocator,
-                    io,
-                    cfg,
-                    log,
-                    pipe_name,
-                    &current_page,
-                    &peer_buf,
-                    &port_buf,
-                    &name_buf,
-                    &wincount_buf,
-                    &rollback_buf,
-                    &ui_state,
-                    &np_session,
-                    &host_start_clicked,
-                    &win_launcher,
-                    &game_pid,
-                    &ipc_server,
-                    &error_msg,
-                    &error_msg_len,
-                    &p1_mapping,
-                    &p2_mapping,
-                    &p1_bind_target,
-                    &p2_bind_target,
-                    &p1_joystick,
-                    &p2_joystick,
-                    &p1_device_sel,
-                    &p2_device_sel,
-                    &bind_cooldown_until_ms,
-                    &list_view,
-                    mapping_path,
-                    num_joy,
-                    &quit,
-                );
-            },
-            .waiting_for_peer => {
-                ui_waiting_for_peer.drawWaitingForPeer(
-                    allocator,
-                    io,
-                    cfg,
-                    log,
-                    pipe_name,
-                    &np_session,
-                    &win_launcher,
-                    &game_pid,
-                    &ipc_server,
-                    &ui_state,
-                    &error_msg,
-                    &error_msg_len,
-                    &host_start_clicked,
-                    &delay_buf,
-                    &delay_override_active,
-                );
-            },
-            .in_game => {
-                // Centered card showing game status.
-                const cw: f32 = 420;
-                const ch: f32 = 220;
-                const cx = (1024 - cw) / 2;
-                const cy = (768 - ch) / 2;
-                c.igSetCursorPos(.{ .x = cx, .y = cy });
-                if (ui_theme.beginCard("##in_game_card", cw, ch, false)) {
-                    ui_theme.cardTitle("GAME RUNNING");
-                    c.igText("PID: %d", game_pid);
-                    c.igSpacing();
-                    if (win_launcher) |*wl| {
-                        if (!wl.isAlive()) {
-                            ui_theme.textColored(ui_theme.COL_MUTED, "Game exited.", .{});
-                            c.igSpacing();
-                            if (ui_theme.primaryButton("OK", 160, 36)) {
-                                game_launcher.cleanupGame(&win_launcher, &game_pid, &ipc_server);
-                                ui_state = .idle;
-                            }
-                        } else {
-                            ui_theme.textColored(ui_theme.COL_MUTED, "Waiting for game to exit...", .{});
-                            c.igSpacing();
-                            if (ui_theme.secondaryButton("Force Kill", 160, 36)) {
-                                if (win_launcher) |*wl2| {
-                                    wl2.terminate();
+            switch (ui_state) {
+                .idle => {
+                    ui_pages.drawIdlePage(
+                        allocator,
+                        io,
+                        cfg,
+                        log,
+                        pipe_name,
+                        &current_page,
+                        peer_buf[0..],
+                        port_buf[0..],
+                        name_buf[0..],
+                        wincount_buf[0..],
+                        rollback_buf[0..],
+                        &ui_state,
+                        &np_session,
+                        &host_start_clicked,
+                        &win_launcher,
+                        &game_pid,
+                        &ipc_server,
+                        &error_msg,
+                        &error_msg_len,
+                        &p1_mapping,
+                        &p2_mapping,
+                        &p1_bind_target,
+                        &p2_bind_target,
+                        &p1_joystick,
+                        &p2_joystick,
+                        &p1_device_sel,
+                        &p2_device_sel,
+                        &bind_cooldown_until_ms,
+                        &list_view,
+                        mapping_path,
+                        num_joy,
+                        &quit,
+                    );
+                },
+                .waiting_for_peer => {
+                    ui_waiting_for_peer.drawWaitingForPeer(
+                        allocator,
+                        io,
+                        cfg,
+                        log,
+                        pipe_name,
+                        &np_session,
+                        &win_launcher,
+                        &game_pid,
+                        &ipc_server,
+                        &ui_state,
+                        &error_msg,
+                        &error_msg_len,
+                        &host_start_clicked,
+                        delay_buf[0..],
+                        &delay_override_active,
+                    );
+                },
+                .in_game => {
+                    // Centered card showing game status.
+                    const cw: f32 = 420;
+                    const ch: f32 = 220;
+                    const cx = (1024 - cw) / 2;
+                    const cy = (768 - ch) / 2;
+                    zgui.setCursorPos(.{ cx, cy });
+                    if (ui_theme.beginCard("##in_game_card", cw, ch, false)) {
+                        ui_theme.cardTitle("GAME RUNNING");
+                        zgui.text("PID: {d}", .{game_pid});
+                        zgui.spacing();
+                        if (win_launcher) |*wl| {
+                            if (!wl.isAlive()) {
+                                ui_theme.textColored(ui_theme.COL_MUTED, "Game exited.", .{});
+                                zgui.spacing();
+                                if (ui_theme.primaryButton("OK", 160, 36)) {
+                                    game_launcher.cleanupGame(&win_launcher, &game_pid, &ipc_server);
+                                    ui_state = .idle;
+                                }
+                            } else {
+                                ui_theme.textColored(ui_theme.COL_MUTED, "Waiting for game to exit...", .{});
+                                zgui.spacing();
+                                if (ui_theme.secondaryButton("Force Kill", 160, 36)) {
+                                    if (win_launcher) |*wl2| {
+                                        wl2.terminate();
+                                    }
                                 }
                             }
                         }
                     }
                     ui_theme.endCard();
-                }
-            },
-            .error_state => {
-                // Centered error card with red border accent.
-                const cw: f32 = 480;
-                const ch: f32 = 200;
-                const cx = (1024 - cw) / 2;
-                const cy = (768 - ch) / 2;
-                c.igSetCursorPos(.{ .x = cx, .y = cy });
-                if (ui_theme.beginCard("##error_card", cw, ch, false)) {
-                    ui_theme.pushStyleColor(c.ImGuiCol_Text, ui_theme.COL_RED);
-                    c.igText("ERROR");
-                    ui_theme.popStyleColor(1);
-                    c.igSpacing();
-                    c.igSeparator();
-                    c.igSpacing();
-                    c.igPushTextWrapPos(0.0);
-                    c.igText("%s", @as([*]const u8, @ptrCast(&error_msg)));
-                    c.igPopTextWrapPos();
-                    c.igSpacing();
-                    c.igSpacing();
-                    if (ui_theme.primaryButton("OK", 160, 36)) {
-                        ui_state = .idle;
+                },
+                .error_state => {
+                    // Centered error card with red border accent.
+                    const cw: f32 = 480;
+                    const ch: f32 = 200;
+                    const cx = (1024 - cw) / 2;
+                    const cy = (768 - ch) / 2;
+                    zgui.setCursorPos(.{ cx, cy });
+                    if (ui_theme.beginCard("##error_card", cw, ch, false)) {
+                        ui_theme.pushStyleColor(.text, ui_theme.COL_RED);
+                        zgui.text("ERROR", .{});
+                        ui_theme.popStyleColor(1);
+                        zgui.spacing();
+                        zgui.separator();
+                        zgui.spacing();
+                        zgui.pushTextWrapPos(0.0);
+                        zgui.text("{s}", .{std.mem.sliceTo(&error_msg, 0)});
+                        zgui.popTextWrapPos();
+                        zgui.spacing();
+                        zgui.spacing();
+                        if (ui_theme.primaryButton("OK", 160, 36)) {
+                            ui_state = .idle;
+                        }
                     }
                     ui_theme.endCard();
-                }
-            },
+                },
+            }
         }
+        zgui.end();
 
-        c.igEnd();
-
-        c.igRender();
         _ = c.glClearColor(0.1, 0.1, 0.1, 1.0);
         _ = c.glClear(c.GL_COLOR_BUFFER_BIT | c.GL_DEPTH_BUFFER_BIT);
-        _ = c.cccaster_imgui_opengl3_render(c.igGetDrawData());
+        zgui.backend.draw();
         c.SDL_GL_SwapWindow(window);
     }
 

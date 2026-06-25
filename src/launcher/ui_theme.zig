@@ -11,19 +11,9 @@
 //
 // All functions here are pure visual helpers — they do NOT touch game,
 // netplay, or session state. Logic lives in ui_pages.zig / ui.zig.
-//
-// Type strategy: this module declares a plain Zig `Color` struct (no cimport
-// dependency) so that color constants can be passed across module boundaries
-// (ui.zig, ui_pages.zig, ui_waiting_for_peer.zig all have their own
-// @cImport of cimgui_shim.h, which generates distinct ImVec4_c types per
-// file). The internal `c` module is only used inside ui_theme.zig itself.
 
 const std = @import("std");
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-    @cInclude("SDL2/SDL_opengl.h");
-    @cInclude("cimgui_shim.h");
-});
+const zgui = @import("zgui");
 
 // ---------------------------------------------------------------------------
 // Plain Zig color/vec types — safe to pass across modules
@@ -86,98 +76,88 @@ pub const COL_TRANSPARENT: Color = .{ .x = 0, .y = 0, .z = 0, .w = 0 };
 // Layout constants (in pixels)
 pub const SIDEBAR_W: f32 = 56.0;
 pub const HEADER_H: f32 = 64.0;
-pub const CONTENT_PAD: f32 = 16.0;
-pub const CARD_ROUND: f32 = 8.0;
-pub const CARD_PAD: f32 = 16.0;
+pub const CONTENT_PAD: f32 = 8.0;
+pub const CARD_ROUND: f32 = 6.0;
+pub const CARD_PAD: f32 = 8.0;
 
 // ---------------------------------------------------------------------------
-// Style/color stack wrappers — these call into c directly, using anonymous
-// struct literals to coerce to ImVec4_c / ImVec2_c at the call site.
+// Style/color stack wrappers
 // ---------------------------------------------------------------------------
 
-pub fn pushStyleColor(idx: c_int, col: Color) void {
-    c.igPushStyleColor_Vec4(idx, .{ .x = col.x, .y = col.y, .z = col.z, .w = col.w });
+pub fn pushStyleColor(idx: zgui.StyleCol, col: Color) void {
+    zgui.pushStyleColor4f(.{ .idx = idx, .c = .{ col.x, col.y, col.z, col.w } });
 }
 
 pub fn popStyleColor(count: c_int) void {
-    c.igPopStyleColor(count);
+    zgui.popStyleColor(.{ .count = @intCast(count) });
 }
 
-pub fn pushStyleVarFloat(idx: c_int, val: f32) void {
-    c.igPushStyleVar_Float(idx, val);
+pub fn pushStyleVarFloat(idx: zgui.StyleVar, val: f32) void {
+    zgui.pushStyleVar1f(.{ .idx = idx, .v = val });
 }
 
-pub fn pushStyleVarVec2(idx: c_int, x: f32, y: f32) void {
-    c.igPushStyleVar_Vec2(idx, .{ .x = x, .y = y });
+pub fn pushStyleVarVec2(idx: zgui.StyleVar, x: f32, y: f32) void {
+    zgui.pushStyleVar2f(.{ .idx = idx, .v = .{ x, y } });
 }
 
 pub fn popStyleVar(count: c_int) void {
-    c.igPopStyleVar(count);
+    zgui.popStyleVar(.{ .count = @intCast(count) });
 }
 
 // ---------------------------------------------------------------------------
-// applyModernTheme — call once after igStyleColorsDark()
+// applyModernTheme — call once after zgui.styleColorsDark()
 // ---------------------------------------------------------------------------
 
-/// Pushes the global style/colors. The matching pop is done by the caller
-/// before igEnd() of the main window. We push style vars + style colors
-/// here; they apply to everything inside the main window.
-///
-/// Counts pushed:
-///   - style var: 14 (pop with popStyleVar(14))
-///   - style color: 30 (pop with popStyleColor(30))
 pub fn applyModernTheme() void {
     // Style vars (geometry)
-    pushStyleVarVec2(c.ImGuiStyleVar_WindowPadding, 0, 0);
-    pushStyleVarFloat(c.ImGuiStyleVar_WindowRounding, 0.0);
-    pushStyleVarFloat(c.ImGuiStyleVar_WindowBorderSize, 0.0);
-    pushStyleVarFloat(c.ImGuiStyleVar_ChildRounding, CARD_ROUND);
-    pushStyleVarFloat(c.ImGuiStyleVar_ChildBorderSize, 1.0);
-    pushStyleVarVec2(c.ImGuiStyleVar_FramePadding, 10, 6);
-    pushStyleVarFloat(c.ImGuiStyleVar_FrameRounding, 6.0);
-    pushStyleVarFloat(c.ImGuiStyleVar_FrameBorderSize, 0.0);
-    pushStyleVarVec2(c.ImGuiStyleVar_ItemSpacing, 10, 10);
-    pushStyleVarVec2(c.ImGuiStyleVar_ItemInnerSpacing, 8, 6);
-    pushStyleVarFloat(c.ImGuiStyleVar_IndentSpacing, 16.0);
-    pushStyleVarFloat(c.ImGuiStyleVar_ScrollbarRounding, 8.0);
-    pushStyleVarFloat(c.ImGuiStyleVar_GrabRounding, 4.0);
-    pushStyleVarFloat(c.ImGuiStyleVar_TabRounding, 4.0);
+    pushStyleVarVec2(.window_padding, 0, 0);
+    pushStyleVarFloat(.window_rounding, 0.0);
+    pushStyleVarFloat(.window_border_size, 0.0);
+    pushStyleVarFloat(.child_rounding, CARD_ROUND);
+    pushStyleVarFloat(.child_border_size, 1.0);
+    pushStyleVarVec2(.frame_padding, 8, 5);
+    pushStyleVarFloat(.frame_rounding, 6.0);
+    pushStyleVarFloat(.frame_border_size, 0.0);
+    pushStyleVarVec2(.item_spacing, 8, 8);
+    pushStyleVarVec2(.item_inner_spacing, 6, 4);
+    pushStyleVarFloat(.indent_spacing, 16.0);
+    pushStyleVarFloat(.scrollbar_rounding, 8.0);
+    pushStyleVarFloat(.grab_rounding, 4.0);
+    pushStyleVarFloat(.tab_rounding, 4.0);
 
     // Style colors (palette)
-    pushStyleColor(c.ImGuiCol_WindowBg, COL_TRANSPARENT);
-    pushStyleColor(c.ImGuiCol_ChildBg, COL_CARD);
-    pushStyleColor(c.ImGuiCol_Border, COL_CARD_BRD);
-    pushStyleColor(c.ImGuiCol_Text, COL_TEXT);
-    pushStyleColor(c.ImGuiCol_TextDisabled, COL_MUTED);
-    pushStyleColor(c.ImGuiCol_TextLink, COL_RED);
-    pushStyleColor(c.ImGuiCol_FrameBg, COL_FRAME);
-    pushStyleColor(c.ImGuiCol_FrameBgHovered, COL_FRAME_HOV);
-    pushStyleColor(c.ImGuiCol_FrameBgActive, COL_FRAME_ACT);
-    pushStyleColor(c.ImGuiCol_Button, COL_RED);
-    pushStyleColor(c.ImGuiCol_ButtonHovered, COL_RED_HOV);
-    pushStyleColor(c.ImGuiCol_ButtonActive, COL_RED_ACT);
-    pushStyleColor(c.ImGuiCol_Header, COL_NAV_ACTIVE);
-    pushStyleColor(c.ImGuiCol_HeaderHovered, COL_NAV_HOV);
-    pushStyleColor(c.ImGuiCol_HeaderActive, COL_NAV_ACTIVE);
-    pushStyleColor(c.ImGuiCol_CheckMark, COL_RED);
-    pushStyleColor(c.ImGuiCol_Separator, COL_CARD_BRD);
-    pushStyleColor(c.ImGuiCol_SeparatorHovered, COL_RED_DIM);
-    pushStyleColor(c.ImGuiCol_SeparatorActive, COL_RED);
-    pushStyleColor(c.ImGuiCol_ScrollbarBg, COL_TRANSPARENT);
-    pushStyleColor(c.ImGuiCol_ScrollbarGrab, COL_FRAME);
-    pushStyleColor(c.ImGuiCol_ScrollbarGrabHovered, COL_FRAME_HOV);
-    pushStyleColor(c.ImGuiCol_ScrollbarGrabActive, COL_FRAME_ACT);
-    pushStyleColor(c.ImGuiCol_SliderGrab, COL_RED);
-    pushStyleColor(c.ImGuiCol_SliderGrabActive, COL_RED_HOV);
-    pushStyleColor(c.ImGuiCol_InputTextCursor, COL_RED);
-    pushStyleColor(c.ImGuiCol_Tab, COL_FRAME);
-    pushStyleColor(c.ImGuiCol_TabHovered, COL_RED_DIM);
-    pushStyleColor(c.ImGuiCol_TabSelected, COL_RED);
-    pushStyleColor(c.ImGuiCol_TabSelectedOverline, COL_RED_HOV);
+    pushStyleColor(.window_bg, COL_TRANSPARENT);
+    pushStyleColor(.child_bg, COL_CARD);
+    pushStyleColor(.border, COL_CARD_BRD);
+    pushStyleColor(.text, COL_TEXT);
+    pushStyleColor(.text_disabled, COL_MUTED);
+    pushStyleColor(.text_link, COL_RED);
+    pushStyleColor(.frame_bg, COL_FRAME);
+    pushStyleColor(.frame_bg_hovered, COL_FRAME_HOV);
+    pushStyleColor(.frame_bg_active, COL_FRAME_ACT);
+    pushStyleColor(.button, COL_RED);
+    pushStyleColor(.button_hovered, COL_RED_HOV);
+    pushStyleColor(.button_active, COL_RED_ACT);
+    pushStyleColor(.header, COL_NAV_ACTIVE);
+    pushStyleColor(.header_hovered, COL_NAV_HOV);
+    pushStyleColor(.header_active, COL_NAV_ACTIVE);
+    pushStyleColor(.check_mark, COL_RED);
+    pushStyleColor(.separator, COL_CARD_BRD);
+    pushStyleColor(.separator_hovered, COL_RED_DIM);
+    pushStyleColor(.separator_active, COL_RED);
+    pushStyleColor(.scrollbar_bg, COL_TRANSPARENT);
+    pushStyleColor(.scrollbar_grab, COL_FRAME);
+    pushStyleColor(.scrollbar_grab_hovered, COL_FRAME_HOV);
+    pushStyleColor(.scrollbar_grab_active, COL_FRAME_ACT);
+    pushStyleColor(.slider_grab, COL_RED);
+    pushStyleColor(.slider_grab_active, COL_RED_HOV);
+    pushStyleColor(.input_text_cursor, COL_RED);
+    pushStyleColor(.tab, COL_FRAME);
+    pushStyleColor(.tab_hovered, COL_RED_DIM);
+    pushStyleColor(.tab_selected, COL_RED);
+    pushStyleColor(.tab_selected_overline, COL_RED_HOV);
 }
 
-/// Pop the styles pushed by applyModernTheme(). Must be called after igEnd()
-/// of the main window to keep the style stack balanced.
 pub fn popModernTheme() void {
     popStyleColor(30);
     popStyleVar(14);
@@ -187,52 +167,51 @@ pub fn popModernTheme() void {
 // drawGradientBackground — full-window vertical gradient via ImDrawList
 // ---------------------------------------------------------------------------
 
-/// Draws a vertical gradient (COL_BG_DARK → COL_BG_MID) covering the entire
-/// main window. Must be called right after igBegin() of the main window,
-/// before any other widgets, so the gradient sits at the bottom of the
-/// draw stack inside that window.
 pub fn drawGradientBackground() void {
-    const dl = c.igGetWindowDrawList() orelse return;
-    const pos = c.igGetWindowPos();
-    const w = c.igGetWindowWidth();
-    const h = c.igGetWindowHeight();
+    const dl = zgui.getWindowDrawList();
+    const pos = zgui.getWindowPos();
+    const w = zgui.getWindowWidth();
+    const h = zgui.getWindowHeight();
     const top = colorU32(COL_BG_DARK);
     const bot = colorU32(COL_BG_MID);
-    // Vertical gradient: same color across left/right at each Y level.
-    c.ImDrawList_AddRectFilledMultiColor(
-        dl,
-        .{ .x = pos.x, .y = pos.y },
-        .{ .x = pos.x + w, .y = pos.y + h },
-        top,
-        top,
-        bot,
-        bot,
-    );
+    dl.addRectFilledMultiColor(.{
+        .pmin = .{ pos[0], pos[1] },
+        .pmax = .{ pos[0] + w, pos[1] + h },
+        .col_upr_left = top,
+        .col_upr_right = top,
+        .col_bot_right = bot,
+        .col_bot_left = bot,
+    });
 }
 
 // ---------------------------------------------------------------------------
 // Card container
 // ---------------------------------------------------------------------------
 
-/// Begin a card (child window) at the current cursor position with the
-/// given width/height. Use 0 for width to fill available space. Pass
-/// `auto_resize_y = true` to size the card to its contents.
-///
-/// Internally pushes ChildBg = COL_CARD, Border = COL_CARD_BRD, WindowPadding
-/// = CARD_PAD. Caller must call endCard() afterwards.
 pub fn beginCard(id: [*:0]const u8, w: f32, h: f32, auto_resize_y: bool) bool {
-    pushStyleColor(c.ImGuiCol_ChildBg, COL_CARD);
-    pushStyleColor(c.ImGuiCol_Border, COL_CARD_BRD);
-    pushStyleVarVec2(c.ImGuiStyleVar_WindowPadding, CARD_PAD, CARD_PAD);
-    var flags: c.ImGuiChildFlags = c.ImGuiChildFlags_Borders | c.ImGuiChildFlags_AlwaysUseWindowPadding;
-    if (auto_resize_y) flags |= c.ImGuiChildFlags_AutoResizeY;
+    return beginCardWithFlags(id, w, h, auto_resize_y, .{});
+}
+
+pub fn beginCardWithFlags(id: [*:0]const u8, w: f32, h: f32, auto_resize_y: bool, flags: zgui.WindowFlags) bool {
+    pushStyleColor(.child_bg, COL_CARD);
+    pushStyleColor(.border, COL_CARD_BRD);
+    pushStyleVarVec2(.window_padding, CARD_PAD, CARD_PAD);
     defer popStyleVar(1);
     defer popStyleColor(2);
-    return c.igBeginChild_Str(id, .{ .x = w, .y = h }, flags, 0);
+    return zgui.beginChild(std.mem.span(id), .{
+        .w = w,
+        .h = h,
+        .child_flags = .{
+            .border = true,
+            .always_use_window_padding = true,
+            .auto_resize_y = auto_resize_y,
+        },
+        .window_flags = flags,
+    });
 }
 
 pub fn endCard() void {
-    c.igEndChild();
+    zgui.endChild();
 }
 
 // ---------------------------------------------------------------------------
@@ -240,38 +219,31 @@ pub fn endCard() void {
 // ---------------------------------------------------------------------------
 
 pub fn cardTitle(text: [*:0]const u8) void {
-    pushStyleColor(c.ImGuiCol_Text, COL_MUTED);
-    c.igText("%s", text);
+    pushStyleColor(.text, COL_MUTED);
+    zgui.text("{s}", .{std.mem.span(text)});
     popStyleColor(1);
-    c.igSpacing();
+    zgui.spacing();
 }
 
 // ---------------------------------------------------------------------------
 // Sidebar nav button — single letter, square, transparent until hover/active
 // ---------------------------------------------------------------------------
 
-/// Returns true if the button was clicked.
-/// `active` controls the highlight state (active page).
-/// `letter` is the single-character label (e.g. "N").
 pub fn navButton(letter: [*:0]const u8, active: bool) bool {
-    // Push button background: transparent normally, red-tinted when active,
-    // dark when hovered. ImGui Button uses ButtonHovered/ButtonActive from
-    // the global palette for those states, so we only override Button when
-    // active to give it the red tint.
     if (active) {
-        pushStyleColor(c.ImGuiCol_Button, COL_NAV_ACTIVE);
-        pushStyleColor(c.ImGuiCol_ButtonHovered, COL_NAV_ACTIVE);
-        pushStyleColor(c.ImGuiCol_ButtonActive, COL_RED_DIM);
-        pushStyleColor(c.ImGuiCol_Text, COL_RED);
+        pushStyleColor(.button, COL_NAV_ACTIVE);
+        pushStyleColor(.button_hovered, COL_NAV_ACTIVE);
+        pushStyleColor(.button_active, COL_RED_DIM);
+        pushStyleColor(.text, COL_RED);
     } else {
-        pushStyleColor(c.ImGuiCol_Button, COL_NAV);
-        pushStyleColor(c.ImGuiCol_ButtonHovered, COL_NAV_HOV);
-        pushStyleColor(c.ImGuiCol_ButtonActive, COL_NAV_HOV);
-        pushStyleColor(c.ImGuiCol_Text, COL_TEXT);
+        pushStyleColor(.button, COL_NAV);
+        pushStyleColor(.button_hovered, COL_NAV_HOV);
+        pushStyleColor(.button_active, COL_NAV_HOV);
+        pushStyleColor(.text, COL_TEXT);
     }
     const sz_w: f32 = SIDEBAR_W - 14;
     const sz_h: f32 = SIDEBAR_W - 14;
-    const clicked = c.igButton(letter, .{ .x = sz_w, .y = sz_h });
+    const clicked = zgui.button(std.mem.span(letter), .{ .w = sz_w, .h = sz_h });
     popStyleColor(4);
     return clicked;
 }
@@ -280,96 +252,68 @@ pub fn navButton(letter: [*:0]const u8, active: bool) bool {
 // Primary CTA button — red, wider, framed
 // ---------------------------------------------------------------------------
 
-/// Returns true if clicked. Uses the global red button colors (already pushed
-/// in applyModernTheme), but ensures consistent height/rounding.
 pub fn primaryButton(label: [*:0]const u8, w: f32, h: f32) bool {
-    return c.igButton(label, .{ .x = w, .y = h });
+    return zgui.button(std.mem.span(label), .{ .w = w, .h = h });
 }
 
 // ---------------------------------------------------------------------------
 // Secondary button — flat dark, neutral
 // ---------------------------------------------------------------------------
 
-/// Returns true if clicked. Flat dark button (for Cancel / OK secondary actions).
 pub fn secondaryButton(label: [*:0]const u8, w: f32, h: f32) bool {
-    pushStyleColor(c.ImGuiCol_Button, COL_FRAME);
-    pushStyleColor(c.ImGuiCol_ButtonHovered, COL_FRAME_HOV);
-    pushStyleColor(c.ImGuiCol_ButtonActive, COL_FRAME_ACT);
-    pushStyleColor(c.ImGuiCol_Text, COL_TEXT);
+    pushStyleColor(.button, COL_FRAME);
+    pushStyleColor(.button_hovered, COL_FRAME_HOV);
+    pushStyleColor(.button_active, COL_FRAME_ACT);
+    pushStyleColor(.text, COL_TEXT);
     defer popStyleColor(4);
-    return c.igButton(label, .{ .x = w, .y = h });
+    return zgui.button(std.mem.span(label), .{ .w = w, .h = h });
 }
 
 // ---------------------------------------------------------------------------
 // Header logo — "ZZ" white + "CASTER" red, on the header bar
 // ---------------------------------------------------------------------------
 
-/// Draws the ZZ CASTER logo at the given absolute screen coordinates.
-/// The text is rendered in two pieces via ImDrawList_AddText so we can
-/// color them independently.
 pub fn drawLogo(at_x: f32, at_y: f32) void {
-    const dl = c.igGetWindowDrawList() orelse return;
-    // "ZZ" in white, then "CASTER" in red, baseline-aligned. We add a small
-    // gap between them for visual breathing room.
+    const dl = zgui.getWindowDrawList();
     const zz_col = colorU32(COL_TEXT);
     const caster_col = colorU32(COL_RED);
-    const zz_str: [*:0]const u8 = "ZZ";
-    const caster_str: [*:0]const u8 = "CASTER";
-    // Measure "ZZ" width so "CASTER" starts right after with a gap.
-    const zz_size = c.igCalcTextSize(zz_str, null, false, 0.0);
-    c.ImDrawList_AddText_Vec2(dl, .{ .x = at_x, .y = at_y }, zz_col, zz_str, null);
-    c.ImDrawList_AddText_Vec2(dl, .{ .x = at_x + zz_size.x + 8, .y = at_y }, caster_col, caster_str, null);
+    const zz_str = "ZZ";
+    const caster_str = "CASTER";
+    const zz_size = zgui.calcTextSize(zz_str, .{});
+    dl.addTextUnformatted(.{ at_x, at_y }, zz_col, zz_str);
+    dl.addTextUnformatted(.{ at_x + zz_size[0] + 8, at_y }, caster_col, caster_str);
 }
 
 // ---------------------------------------------------------------------------
 // Text helpers — colored text via the theme palette
 // ---------------------------------------------------------------------------
 
-/// Render text in a given theme color. Builds a null-terminated buffer on
-/// the stack because c.igTextColored is variadic and Zig can't pass args
-/// directly to a C variadic; we format locally and call with "%s".
 pub fn textColored(col: Color, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const formatted = std.fmt.bufPrintZ(&buf, fmt, args) catch {
-        // Buffer too small — fall back to format string itself.
-        c.igTextColored(.{ .x = col.x, .y = col.y, .z = col.z, .w = col.w }, "%s", fmt.ptr);
-        return;
-    };
-    c.igTextColored(.{ .x = col.x, .y = col.y, .z = col.z, .w = col.w }, "%s", formatted.ptr);
+    zgui.textColored(.{ col.x, col.y, col.z, col.w }, fmt, args);
 }
 
-/// Wrapped variant — text wraps at the right edge of the container.
 pub fn textWrapped(col: Color, comptime fmt: []const u8, args: anytype) void {
-    var buf: [512]u8 = undefined;
-    const formatted = std.fmt.bufPrintZ(&buf, fmt, args) catch {
-        c.igPushTextWrapPos(0.0);
-        c.igTextColored(.{ .x = col.x, .y = col.y, .z = col.z, .w = col.w }, "%s", fmt.ptr);
-        c.igPopTextWrapPos();
-        return;
-    };
-    c.igPushTextWrapPos(0.0);
-    c.igTextColored(.{ .x = col.x, .y = col.y, .z = col.z, .w = col.w }, "%s", formatted.ptr);
-    c.igPopTextWrapPos();
+    pushStyleColor(.text, col);
+    defer popStyleColor(1);
+    zgui.textWrapped(fmt, args);
 }
 
 // ---------------------------------------------------------------------------
 // Small inline helpers for layout
 // ---------------------------------------------------------------------------
 
-/// Fills a horizontal gap with an invisible dummy of given width.
 pub fn hspace(w: f32) void {
-    c.igDummy(.{ .x = w, .y = 0 });
+    zgui.dummy(.{ .w = w, .h = 0 });
 }
 
-/// Vertical spacer (in pixels).
 pub fn vspace(h: f32) void {
-    c.igDummy(.{ .x = 0, .y = h });
+    zgui.dummy(.{ .w = 0, .h = h });
 }
 
 // ---------------------------------------------------------------------------
 // Internal color conversion
 // ---------------------------------------------------------------------------
 
-fn colorU32(col: Color) c.ImU32 {
-    return c.igColorConvertFloat4ToU32(.{ .x = col.x, .y = col.y, .z = col.z, .w = col.w });
+fn colorU32(col: Color) u32 {
+    return zgui.colorConvertFloat4ToU32(.{ col.x, col.y, col.z, col.w });
 }

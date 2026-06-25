@@ -7,14 +7,9 @@ const session = @import("session.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui = @import("ui.zig");
 const ui_theme = @import("ui_theme.zig");
+const zgui = @import("zgui");
 
 const UiState = ui.UiState;
-
-const c = @cImport({
-    @cInclude("SDL2/SDL.h");
-    @cInclude("SDL2/SDL_opengl.h");
-    @cInclude("cimgui_shim.h");
-});
 
 /// Tear down any in-progress netplay session. Since the session now runs
 /// entirely on the main thread (no background thread), this just cancels
@@ -114,7 +109,7 @@ pub fn drawWaitingForPeer(
     error_msg: *[256]u8,
     error_msg_len: *usize,
     host_start_clicked: *bool,
-    delay_buf: *[4]u8,
+    delay_buf: [:0]u8,
     delay_override_active: *bool,
 ) void {
     if (np_session.* == null) {
@@ -135,7 +130,7 @@ pub fn drawWaitingForPeer(
     const ch: f32 = 460;
     const cx = (1024 - cw) / 2;
     const cy = (768 - ch) / 2;
-    c.igSetCursorPos(.{ .x = cx, .y = cy });
+    zgui.setCursorPos(.{ cx, cy });
 
     if (ui_theme.beginCard("##wait_peer_card", cw, ch, false)) {
         // Title row.
@@ -144,7 +139,7 @@ pub fn drawWaitingForPeer(
         } else {
             ui_theme.cardTitle("CONNECTING TO HOST");
         }
-        c.igSpacing();
+        zgui.spacing();
 
         switch (s.state) {
             .idle, .listening, .connecting, .handshaking, .ping_exchanging => {
@@ -154,10 +149,10 @@ pub fn drawWaitingForPeer(
                         var addr_buf: [80]u8 = undefined;
                         const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ pub_ip, s.config.peer_port }) catch "?:?";
                         ui_theme.textColored(ui_theme.COL_MUTED, "Share this address with your opponent:", .{});
-                        c.igSpacing();
+                        zgui.spacing();
                         // Highlight the address in red — it's the most important info on the screen.
                         ui_theme.textColored(ui_theme.COL_RED, "{s}", .{addr_z});
-                        c.igSameLine(0, 12);
+                        zgui.sameLine(.{ .spacing = 12 });
                         if (ui_theme.secondaryButton("Copy", 80, 28)) {
                             setClipboardZ(addr_z);
                         }
@@ -167,7 +162,7 @@ pub fn drawWaitingForPeer(
                     if (s.localIp()) |loc_ip| {
                         var addr_buf: [80]u8 = undefined;
                         const addr_z = std.fmt.bufPrintZ(&addr_buf, "Local IP: {s}:{d}", .{ loc_ip, s.config.peer_port }) catch "";
-                        c.igSpacing();
+                        zgui.spacing();
                         ui_theme.textColored(ui_theme.COL_TEXT_DIM, "{s}", .{addr_z});
                     }
                 } else {
@@ -176,7 +171,7 @@ pub fn drawWaitingForPeer(
                     const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ peer_z, s.config.peer_port }) catch "?:?";
                     ui_theme.textColored(ui_theme.COL_MUTED, "Connecting to {s}...", .{addr_z});
                 }
-                c.igSpacing();
+                zgui.spacing();
                 ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(make sure the port is open / forwarded on the host's router)", .{});
 
                 // Show remaining time for the current phase's timeout.
@@ -186,18 +181,18 @@ pub fn drawWaitingForPeer(
                         const mins = remaining / 60;
                         const secs = remaining % 60;
                         const timer_z = std.fmt.bufPrintZ(&timer_buf, "Timeout in: {d}m {d:0>2}s", .{ mins, secs }) catch "Timeout in: ...";
-                        c.igSpacing();
+                        zgui.spacing();
                         ui_theme.textColored(ui_theme.COL_MUTED, "{s}", .{timer_z});
                     } else {
                         const timer_z = std.fmt.bufPrintZ(&timer_buf, "Timeout in: {d}s", .{remaining}) catch "Timeout in: ...";
-                        c.igSpacing();
+                        zgui.spacing();
                         ui_theme.textColored(ui_theme.COL_MUTED, "{s}", .{timer_z});
                     }
                 }
 
                 // Cancel button at the bottom of the card.
                 const btn_y = ch - 36 - ui_theme.CARD_PAD - ui_theme.CARD_PAD;
-                c.igSetCursorPosY(btn_y);
+                zgui.setCursorPosY(btn_y);
                 if (ui_theme.secondaryButton("Cancel", 140, 36)) {
                     cleanupSession(np_session);
                     ui_state.* = .idle;
@@ -212,7 +207,7 @@ pub fn drawWaitingForPeer(
                 } else {
                     ui_theme.textColored(ui_theme.COL_TEXT, "Opponent connected!", .{});
                 }
-                c.igSpacing();
+                zgui.spacing();
                 // Show connection type for both players.
                 const local_ct = s.localConnectionType();
                 const remote_ct = s.remoteConnectionType();
@@ -222,23 +217,23 @@ pub fn drawWaitingForPeer(
                 if (local_ct.len > 0) {
                     ui_theme.textColored(ui_theme.COL_MUTED, "Your connection: {s}", .{local_ct});
                 }
-                c.igSpacing();
-                c.igText("Ping: avg=%.0fms  min=%.0fms  max=%.0fms", s.stats.avg_ms, s.stats.min_ms, s.stats.max_ms);
-                c.igText("Auto input delay: %d", s.config.delay);
-                c.igSpacing();
+                zgui.spacing();
+                zgui.text("Ping: avg={d:.0}ms  min={d:.0}ms  max={d:.0}ms", .{ s.stats.avg_ms, s.stats.min_ms, s.stats.max_ms });
+                zgui.text("Auto input delay: {d}", .{ s.config.delay });
+                zgui.spacing();
 
                 // Delay override: the host can manually set the input delay
                 // instead of using the auto-computed value. The override is
                 // applied to s.config.delay before hostConfirm() sends the
                 // config to the client.
-                c.igText("Override delay");
-                c.igSameLine(0, 8);
-                c.igPushItemWidth(80);
-                _ = c.igInputText("##delay_override", delay_buf, delay_buf.len, 0, null, null);
-                c.igPopItemWidth();
-                c.igSameLine(0, 8);
+                zgui.text("Override delay", .{});
+                zgui.sameLine(.{ .spacing = 8 });
+                zgui.pushItemWidth(80);
+                _ = zgui.inputText("##delay_override", .{ .buf = delay_buf });
+                zgui.popItemWidth();
+                zgui.sameLine(.{ .spacing = 8 });
                 if (ui_theme.secondaryButton("Apply##delay", 80, 0)) {
-                    const delay_str = std.mem.sliceTo(@as([*:0]u8, @ptrCast(delay_buf)), 0);
+                    const delay_str = std.mem.sliceTo(delay_buf, 0);
                     if (delay_str.len > 0) {
                         const val = std.fmt.parseInt(u8, delay_str, 10) catch s.config.delay;
                         // Clamp to [0, 15] — anything higher is unplayable.
@@ -248,9 +243,9 @@ pub fn drawWaitingForPeer(
                     }
                 }
                 if (delay_override_active.*) {
-                    c.igSameLine(0, 8);
+                    zgui.sameLine(.{ .spacing = 8 });
                     ui_theme.textColored(ui_theme.COL_MUTED, "(overridden: {d})", .{s.config.delay});
-                    c.igSameLine(0, 8);
+                    zgui.sameLine(.{ .spacing = 8 });
                     if (ui_theme.secondaryButton("Reset##delay", 70, 0)) {
                         // Recompute auto delay from ping.
                         const avg_rtt = if (s.stats.avg_ms > 0) s.stats.avg_ms else 50;
@@ -263,12 +258,12 @@ pub fn drawWaitingForPeer(
 
                 // Bottom action row.
                 const btn_y = ch - 38 - ui_theme.CARD_PAD - ui_theme.CARD_PAD;
-                c.igSetCursorPosY(btn_y);
+                zgui.setCursorPosY(btn_y);
                 if (ui_theme.primaryButton("Start Match", 200, 38)) {
                     host_start_clicked.* = true;
                     s.hostConfirm();
                 }
-                c.igSameLine(0, 12);
+                zgui.sameLine(.{ .spacing = 12 });
                 if (ui_theme.secondaryButton("Cancel", 140, 38)) {
                     cleanupSession(np_session);
                     ui_state.* = .idle;
@@ -302,7 +297,7 @@ pub fn drawWaitingForPeer(
             .completed => {
                 ui_theme.textColored(ui_theme.COL_TEXT, "Session completed.", .{});
                 const btn_y = ch - 36 - ui_theme.CARD_PAD - ui_theme.CARD_PAD;
-                c.igSetCursorPosY(btn_y);
+                zgui.setCursorPosY(btn_y);
                 if (ui_theme.primaryButton("OK", 140, 36)) {
                     cleanupSession(np_session);
                     ui_state.* = .idle;
@@ -321,19 +316,15 @@ pub fn drawWaitingForPeer(
                 ui_state.* = .idle;
             },
         }
-
-        ui_theme.endCard();
     }
+    ui_theme.endCard();
 }
-
-// Module-local references removed: the host-screen IP buffers are now passed
-// through startHostSession → drawWaitingForPeer as explicit parameters.
 
 fn setClipboardZ(text: []const u8) void {
     // Build a null-terminated copy on the stack and hand it to ImGui.
-    var buf: [128]u8 = undefined;
-    const n = @min(text.len, buf.len - 1);
+    var buf: [128:0]u8 = undefined;
+    const n = @min(text.len, buf.len);
     @memcpy(buf[0..n], text[0..n]);
     buf[n] = 0;
-    c.igSetClipboardText(@ptrCast(&buf));
+    zgui.setClipboardText(buf[0..n :0]);
 }

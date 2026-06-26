@@ -315,24 +315,42 @@ pub fn build(b: *std.Build) void {
     const run_common_tests = b.addRunArtifact(common_tests);
 
     // Net module tests — relay_protocol.zig and relay_config.zig have
-    // pure-logic tests (wire format encode/decode, list parsing). The
-    // nat_probe.zig tests are logic-only too (no actual network calls).
-    // We cross-compile the test binary to the same Windows target as the
-    // main build so ws2_32 externs resolve.
-    const net_test_mod = b.createModule(.{
-        .root_source_file = b.path("src/net/mod.zig"),
+    // pure-logic tests (wire format encode/decode, list parsing) with
+    // no Win32 deps. We run them as separate test targets pointing at
+    // the individual files, NOT at src/net/mod.zig — that would pull
+    // in nat_probe.zig (which has `extern "ws2_32"` calls to
+    // WSAStartup, a Windows-only symbol not in Linux libc) and
+    // enet_transport.zig (which @cImports the enet C headers).
+    //
+    // nat_probe.zig's tests are logic-only (NAT type enum methods) but
+    // the file's function bodies call WSAStartup. Rather than risk the
+    // linker failing on undefined WSAStartup, we test the pure-logic
+    // files individually. nat_probe.zig will be tested via the actual
+    // launcher binary once Slice 3 integrates it.
+    const net_protocol_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/relay_protocol.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    net_test_mod.addImport("common", common_mod);
-    net_test_mod.linkSystemLibrary("ws2_32", .{});
-    net_test_mod.linkSystemLibrary("wininet", .{});
-    net_test_mod.addIncludePath(b.path("libs/enet/include"));
-    const net_tests = b.addTest(.{
-        .root_module = net_test_mod,
+    const net_protocol_tests = b.addTest(.{
+        .root_module = net_protocol_test_mod,
     });
-    const run_net_tests = b.addRunArtifact(net_tests);
+    const run_net_protocol_tests = b.addRunArtifact(net_protocol_tests);
+
+    const net_config_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/relay_config.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    // relay_config.zig imports relay_protocol.zig via relative path
+    // (@import("relay_protocol.zig")), which Zig resolves automatically
+    // since both files are in src/net/. No addImport needed.
+    const net_config_tests = b.addTest(.{
+        .root_module = net_config_test_mod,
+    });
+    const run_net_config_tests = b.addRunArtifact(net_config_tests);
 
     // air_dash_macro.zig is pure std (no Win32/SDL/game-memory deps), so like
     // the common module it host-tests cleanly. Build a fresh test module
@@ -363,7 +381,8 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_common_tests.step);
-    test_step.dependOn(&run_net_tests.step);
+    test_step.dependOn(&run_net_protocol_tests.step);
+    test_step.dependOn(&run_net_config_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
     test_step.dependOn(&run_simulation_tests.step);
 

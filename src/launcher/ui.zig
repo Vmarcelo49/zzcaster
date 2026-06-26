@@ -85,6 +85,15 @@ pub const CliMode = @import("main.zig").CliMode;
 pub const UiState = enum { idle, waiting_for_peer, in_game, error_state };
 pub const MenuPage = enum { play, game_config, controllers };
 
+/// Netplay connection mode — toggled on the Play page.
+///   .direct_ip — existing behavior: paste ip:port, requires port forward
+///   .relay     — relay-assisted hole-punch, no port forward needed.
+///                For zzcaster relays: uses 4-letter room codes.
+///                For cccaster relays: uses ip:port (same UX as direct,
+///                  but relay-assisted hole-punching through live CCCaster
+///                  relays).
+pub const NetplayMode = enum { direct_ip, relay };
+
 pub fn runCli(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -204,6 +213,17 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var port_buf = [_:0]u8{ '4', '6', '3', '1', '8' } ++ [_]u8{0} ** 10;
     var peer_buf = [_:0]u8{ '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '4', '6', '3', '1', '8' } ++ [_]u8{0} ** 112;
 
+    // Netplay mode: direct IP (existing) or relay-assisted (new).
+    // Defaults to direct_ip for backward compatibility — existing users
+    // aren't surprised by a new flow. Can flip default to .relay in a
+    // future release once the relay path is battle-tested.
+    var netplay_mode: NetplayMode = .direct_ip;
+
+    // Room code / host address input for relay mode.
+    // For zzcaster relays: 4-letter room code (e.g., "ABCD").
+    // For cccaster relays: host's ip:port (e.g., "203.0.113.10:46318").
+    var room_code_buf = [_:0]u8{0} ** 32;
+
     // Text input buffers for config
     var wincount_buf = [_:0]u8{ '2' } ++ [_]u8{0} ** 6;
     var rollback_buf = [_:0]u8{ '4' } ++ [_]u8{0} ** 6;
@@ -308,6 +328,8 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         &current_page,
                         peer_buf[0..],
                         port_buf[0..],
+                        &netplay_mode,
+                        room_code_buf[0..],
                         name_buf[0..],
                         wincount_buf[0..],
                         rollback_buf[0..],

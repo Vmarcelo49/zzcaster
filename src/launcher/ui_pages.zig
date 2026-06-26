@@ -8,12 +8,14 @@ const session = @import("session.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui_controller_mapper = @import("ui_controller_mapper.zig");
 const ui_waiting_for_peer = @import("ui_waiting_for_peer.zig");
+const relay_config = @import("net").relay_config;
 const ui = @import("ui.zig");
 const ui_theme = @import("ui_theme.zig");
 const zgui = @import("zgui");
 
 const UiState = ui.UiState;
 const MenuPage = ui.MenuPage;
+const NetplayMode = ui.NetplayMode;
 
 /// Render the idle (main menu) page. Modern layout:
 ///   - Fixed header bar (64px) at the top with ZZ+CASTER logo
@@ -32,6 +34,8 @@ pub fn drawIdlePage(
     current_page: *MenuPage,
     peer_buf: [:0]u8,
     port_buf: [:0]u8,
+    netplay_mode: *NetplayMode,
+    room_code_buf: [:0]u8,
     name_buf: [:0]u8,
     wincount_buf: [:0]u8,
     rollback_buf: [:0]u8,
@@ -80,7 +84,8 @@ pub fn drawIdlePage(
 
     switch (current_page.*) {
         .play => drawPlayPage(
-            allocator, io, cfg, log, pipe_name, peer_buf, port_buf, ui_state,
+            allocator, io, cfg, log, pipe_name, peer_buf, port_buf,
+            netplay_mode, room_code_buf, ui_state,
             np_session, host_start_clicked, win_launcher, game_pid, ipc_server,
             error_msg, error_msg_len
         ),
@@ -186,6 +191,8 @@ fn drawPlayPage(
     pipe_name: []const u8,
     peer_buf: [:0]u8,
     port_buf: [:0]u8,
+    netplay_mode: *NetplayMode,
+    room_code_buf: [:0]u8,
     ui_state: *UiState,
     np_session: *?session.NetplaySession,
     host_start_clicked: *bool,
@@ -203,42 +210,119 @@ fn drawPlayPage(
     if (ui_theme.beginCard("##netplay_card", col_w, col_h, false)) {
         ui_theme.cardTitle("NETPLAY");
 
-        zgui.text("Host Port", .{});
-        zgui.pushItemWidth(120);
-        _ = zgui.inputText("##host_port", .{ .buf = port_buf });
-        zgui.popItemWidth();
+        // --- Mode toggle: Direct IP / Relay ---
+        zgui.text("Mode", .{});
+        zgui.spacing();
+        {
+            if (zgui.radioButton("Direct IP", .{ .active = netplay_mode.* == .direct_ip })) {
+                netplay_mode.* = .direct_ip;
+            }
+            zgui.sameLine(.{ .spacing = 16 });
+            if (zgui.radioButton("Relay", .{ .active = netplay_mode.* == .relay })) {
+                netplay_mode.* = .relay;
+            }
+        }
 
         zgui.spacing();
         zgui.separator();
         zgui.spacing();
 
-        zgui.text("Join / Spectate (IP : Port)", .{});
-        zgui.pushItemWidth(-1);
-        _ = zgui.inputText("##peer_addr", .{ .buf = peer_buf });
-        zgui.popItemWidth();
+        // --- Mode-specific input fields ---
+        switch (netplay_mode.*) {
+            .direct_ip => {
+                // Direct IP mode: existing UI (host port + peer addr)
+                zgui.text("Host Port", .{});
+                zgui.pushItemWidth(120);
+                _ = zgui.inputText("##host_port", .{ .buf = port_buf });
+                zgui.popItemWidth();
 
-        // 3 buttons at the bottom: Host, Join, Spectate
+                zgui.spacing();
+
+                zgui.text("Join / Spectate (IP : Port)", .{});
+                zgui.pushItemWidth(-1);
+                _ = zgui.inputText("##peer_addr", .{ .buf = peer_buf });
+                zgui.popItemWidth();
+
+                zgui.spacing();
+                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(host must port-forward the port)", .{});
+            },
+            .relay => {
+                // Relay mode: room code / host address + host port
+                zgui.text("Host Port", .{});
+                zgui.pushItemWidth(120);
+                _ = zgui.inputText("##host_port_relay", .{ .buf = port_buf });
+                zgui.popItemWidth();
+
+                zgui.spacing();
+
+                zgui.text("Room Code / Host Address", .{});
+                zgui.pushItemWidth(-1);
+                _ = zgui.inputText("##room_code", .{ .buf = room_code_buf });
+                zgui.popItemWidth();
+
+                zgui.spacing();
+                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(relay-assisted — no port forwarding needed)", .{});
+                zgui.spacing();
+                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Host: leave code empty to auto-generate.", .{});
+                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Join: enter the host's room code or IP:port.", .{});
+            },
+        }
+
+        // --- Bottom action buttons ---
         const card_inner_w = zgui.getContentRegionAvail()[0];
         const btn_w = (card_inner_w - ui_theme.CONTENT_PAD * 2) / 3;
 
         const btn_y = col_h - 32 - ui_theme.CARD_PAD;
         zgui.setCursorPosY(btn_y);
 
+        // Host button — calls the appropriate start function based on mode
         if (ui_theme.primaryButton("Host", btn_w, 32)) {
-            ui_waiting_for_peer.startHostSession(allocator, io, cfg, log, game_launcher.parsePort(port_buf.ptr), np_session);
+            switch (netplay_mode.*) {
+                .direct_ip => {
+                    ui_waiting_for_peer.startHostSession(allocator, io, cfg, log, game_launcher.parsePort(port_buf.ptr), np_session);
+                },
+                .relay => {
+                    const relay_source = getRelaySource(cfg);
+                    ui_waiting_for_peer.startRelayHostSession(
+                        allocator, io, cfg, log,
+                        game_launcher.parsePort(port_buf.ptr),
+                        relay_source,
+                        np_session,
+                    );
+                },
+            }
             if (np_session.* != null) {
                 host_start_clicked.* = false;
                 ui_state.* = .waiting_for_peer;
             }
         }
         zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
+
+        // Join button — calls the appropriate start function based on mode
         if (ui_theme.primaryButton("Join", btn_w, 32)) {
-            ui_waiting_for_peer.startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(peer_buf, 0), np_session);
+            switch (netplay_mode.*) {
+                .direct_ip => {
+                    ui_waiting_for_peer.startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(peer_buf, 0), np_session);
+                },
+                .relay => {
+                    const relay_source = getRelaySource(cfg);
+                    ui_waiting_for_peer.startRelayJoinSession(
+                        allocator, io, cfg, log,
+                        std.mem.sliceTo(room_code_buf, 0),
+                        relay_source,
+                        np_session,
+                    );
+                },
+            }
             if (np_session.* != null) {
                 ui_state.* = .waiting_for_peer;
             }
         }
         zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
+
+        // Spectate button — always uses direct IP (spectate via relay
+        // is not yet implemented — would need spectator chain support
+        // in the relay protocol).
         if (ui_theme.secondaryButton("Spectate", btn_w, 32)) {
             game_launcher.launchNetplayImpl(allocator, io, cfg, log, std.mem.sliceTo(peer_buf, 0), true, pipe_name, win_launcher, game_pid, ipc_server, error_msg, error_msg_len);
             if (game_pid.* > 0) ui_state.* = .in_game else ui_state.* = .error_state;
@@ -273,6 +357,17 @@ fn drawPlayPage(
         }
     }
     ui_theme.endCard();
+}
+
+/// Returns the relay source string — either from config.ini's
+/// relayServers= field, or the hardcoded DEFAULT_RELAY_LIST.
+///
+/// The returned slice points to memory owned by `cfg` (if config has
+/// relayServers) or to a compile-time constant (if using defaults).
+/// Either way, the caller doesn't need to free it.
+fn getRelaySource(cfg: *const config.Config) []const u8 {
+    if (cfg.relay_servers.len > 0) return cfg.relay_servers;
+    return relay_config.DEFAULT_RELAY_LIST;
 }
 
 // ---------------------------------------------------------------------------

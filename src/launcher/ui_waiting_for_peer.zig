@@ -171,15 +171,22 @@ pub fn startRelayJoinSession(
     });
 }
 
-/// Start a smart host session — tries relay first, falls back to direct.
+/// Start a smart host session — direct listener + relay in parallel.
 ///
-/// This is the unified Host button handler. It always tries the relay
-/// (zzcaster flavor, generates room code) first. If the relay is
-/// unreachable or fails, it falls back to direct ENet listen.
+/// This is the unified Host button handler. It opens a direct ENet listener
+/// on `port` AND starts a relay client (for NAT traversal) in parallel.
+/// Whichever peer arrives first wins:
 ///
-/// The fallback happens in session.stepRelay() — if the relay client
-/// fails, the session transitions to .listening (direct mode) instead
-/// of .failed. The user sees a clear status message either way.
+///   - If a direct peer connects (localhost/LAN), the relay client is
+///     canceled and the existing ENet handshake flow takes over.
+///   - If the relay handshake completes first (peer behind NAT), the direct
+///     listener is torn down and re-created bound to the relay's
+///     local_udp_port — preserving the NAT mapping. The peer's ENet CONNECT
+///     then arrives at the new listener.
+///
+/// This fixes the regression where the smart host flow forced ALL host
+/// sessions through the relay path — breaking localhost/LAN connections
+/// where the relay is unreachable or unnecessary.
 pub fn startSmartHostSession(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -199,23 +206,17 @@ pub fn startSmartHostSession(
     s.lookupHostAddresses();
     np_session.* = s;
 
-    // Try relay host first. If it fails, session.stepRelay() will
-    // fall back to direct listen.
-    np_session.*.?.startRelayHost(relay_source, port, false) catch |err| {
-        log.err("startRelayHost failed: {s}, falling back to direct", .{@errorName(err)});
-        // Fall back to direct listen immediately
-        np_session.*.?.startHost(port, false) catch |err2| {
-            log.err("startHost (fallback) also failed: {s}", .{@errorName(err2)});
-            cleanupSession(np_session);
-            return;
-        };
+    np_session.*.?.startSmartHost(relay_source, port, false) catch |err| {
+        log.err("startSmartHost failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
     };
     if (np_session.*.?.getRoomCode()) |code| {
         log.info("Smart host session started (room code={s}, name='{s}')", .{
             code, np_session.*.?.localName(),
         });
     } else {
-        log.info("Smart host session started (direct fallback, name='{s}')", .{
+        log.info("Smart host session started (direct only, name='{s}')", .{
             np_session.*.?.localName(),
         });
     }

@@ -78,6 +78,18 @@ const c = @cImport({
     @cInclude("SDL2/SDL_opengl.h");
 });
 
+/// Show a Win32 MessageBox with an error message. Used as a fallback
+/// when SDL/GL initialization fails — without this, errors only go to
+/// the log file (which may not exist yet) and stderr (which is
+/// invisible when the user double-clicks the exe).
+///
+/// Uses SDL_ShowSimpleMessageBox (which wraps MessageBoxW internally)
+/// so it works even before SDL_Init is called — as long as the SDL2
+/// library is loaded (it's statically linked, so always available).
+fn showErrorBox(title: [:0]const u8, msg: [:0]const u8) void {
+    _ = c.SDL_ShowSimpleMessageBox(c.SDL_MESSAGEBOX_ERROR, title.ptr, msg.ptr, null);
+}
+
 pub const CliMode = @import("main.zig").CliMode;
 
 // Re-exported so ui_pages.zig and ui_waiting_for_peer.zig can import the
@@ -147,18 +159,37 @@ pub fn runCli(
 
 pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *logging.Logger, pipe_name: []const u8) !void {
     if (c.SDL_Init(c.SDL_INIT_VIDEO | c.SDL_INIT_GAMECONTROLLER | c.SDL_INIT_JOYSTICK) != 0) {
-        log.err("SDL_Init failed: {s}", .{c.SDL_GetError()});
+        const sdl_err = std.mem.span(c.SDL_GetError());
+        log.err("SDL_Init failed: {s}", .{sdl_err});
+        showErrorBox("ZZCaster failed to start", "SDL initialization failed.\n\nThis usually means your graphics drivers are missing or outdated.\nPlease install the latest drivers from your GPU vendor (NVIDIA, AMD, or Intel).\n\nIf this persists, run zzcaster.exe from a command prompt to see the full error.");
         return error.SdlInitFailed;
     }
     defer c.SDL_Quit();
 
-    _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    // Common GL attributes for all profiles.
     _ = c.SDL_GL_SetAttribute(c.SDL_GL_DOUBLEBUFFER, 1);
     _ = c.SDL_GL_SetAttribute(c.SDL_GL_DEPTH_SIZE, 24);
     _ = c.SDL_GL_SetAttribute(c.SDL_GL_STENCIL_SIZE, 8);
 
-    const window = c.SDL_CreateWindow(
+    // Try OpenGL 3.0 core profile first. This is what we want for modern
+    // ImGui rendering. If it fails (common on older Intel HD GPUs like
+    // HD 4000 on Win10 with Microsoft Basic Display Adapter, which only
+    // supports GL 1.1), fall back to OpenGL 2.1 compatibility profile.
+    // ImGui's GL backend works with both — we pass "#version 130" for
+    // GL 3.0 and "#version 110" for GL 2.1 to the backend init.
+    var gl_major: c_int = 3;
+    var gl_minor: c_int = 0;
+    var glsl_version: ?[:0]const u8 = "#version 130";
+    var window: *c.SDL_Window = undefined;
+    var gl_ctx: c.SDL_GLContext = undefined;
+    var gl_fallback_used: bool = false;
+
+    // Attempt 1: OpenGL 3.0 core
+    _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_PROFILE_MASK, c.SDL_GL_CONTEXT_PROFILE_CORE);
+
+    window = c.SDL_CreateWindow(
         "ZZCaster",
         c.SDL_WINDOWPOS_CENTERED,
         c.SDL_WINDOWPOS_CENTERED,
@@ -166,16 +197,61 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
         768,
         c.SDL_WINDOW_OPENGL,
     ) orelse {
-        log.err("SDL_CreateWindow failed: {s}", .{c.SDL_GetError()});
+        const sdl_err = std.mem.span(c.SDL_GetError());
+        log.err("SDL_CreateWindow failed: {s}", .{sdl_err});
+        showErrorBox("ZZCaster failed to start", "Could not create the game window.\n\nThis may be caused by missing graphics drivers or a locked display.\n\nPlease ensure your graphics drivers are up to date.");
         return error.WindowCreateFailed;
     };
-    defer c.SDL_DestroyWindow(window);
 
-    const gl_ctx = c.SDL_GL_CreateContext(window) orelse {
-        log.err("SDL_GL_CreateContext failed: {s}", .{c.SDL_GetError()});
-        return error.GlContextFailed;
-    };
+    gl_ctx = c.SDL_GL_CreateContext(window);
+    if (gl_ctx == null) {
+        const sdl_err_30 = std.mem.span(c.SDL_GetError());
+        log.warn("OpenGL 3.0 core context failed: {s} — trying 2.1 compatibility fallback", .{sdl_err_30});
+
+        // Destroy the window and retry with GL 2.1 compatibility.
+        // SDL_GL_SetAttribute must be set BEFORE SDL_CreateWindow for
+        // the GL context attributes to take effect on some drivers.
+        c.SDL_DestroyWindow(window);
+
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MAJOR_VERSION, 2);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_MINOR_VERSION, 1);
+        _ = c.SDL_GL_SetAttribute(c.SDL_GL_CONTEXT_PROFILE_MASK, c.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY);
+        glsl_version = "#version 110";
+        gl_major = 2;
+        gl_minor = 1;
+        gl_fallback_used = true;
+
+        window = c.SDL_CreateWindow(
+            "ZZCaster",
+            c.SDL_WINDOWPOS_CENTERED,
+            c.SDL_WINDOWPOS_CENTERED,
+            1024,
+            768,
+            c.SDL_WINDOW_OPENGL,
+        ) orelse {
+            const sdl_err = std.mem.span(c.SDL_GetError());
+            log.err("SDL_CreateWindow (GL 2.1 fallback) failed: {s}", .{sdl_err});
+            showErrorBox("ZZCaster failed to start", "Could not create the game window.\n\nThis may be caused by missing graphics drivers or a locked display.\n\nPlease ensure your graphics drivers are up to date.");
+            return error.WindowCreateFailed;
+        };
+
+        gl_ctx = c.SDL_GL_CreateContext(window);
+        if (gl_ctx == null) {
+            const sdl_err_21 = std.mem.span(c.SDL_GetError());
+            log.err("OpenGL 2.1 compatibility context also failed: {s}", .{sdl_err_21});
+            showErrorBox("ZZCaster failed to start", "Could not create an OpenGL context.\n\nYour graphics card or driver does not support OpenGL 2.1 or higher.\n\nSolutions:\n  1. Update your graphics drivers (NVIDIA / AMD / Intel)\n     For Intel HD 4000 and older, download from:\n     https://www.intel.com/content/www/us/en/download-center/home.html\n  2. If Windows is using 'Microsoft Basic Display Adapter',\n     install the real GPU driver from your laptop manufacturer.\n  3. If on a virtual machine or remote desktop, enable GPU\n     passthrough or use Wine on Linux.\n\nzzcaster requires at least OpenGL 2.1 support.");
+            c.SDL_DestroyWindow(window);
+            return error.GlContextFailed;
+        }
+    }
+    defer c.SDL_DestroyWindow(window);
     defer c.SDL_GL_DeleteContext(gl_ctx);
+
+    if (gl_fallback_used) {
+        log.info("Using OpenGL {d}.{d} compatibility profile (fallback)", .{ gl_major, gl_minor });
+    } else {
+        log.info("Using OpenGL {d}.{d} core profile", .{ gl_major, gl_minor });
+    }
 
     _ = c.SDL_GL_SetSwapInterval(1);
 
@@ -187,7 +263,7 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     const font = zgui.io.addFontFromMemory(font_ttf, 18.0);
     zgui.io.setDefaultFont(font);
 
-    zgui.backend.initWithGlSlVersion(window, gl_ctx, "#version 130");
+    zgui.backend.initWithGlSlVersion(window, gl_ctx.?, glsl_version);
     defer zgui.backend.deinit();
 
     zgui.styleColorsDark(zgui.getStyle());

@@ -83,6 +83,11 @@ const win32 = struct {
         lpValue: [*:0]const u8,
     ) callconv(.winapi) i32;
     extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn GetEnvironmentVariableA(
+        lpName: [*:0]const u8,
+        lpBuffer: [*]u8,
+        nSize: u32,
+    ) callconv(.winapi) u32;
     extern "kernel32" fn GetFullPathNameW(
         lpFileName: [*:0]const u16,
         nBufferLength: u32,
@@ -392,4 +397,43 @@ pub fn setenv_win32(name: []const u8, value: []const u8) void {
 /// run under Wine.)
 pub fn getCurrentProcessId_win32() u32 {
     return win32.GetCurrentProcessId();
+}
+
+/// Resolve the log file path to an absolute, user-writable location.
+///
+/// Returns `%LOCALAPPDATA%\zzcaster\debug.log` on Windows. If
+/// `%LOCALAPPDATA%` is not set (very unusual — it's set by default on
+/// every Windows install since Vista), falls back to `zzcaster/debug.log`
+/// relative to CWD so the log still works in some form.
+///
+/// `buf` receives the null-terminated path. The returned slice is a
+/// substring of `buf`.
+pub fn resolveLogPath(buf: []u8) []const u8 {
+    // Try to read %LOCALAPPDATA% from the environment.
+    var env_buf: [260]u8 = undefined;
+    const env_len = win32.GetEnvironmentVariableA("LOCALAPPDATA", &env_buf, env_buf.len);
+
+    if (env_len == 0 or env_len >= env_buf.len) {
+        // LOCALAPPDATA not set or too long — fall back to CWD-relative path.
+        const fallback = "zzcaster/debug.log";
+        if (fallback.len + 1 <= buf.len) {
+            @memcpy(buf[0..fallback.len], fallback);
+            buf[fallback.len] = 0;
+            return buf[0..fallback.len];
+        }
+        return "zzcaster/debug.log";
+    }
+
+    // Build "%LOCALAPPDATA%\zzcaster\debug.log"
+    const result = std.fmt.bufPrint(buf, "{s}\\zzcaster\\debug.log", .{env_buf[0..env_len]}) catch {
+        // Buffer too small — fall back.
+        const fallback = "zzcaster/debug.log";
+        if (fallback.len + 1 <= buf.len) {
+            @memcpy(buf[0..fallback.len], fallback);
+            buf[fallback.len] = 0;
+            return buf[0..fallback.len];
+        }
+        return "zzcaster/debug.log";
+    };
+    return result;
 }

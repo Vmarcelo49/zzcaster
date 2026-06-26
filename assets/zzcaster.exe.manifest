@@ -1,0 +1,92 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <!--
+    zzcaster.exe application manifest.
+
+    This manifest is CRITICAL for Windows 10 compatibility. Without it:
+
+    1. Win10 enters "version lie" mode — VerifyVersionInfoW reports as
+       Win 8 (6.2) instead of 10.0. SDL2 calls this API and takes a
+       legacy code path that can crash on actual Win10 hardware.
+       Win11 is more lenient with manifest-less apps; Wine doesn't
+       implement the version lie at all.
+
+    2. Without requestedExecutionLevel=asInvoker, UAC virtualization
+       kicks in. File writes to protected locations (e.g. Program Files)
+       get silently redirected to %LOCALAPPDATA%\VirtualStore\...,
+       which is why "no logs are created" — the log IS written but to
+       a hidden VirtualStore path the user doesn't check.
+
+    3. The supportedOS GUID {8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}
+       grants the app full Windows 10 capabilities.
+  -->
+
+  <!-- Identify the application -->
+  <assemblyIdentity
+    type="win32"
+    name="zzcaster"
+    version="4.0.0.0"
+    processorArchitecture="x86"
+  />
+
+  <!-- Describe the application -->
+  <description>ZZCaster — Melty Blood Actress Again Current Code netplay launcher</description>
+
+  <!-- Request normal execution (no elevation). This DISABLES UAC file
+       virtualization, so file writes go where the app expects, not to
+       VirtualStore. -->
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+
+  <!-- Declare compatibility with Windows 10 and 11.
+       Without the Win10 GUID, VerifyVersionInfoW lies and reports as
+       Win 8 (6.2), which breaks SDL2's version detection. -->
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10 and Windows 11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+      <!-- Windows 8.1 -->
+      <supportedOS Id="{1f676c76-80e1-4239-95bb-83d0f6d0da78}"/>
+      <!-- Windows 8 -->
+      <supportedOS Id="{4a2f28e3-53b9-4441-ba9c-d69d4a4a6e38}"/>
+      <!-- Windows 7 -->
+      <supportedOS Id="{35138b9a-5d96-4fbd-8e2d-a2440225f93a}"/>
+    </application>
+  </compatibility>
+
+  <!-- Declare DPI awareness. Without this, Win10 applies DPI
+       virtualization (bitmap scaling), which can cause rendering
+       issues and crashes in OpenGL apps.
+       "true/pm" = per-monitor v2 on Win10 1703+, system DPI on older.
+       We don't use SetProcessDpiAwarenessContext programmatically,
+       so the manifest is the only way to declare this. -->
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <dpiAware xmlns="http://schemas.microsoft.com/SMI/2005/WindowsSettings">true/pm</dpiAware>
+      <dpiAwareness xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">PerMonitorV2</dpiAwareness>
+    </windowsSettings>
+  </application>
+
+  <!-- Declare common controls v6 (ComCtl32.dll version 6).
+       Required for themed UI controls. Without this, apps get the
+       classic Windows 95-style controls. Not strictly needed for
+       zzcaster (we use ImGui, not Win32 controls), but harmless and
+       good practice. -->
+  <dependency>
+    <dependentAssembly>
+      <assemblyIdentity
+        type="win32"
+        name="Microsoft.Windows.Common-Controls"
+        version="6.0.0.0"
+        processorArchitecture="*"
+        publicKeyToken="6595b64144ccf1df"
+        language="*"
+      />
+    </dependentAssembly>
+  </dependency>
+</assembly>

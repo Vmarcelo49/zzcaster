@@ -11,20 +11,22 @@ pub fn build(b: *std.Build) void {
         );
     }
 
-    // Default the 32-bit x86 build to the Haswell micro-architecture when the
-    // user did NOT pass `-Dcpu=...`. This enables AVX2 / SSE4.2 code generation
-    // in `@memcpy`, which the rollbacks hot path benefits from heavily. Users
-    // can still opt out with `-Dcpu=baseline` for legacy x86 CPUs.
+    // Default the 32-bit x86 build to the "baseline" CPU model when the
+    // user did NOT pass `-Dcpu=...`. This ensures compatibility with ALL
+    // x86 CPUs — including older pre-Haswell laptops (e.g. Ivy Bridge
+    // i5-3210M with Intel HD 4000) that don't support AVX2 / FMA3 / BMI1.
     //
-    // Why Haswell (not Skylake / Zen3+): Haswell is the lowest-tier x86 with
-    // AVX2 — every MBAACC player machine (Intel Haswell+, AMD Zen+) supports
-    // it. Going higher (znver3, skylake) adds tuning hints that aren't worth
-    // the risk of breaking on older CPUs (e.g. first-gen Zen / Broadwell-Iris).
-    // Users on newer hardware can pass `-Dcpu=znver3` (or whatever) explicitly.
+    // Previously this defaulted to Haswell, which enabled AVX2 codegen in
+    // @memcpy and auto-vectorized loops. That crashed silently on pre-
+    // Haswell CPUs with STATUS_ILLEGAL_INSTRUCTION (no error dialog, no
+    // log entry — the process just disappeared). The crash was reported
+    // on a Windows 10 laptop with an i5-3210M (Ivy Bridge, 2012).
     //
-    // See docs/dll-optimization-plan.md Strategy B + the experiment table there
-    // for the SHA-256/size delta that confirms `-Dcpu=haswell` produces distinct
-    // machine code.
+    // Users who know their target hardware supports AVX2 (Intel Haswell+,
+    // AMD Zen+) can opt in for better rollback performance with:
+    //   zig build -Dtarget=x86-windows-gnu -Dcpu=haswell
+    //
+    // See docs/dll-optimization-plan.md for the performance delta.
     //
     // `user_target.query.cpu_model == .determined_by_arch_os` is the default
     // when the user did not pass `-Dcpu=...` (see standardTargetOptionsQueryOnly
@@ -33,7 +35,7 @@ pub fn build(b: *std.Build) void {
     if (user_target.result.cpu.arch == .x86 and
         target_query.cpu_model == .determined_by_arch_os)
     {
-        target_query.cpu_model = .{ .explicit = &std.Target.x86.cpu.haswell };
+        target_query.cpu_model = .{ .explicit = &std.Target.x86.cpu.pentium4 };
     }
     const target = b.resolveTargetQuery(target_query);
 

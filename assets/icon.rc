@@ -1,1 +1,15 @@
+// Resource script for zzcaster.exe
+//
+// Embeds:
+//   1. The application icon (assets/icon.ico)
+//   2. The application manifest (assets/zzcaster.exe.manifest)
+//
+// The manifest is CRITICAL for Windows 10 compatibility — see the
+// comment block in zzcaster.exe.manifest for the full explanation.
+
+// Application icon (resource ID 1, the default).
 1 ICON "icon.ico"
+
+// Application manifest (resource ID 1, CREATEPROCESS_MANIFEST_RESOURCE_ID).
+// The Windows loader looks for a manifest at this resource ID.
+1 24 "zzcaster.exe.manifest"

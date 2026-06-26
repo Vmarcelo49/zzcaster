@@ -66,10 +66,32 @@ pub fn main(init: std.process.Init) !void {
     ) catch "zzcaster_pipe";
     launcher.setenv_win32("CCCASTER_PIPE", pipe_name);
 
+    // Resolve the log path to an ABSOLUTE, user-writable location.
+    //
+    // The previous code used the CWD-relative path "zzcaster/debug.log",
+    // which broke in three common scenarios on Windows 10:
+    //
+    //   1. Launched from a shortcut with a different "Start in" folder —
+    //      CWD is not the exe's directory, so the relative path points
+    //      nowhere useful.
+    //   2. Exe in Program Files — without a manifest, UAC virtualization
+    //      silently redirected writes to %LOCALAPPDATA%\VirtualStore\...,
+    //      which the user never checks. "No logs created" was the symptom.
+    //   3. Exe in a read-only location (e.g. C:\Program Files (x86)) —
+    //      createDirPath failed silently, so the log was never written.
+    //
+    // Using %LOCALAPPDATA%\zzcaster\debug.log fixes all three: it's
+    // always writable by the current user, it's an absolute path (immune
+    // to CWD issues), and it's the standard location for per-user app
+    // data on Windows Vista+.
+    var log_path_buf: [512]u8 = undefined;
+    const log_path = launcher.resolveLogPath(&log_path_buf);
+
     // Init logging
-    var log = try logging.Logger.init(allocator, io, "zzcaster/debug.log");
+    var log = try logging.Logger.init(allocator, io, log_path);
     defer log.deinit();
     log.info("CCCaster v{s} (zig port) [mode={s}]", .{ config.version_string, @tagName(cli_mode) });
+    log.info("Log file: {s}", .{log_path});
 
     // Initialize Winsock BEFORE any networking. ENet calls WSAStartup
     // internally via enet_initialize(), but the relay client uses raw

@@ -314,6 +314,26 @@ pub fn build(b: *std.Build) void {
     });
     const run_common_tests = b.addRunArtifact(common_tests);
 
+    // Net module tests — relay_protocol.zig and relay_config.zig have
+    // pure-logic tests (wire format encode/decode, list parsing). The
+    // nat_probe.zig tests are logic-only too (no actual network calls).
+    // We cross-compile the test binary to the same Windows target as the
+    // main build so ws2_32 externs resolve.
+    const net_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/mod.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    net_test_mod.addImport("common", common_mod);
+    net_test_mod.linkSystemLibrary("ws2_32", .{});
+    net_test_mod.linkSystemLibrary("wininet", .{});
+    net_test_mod.addIncludePath(b.path("libs/enet/include"));
+    const net_tests = b.addTest(.{
+        .root_module = net_test_mod,
+    });
+    const run_net_tests = b.addRunArtifact(net_tests);
+
     // air_dash_macro.zig is pure std (no Win32/SDL/game-memory deps), so like
     // the common module it host-tests cleanly. Build a fresh test module
     // rather than reusing the cross-compiled dll module.
@@ -343,6 +363,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_common_tests.step);
+    test_step.dependOn(&run_net_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
     test_step.dependOn(&run_simulation_tests.step);
 

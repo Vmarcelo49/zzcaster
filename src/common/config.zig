@@ -23,10 +23,22 @@ pub const Config = struct {
     /// in the game's own System/NetConnect.dat (see fetchGameUserName).
     display_name: []u8 = &.{},
 
+    /// Custom relay server list (one entry per line, format documented in
+    /// src/net/relay_config.zig). If empty, the hardcoded DEFAULT_RELAY_LIST
+    /// is used (live CCCaster relays as fallback).
+    ///
+    /// Example config.ini content:
+    ///   relayServers=zzcaster:nat.example.com:3939
+    ///   relayServers=cccaster:melty.argoneus.com:3939
+    ///
+    /// Multiple lines append multiple entries (in order).
+    relay_servers: []u8 = &.{},
+
     pub fn deinit(self: *Config) void {
         self.allocator.free(self.app_dir);
         self.allocator.free(self.game_dir);
         if (self.display_name.len > 0) self.allocator.free(self.display_name);
+        if (self.relay_servers.len > 0) self.allocator.free(self.relay_servers);
     }
 };
 
@@ -107,6 +119,23 @@ pub fn parseConfig(cfg: *Config, content: []const u8) void {
             // Replace any previously-loaded value (e.g. from an earlier line).
             if (cfg.display_name.len > 0) allocator.free(cfg.display_name);
             cfg.display_name = allocator.dupe(u8, val) catch &.{};
+        } else if (std.mem.eql(u8, key, "relayServers")) {
+            // Append to the existing list (one entry per line). Multiple
+            // relayServers= lines accumulate — this lets users list multiple
+            // relays in the flat-key INI format.
+            const old = cfg.relay_servers;
+            defer if (old.len > 0) allocator.free(old);
+            const sep_len: usize = if (old.len > 0) 1 else 0; // newline separator
+            const new_len = old.len + sep_len + val.len;
+            const new_buf = allocator.alloc(u8, new_len) catch return;
+            if (old.len > 0) {
+                @memcpy(new_buf[0..old.len], old);
+                new_buf[old.len] = '\n';
+                @memcpy(new_buf[old.len + 1 ..], val);
+            } else {
+                @memcpy(new_buf[0..val.len], val);
+            }
+            cfg.relay_servers = new_buf;
         }
     }
 }
@@ -125,6 +154,19 @@ pub fn saveConfig(cfg: *const Config, io: std.Io) !void {
     try writer.print("autoReplaySave={s}\n", .{if (cfg.auto_replay_save) "true" else "false"});
     try writer.print("autoCheckUpdates={s}\n", .{if (cfg.auto_check_updates) "true" else "false"});
     try writer.print("displayName={s}\n", .{cfg.display_name});
+
+    // Save relay servers — one relayServers= line per entry.
+    // We split on newlines and emit each non-empty line as a separate
+    // relayServers= key (matches the parse-side accumulation logic).
+    if (cfg.relay_servers.len > 0) {
+        var relay_lines = std.mem.splitScalar(u8, cfg.relay_servers, '\n');
+        while (relay_lines.next()) |line| {
+            const trimmed = std.mem.trim(u8, line, " \r\t");
+            if (trimmed.len > 0) {
+                try writer.print("relayServers={s}\n", .{trimmed});
+            }
+        }
+    }
 
     try file.writeStreamingAll(io, writer.buffered());
 }
@@ -272,4 +314,39 @@ test "parseConfig duplicate key keeps last value" {
 
     parseConfig(&cfg, "displayName=First\ndisplayName=Second\n");
     try std.testing.expectEqualStrings("Second", cfg.display_name);
+}
+
+test "parseConfig reads single relayServers" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "relayServers=zzcaster:nat.example.com:3939\n");
+    try std.testing.expectEqualStrings("zzcaster:nat.example.com:3939", cfg.relay_servers);
+}
+
+test "parseConfig accumulates multiple relayServers lines" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg,
+        \\relayServers=zzcaster:nat.example.com:3939
+        \\relayServers=cccaster:melty.argoneus.com:3939
+        \\
+    );
+    // Should contain both entries, separated by a newline.
+    try std.testing.expectEqualStrings(
+        "zzcaster:nat.example.com:3939\ncccaster:melty.argoneus.com:3939",
+        cfg.relay_servers,
+    );
+}
+
+test "parseConfig relayServers defaults to empty" {
+    const allocator = std.testing.allocator;
+    var cfg = defaultConfig(allocator);
+    defer cfg.deinit();
+
+    parseConfig(&cfg, "# no relay config\n");
+    try std.testing.expectEqual(@as(usize, 0), cfg.relay_servers.len);
 }

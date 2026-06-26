@@ -329,7 +329,10 @@ pub fn detectNatType(relay_host: []const u8, relay_port: u16) NatType {
     const fd2 = createBoundSocket(0) orelse return .unknown;
     defer _ = ws2_32.closesocket(fd2);
 
-    const _local_port_2 = getLocalPort(fd2) orelse return .unknown;
+    // Verify the second socket bound successfully (we don't need the
+    // actual port number — we just need the socket to be valid so we
+    // can probe from a different local port than the first socket).
+    _ = getLocalPort(fd2) orelse return .unknown;
     const reply2 = sendProbe(fd2, ip_nbo, relay_port) orelse return .unknown;
 
     // If both probes from DIFFERENT local ports got the SAME public port,

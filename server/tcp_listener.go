@@ -155,8 +155,12 @@ func readInitialMessage(br *bufio.Reader) ([]byte, error) {
 }
 
 // handleHostRegister processes a HostRegister: create a room, reply
-// with Hosted, then keep the TCP open until a client joins (MatchInfo)
-// and the UDP exchange completes (TunInfo).
+// with Hosted, then keep the TCP open until the connection closes.
+//
+// MatchInfo and TunInfo are pushed to the host's TCP connection by
+// JoinClient and RecordPeerUdpAddr respectively — this function does
+// NOT send them. It just waits for the connection to close (host
+// disconnects) and then cleans up the room.
 func handleHostRegister(
         ctx context.Context,
         conn net.Conn,
@@ -182,43 +186,24 @@ func handleHostRegister(
 
         logger.Printf("host registered: code=%s addr=%s port=%d", assignedCode, peerConn.TCPAddr, hr.Port)
 
-        // Block until the room is matched (state transitions to RoomMatched)
-        // or the connection closes / context cancels / TTL expires.
-        ticker := time.NewTicker(100 * time.Millisecond)
-        defer ticker.Stop()
+        // Wait for the connection to close. The server will push MatchInfo
+        // and TunInfo to this TCP connection from JoinClient / RecordPeerUdpAddr.
+        // If the host disconnects before a client joins, the TCP read will
+        // return EOF and we'll clean up the room.
+        waitForConnClose(ctx, conn, logger, peerConn.TCPAddr)
 
-        for {
-                select {
-                case <-ctx.Done():
-                        rm.Delete(assignedCode)
-                        return
-                case <-ticker.C:
-                        r := rm.LookupByHostCode(assignedCode)
-                        if r == nil {
-                                // Room was deleted (TTL expired or client error)
-                                logger.Printf("host: room %s gone", assignedCode)
-                                return
-                        }
-                        if r.State == RoomMatched {
-                                // Send MatchInfo
-                                if _, err := conn.Write(EncodeMatchInfo(r.MatchId)); err != nil {
-                                        logger.Printf("write MatchInfo to host %s: %v", peerConn.TCPAddr, err)
-                                        rm.Delete(assignedCode)
-                                        return
-                                }
-                                logger.Printf("host: sent MatchInfo for room %s matchId=%d", assignedCode, r.MatchId)
-                                // Now wait for the UDP handler to send TunInfo directly
-                                // to this conn. We just block here until the conn closes.
-                                waitForConnClose(ctx, conn, logger, peerConn.TCPAddr)
-                                return
-                        }
-                }
-        }
+        // Clean up room on disconnect (whether matched or not).
+        rm.Delete(assignedCode)
+        logger.Printf("host disconnected, deleted room %s", assignedCode)
 }
 
 // handleClientJoin processes a ClientJoin: look up the room, attach
-// self as client, send MatchInfo, then wait for the relay's UDP handler
-// to send TunInfo.
+// self as client. MatchInfo is sent to BOTH host and client by
+// JoinClient (atomically, under the lock) — this function does NOT
+// send MatchInfo itself.
+//
+// After JoinClient succeeds, this function just waits for the relay's
+// UDP handler to push TunInfo to this connection.
 func handleClientJoin(
         ctx context.Context,
         conn net.Conn,
@@ -228,7 +213,7 @@ func handleClientJoin(
         rm *RoomManager,
         logger *log.Logger,
 ) {
-        _, matchId, err := rm.JoinClient(cj.Code, peerConn, cfg.RoomTTL)
+        matchId, err := rm.JoinClient(cj.Code, peerConn, cfg.RoomTTL)
         if err != nil {
                 logger.Printf("join client from %s code=%s: %v", peerConn.TCPAddr, cj.Code, err)
                 if re, ok := err.(*RoomError); ok {
@@ -239,13 +224,7 @@ func handleClientJoin(
                 return
         }
 
-        // Send MatchInfo to client.
-        if _, err := conn.Write(EncodeMatchInfo(matchId)); err != nil {
-                logger.Printf("write MatchInfo to client %s: %v", peerConn.TCPAddr, err)
-                rm.Delete(cj.Code)
-                return
-        }
-
+        // MatchInfo was already sent to both host and client by JoinClient.
         logger.Printf("client joined: code=%s matchId=%d addr=%s", cj.Code, matchId, peerConn.TCPAddr)
 
         // Wait for the UDP handler to send TunInfo directly to this conn.

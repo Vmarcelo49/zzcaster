@@ -126,29 +126,34 @@ func (rm *RoomManager) RegisterHost(code string, hostConn *PeerConn, ttl time.Du
 }
 
 // JoinClient looks up a room by code and attaches the client to it.
-// Generates a matchId and transitions to RoomMatched. The caller is
-// responsible for sending MatchInfo to both peers after this returns.
+// Generates a matchId and transitions to RoomMatched. MatchInfo is
+// sent to BOTH host and client atomically inside this function, under
+// the lock — this guarantees the host receives MatchInfo BEFORE any
+// TunInfo that might be triggered by the client's UdpData (which the
+// client starts sending immediately after receiving MatchInfo).
 //
-// Returns: the room (now in RoomMatched state) and the matchId.
+// Returns the matchId. The caller does NOT need to send MatchInfo —
+// it's already done.
+//
 // Returns ErrRoomNotFound if the code doesn't exist, ErrRoomExpired if
 // the room's TTL has elapsed, ErrProtocolError if the room is already
-// matched (shouldn't happen — second joiner should be rejected).
-func (rm *RoomManager) JoinClient(code string, clientConn *PeerConn, ttl time.Duration) (*Room, uint32, error) {
+// matched or a peer's TCP write fails.
+func (rm *RoomManager) JoinClient(code string, clientConn *PeerConn, ttl time.Duration) (uint32, error) {
         rm.mu.Lock()
         defer rm.mu.Unlock()
 
         room, exists := rm.rooms[code]
         if !exists {
-                return nil, 0, ErrRoomNotFound
+                return 0, ErrRoomNotFound
         }
 
         if time.Now().After(room.Expires) {
                 delete(rm.rooms, code)
-                return nil, 0, ErrRoomExpired
+                return 0, ErrRoomExpired
         }
 
         if room.State != RoomWaiting {
-                return nil, 0, ErrProtocolError
+                return 0, ErrProtocolError
         }
 
         room.ClientConn = clientConn
@@ -158,7 +163,25 @@ func (rm *RoomManager) JoinClient(code string, clientConn *PeerConn, ttl time.Du
         // the hole-punch.
         room.Expires = time.Now().Add(ttl)
 
-        return room, room.MatchId, nil
+        // Send MatchInfo to BOTH host and client atomically. This MUST
+        // happen under the lock to prevent the race where the client sends
+        // UdpData → server sends TunInfo to host → host receives TunInfo
+        // before MatchInfo.
+        matchInfo := EncodeMatchInfo(room.MatchId)
+        if room.HostConn != nil {
+                if _, err := room.HostConn.Conn.Write(matchInfo); err != nil {
+                        // Host disconnected — clean up and fail.
+                        delete(rm.rooms, code)
+                        return 0, ErrProtocolError
+                }
+        }
+        if _, err := clientConn.Conn.Write(matchInfo); err != nil {
+                // Client disconnected — clean up and fail.
+                delete(rm.rooms, code)
+                return 0, ErrProtocolError
+        }
+
+        return room.MatchId, nil
 }
 
 // FindByMatchId returns the room associated with a matchId, or nil.

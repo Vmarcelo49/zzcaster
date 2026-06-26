@@ -103,6 +103,15 @@ pub const NetplaySession = struct {
     error_buf: [128]u8 = [_]u8{0} ** 128,
     error_len: usize = 0,
 
+    // --- Status message for UI display (Slice 5 redesign) ---
+    //
+    // Human-readable status string that describes what the session is
+    // currently doing. Updated by stepRelay(), stepListening(), etc.
+    // The UI reads this via getStatusMsg() and displays it prominently
+    // so the user always knows what's happening.
+    status_buf: [128]u8 = [_]u8{0} ** 128,
+    status_len: usize = 0,
+
     // --- Internal sub-state for the step-based handshake state machine ---
     //
     // `phase_deadline_ms` is the wall-clock millisecond timestamp at which
@@ -230,6 +239,15 @@ pub const NetplaySession = struct {
         return self.error_buf[0..self.error_len];
     }
 
+    /// Returns the current status message for UI display.
+    /// This is a human-readable string like "Connecting to relay server..."
+    /// or "Listening on port 46318 (direct mode)..." that tells the user
+    /// exactly what's happening. Never null — returns "Idle." if no status.
+    pub fn getStatusMsg(self: *const NetplaySession) []const u8 {
+        if (self.status_len == 0) return "Idle.";
+        return self.status_buf[0..self.status_len];
+    }
+
     /// Returns the remaining whole seconds for the current phase's timeout,
     /// or null if the current state has no active deadline. Used by the UI
     /// to render a countdown. Wall-clock based, so the countdown runs at
@@ -269,6 +287,16 @@ pub const NetplaySession = struct {
         self.error_len = n;
     }
 
+    /// Set the status message shown to the user on the waiting screen.
+    /// Called by stepRelay(), stepListening(), stepConnecting(), etc.
+    /// to keep the user informed about what's happening.
+    fn setStatus(self: *NetplaySession, msg: []const u8) void {
+        const n = @min(msg.len, self.status_buf.len - 1);
+        @memcpy(self.status_buf[0..n], msg[0..n]);
+        self.status_buf[n] = 0;
+        self.status_len = n;
+    }
+
     pub fn startHost(self: *NetplaySession, port: u16, training: bool) !void {
         self.config.is_host = true;
         self.config.is_training = training;
@@ -280,6 +308,7 @@ pub const NetplaySession = struct {
         self.state = .listening;
         self.setPhaseTimeout(listen_timeout_ms);
         try self.transport.listen(port, self.log);
+        self.setStatus("Listening for direct connection...");
         self.log.info("Waiting for opponent to connect on port {d}...", .{port});
     }
 
@@ -296,6 +325,7 @@ pub const NetplaySession = struct {
         self.state = .connecting;
         self.setPhaseTimeout(connect_timeout_ms);
         try self.transport.connect(host_str, port, self.log);
+        self.setStatus("Connecting directly to peer...");
     }
 
     // ========================================================================
@@ -369,6 +399,7 @@ pub const NetplaySession = struct {
 
         self.state = .relay_connecting;
         self.setPhaseTimeout(0); // RelayClient manages its own timeouts
+        self.setStatus("Connecting to relay server...");
         self.log.info("Relay host started (flavor={s})", .{entry.flavor.label()});
     }
 
@@ -419,6 +450,7 @@ pub const NetplaySession = struct {
 
         self.state = .relay_connecting;
         self.setPhaseTimeout(0); // RelayClient manages its own timeouts
+        self.setStatus("Connecting to relay server...");
         self.log.info("Relay join started (flavor={s})", .{entry.flavor.label()});
     }
 
@@ -534,6 +566,23 @@ pub const NetplaySession = struct {
         }
 
         const rc = &self.relay_client.?;
+
+        // Update status message based on relay client's internal state
+        switch (rc.getState()) {
+            .tcp_connecting => self.setStatus("Connecting to relay server..."),
+            .waiting_for_hosted => self.setStatus("Registering with relay..."),
+            .waiting_for_match_info => {
+                if (self.config.is_host) {
+                    self.setStatus("Waiting for opponent to join...");
+                } else {
+                    self.setStatus("Joining host via relay...");
+                }
+            },
+            .waiting_for_tun_info => self.setStatus("Negotiating connection..."),
+            .hole_punching => self.setStatus("Hole-punching through NAT..."),
+            else => {},
+        }
+
         const result = rc.step(self.io);
 
         if (result == null) return; // still in progress
@@ -545,6 +594,7 @@ pub const NetplaySession = struct {
                     r.peer_ip[0], r.peer_ip[1], r.peer_ip[2], r.peer_ip[3],
                     r.peer_port, r.local_udp_port,
                 });
+                self.setStatus("Connected! Starting ENet handshake...");
 
                 // Format peer IP as string for ENet
                 var peer_ip_str: [32]u8 = undefined;
@@ -599,6 +649,7 @@ pub const NetplaySession = struct {
                     err.suggestion(),
                 }) catch err.label();
                 self.setError(msg);
+                self.setStatus("Connection failed.");
                 self.state = .failed;
             },
         }

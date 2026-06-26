@@ -9,13 +9,13 @@ const game_launcher = @import("game_launcher.zig");
 const ui_controller_mapper = @import("ui_controller_mapper.zig");
 const ui_waiting_for_peer = @import("ui_waiting_for_peer.zig");
 const relay_config = @import("net").relay_config;
+const connection_detector = @import("net").connection_detector;
 const ui = @import("ui.zig");
 const ui_theme = @import("ui_theme.zig");
 const zgui = @import("zgui");
 
 const UiState = ui.UiState;
 const MenuPage = ui.MenuPage;
-const NetplayMode = ui.NetplayMode;
 
 /// Render the idle (main menu) page. Modern layout:
 ///   - Fixed header bar (64px) at the top with ZZ+CASTER logo
@@ -34,8 +34,6 @@ pub fn drawIdlePage(
     current_page: *MenuPage,
     peer_buf: [:0]u8,
     port_buf: [:0]u8,
-    netplay_mode: *NetplayMode,
-    room_code_buf: [:0]u8,
     name_buf: [:0]u8,
     wincount_buf: [:0]u8,
     rollback_buf: [:0]u8,
@@ -84,8 +82,7 @@ pub fn drawIdlePage(
 
     switch (current_page.*) {
         .play => drawPlayPage(
-            allocator, io, cfg, log, pipe_name, peer_buf, port_buf,
-            netplay_mode, room_code_buf, ui_state,
+            allocator, io, cfg, log, pipe_name, peer_buf, port_buf, ui_state,
             np_session, host_start_clicked, win_launcher, game_pid, ipc_server,
             error_msg, error_msg_len
         ),
@@ -191,8 +188,6 @@ fn drawPlayPage(
     pipe_name: []const u8,
     peer_buf: [:0]u8,
     port_buf: [:0]u8,
-    netplay_mode: *NetplayMode,
-    room_code_buf: [:0]u8,
     ui_state: *UiState,
     np_session: *?session.NetplaySession,
     host_start_clicked: *bool,
@@ -210,63 +205,30 @@ fn drawPlayPage(
     if (ui_theme.beginCard("##netplay_card", col_w, col_h, false)) {
         ui_theme.cardTitle("NETPLAY");
 
-        // --- Mode toggle: Direct IP / Relay ---
-        zgui.text("Mode", .{});
-        zgui.spacing();
-        {
-            if (zgui.radioButton("Direct IP", .{ .active = netplay_mode.* == .direct_ip })) {
-                netplay_mode.* = .direct_ip;
-            }
-            zgui.sameLine(.{ .spacing = 16 });
-            if (zgui.radioButton("Relay", .{ .active = netplay_mode.* == .relay })) {
-                netplay_mode.* = .relay;
-            }
-        }
+        // --- Single unified input layout (Slice 5 redesign) ---
+        // Two fields only:
+        //   1. Host Port (used for hosting)
+        //   2. IP:Port or Room Code (used for joining)
+        //
+        // Auto-detection: the Join button figures out what the user typed
+        // and picks the right connection strategy. No mode toggle needed.
+        zgui.text("Host Port", .{});
+        zgui.pushItemWidth(120);
+        _ = zgui.inputText("##host_port", .{ .buf = port_buf });
+        zgui.popItemWidth();
 
         zgui.spacing();
         zgui.separator();
         zgui.spacing();
 
-        // --- Mode-specific input fields ---
-        switch (netplay_mode.*) {
-            .direct_ip => {
-                // Direct IP mode: existing UI (host port + peer addr)
-                zgui.text("Host Port", .{});
-                zgui.pushItemWidth(120);
-                _ = zgui.inputText("##host_port", .{ .buf = port_buf });
-                zgui.popItemWidth();
+        zgui.text("Join: IP:Port or Room Code", .{});
+        zgui.pushItemWidth(-1);
+        _ = zgui.inputText("##peer_addr", .{ .buf = peer_buf });
+        zgui.popItemWidth();
 
-                zgui.spacing();
-
-                zgui.text("Join / Spectate (IP : Port)", .{});
-                zgui.pushItemWidth(-1);
-                _ = zgui.inputText("##peer_addr", .{ .buf = peer_buf });
-                zgui.popItemWidth();
-
-                zgui.spacing();
-                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(host must port-forward the port)", .{});
-            },
-            .relay => {
-                // Relay mode: room code / host address + host port
-                zgui.text("Host Port", .{});
-                zgui.pushItemWidth(120);
-                _ = zgui.inputText("##host_port_relay", .{ .buf = port_buf });
-                zgui.popItemWidth();
-
-                zgui.spacing();
-
-                zgui.text("Room Code / Host Address", .{});
-                zgui.pushItemWidth(-1);
-                _ = zgui.inputText("##room_code", .{ .buf = room_code_buf });
-                zgui.popItemWidth();
-
-                zgui.spacing();
-                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(relay-assisted — no port forwarding needed)", .{});
-                zgui.spacing();
-                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Host: leave code empty to auto-generate.", .{});
-                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Join: enter the host's room code or IP:port.", .{});
-            },
-        }
+        zgui.spacing();
+        ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Room code: 4 letters (e.g., ABCD)", .{});
+        ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Direct: ip:port (e.g., 192.168.0.2:46318)", .{});
 
         // --- Bottom action buttons ---
         const card_inner_w = zgui.getContentRegionAvail()[0];
@@ -275,22 +237,15 @@ fn drawPlayPage(
         const btn_y = col_h - 32 - ui_theme.CARD_PAD;
         zgui.setCursorPosY(btn_y);
 
-        // Host button — calls the appropriate start function based on mode
+        // Host button — always tries relay first, falls back to direct
         if (ui_theme.primaryButton("Host", btn_w, 32)) {
-            switch (netplay_mode.*) {
-                .direct_ip => {
-                    ui_waiting_for_peer.startHostSession(allocator, io, cfg, log, game_launcher.parsePort(port_buf.ptr), np_session);
-                },
-                .relay => {
-                    const relay_source = getRelaySource(cfg);
-                    ui_waiting_for_peer.startRelayHostSession(
-                        allocator, io, cfg, log,
-                        game_launcher.parsePort(port_buf.ptr),
-                        relay_source,
-                        np_session,
-                    );
-                },
-            }
+            const relay_source = getRelaySource(cfg);
+            ui_waiting_for_peer.startSmartHostSession(
+                allocator, io, cfg, log,
+                game_launcher.parsePort(port_buf.ptr),
+                relay_source,
+                np_session,
+            );
             if (np_session.* != null) {
                 host_start_clicked.* = false;
                 ui_state.* = .waiting_for_peer;
@@ -298,22 +253,16 @@ fn drawPlayPage(
         }
         zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
 
-        // Join button — calls the appropriate start function based on mode
+        // Join button — auto-detects input format
         if (ui_theme.primaryButton("Join", btn_w, 32)) {
-            switch (netplay_mode.*) {
-                .direct_ip => {
-                    ui_waiting_for_peer.startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(peer_buf, 0), np_session);
-                },
-                .relay => {
-                    const relay_source = getRelaySource(cfg);
-                    ui_waiting_for_peer.startRelayJoinSession(
-                        allocator, io, cfg, log,
-                        std.mem.sliceTo(room_code_buf, 0),
-                        relay_source,
-                        np_session,
-                    );
-                },
-            }
+            const input = std.mem.sliceTo(peer_buf, 0);
+            const relay_source = getRelaySource(cfg);
+            ui_waiting_for_peer.startSmartJoinSession(
+                allocator, io, cfg, log,
+                input,
+                relay_source,
+                np_session,
+            );
             if (np_session.* != null) {
                 ui_state.* = .waiting_for_peer;
             }

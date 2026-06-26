@@ -5,6 +5,7 @@ pub const relay_protocol = @import("relay_protocol.zig");
 pub const relay_config = @import("relay_config.zig");
 pub const relay_client = @import("relay_client.zig");
 pub const nat_probe = @import("nat_probe.zig");
+pub const connection_detector = @import("connection_detector.zig");
 
 // Re-export the ENet cimport so all files see the same type definitions.
 pub const enet = enet_transport.enet;

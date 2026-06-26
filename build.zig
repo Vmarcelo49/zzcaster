@@ -366,6 +366,18 @@ pub fn build(b: *std.Build) void {
     });
     const run_net_integration_tests = b.addRunArtifact(net_integration_tests);
 
+    // Connection detector tests — pure logic, no Win32 deps
+    const conn_detector_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/connection_detector.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const conn_detector_tests = b.addTest(.{
+        .root_module = conn_detector_test_mod,
+    });
+    const run_conn_detector_tests = b.addRunArtifact(conn_detector_tests);
+
     // air_dash_macro.zig is pure std (no Win32/SDL/game-memory deps), so like
     // the common module it host-tests cleanly. Build a fresh test module
     // rather than reusing the cross-compiled dll module.
@@ -398,6 +410,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_net_protocol_tests.step);
     test_step.dependOn(&run_net_config_tests.step);
     test_step.dependOn(&run_net_integration_tests.step);
+    test_step.dependOn(&run_conn_detector_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
     test_step.dependOn(&run_simulation_tests.step);
 

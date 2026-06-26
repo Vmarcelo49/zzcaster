@@ -84,6 +84,19 @@ func handleTCPConn(ctx context.Context, conn net.Conn, cfg TCPListenerConfig, rm
         }
 
         br := bufio.NewReader(conn)
+
+        // Check for HTTP request before trying to parse as relay protocol.
+        // If someone opens http://<relay-ip>:3939/ in a browser, the browser
+        // sends "GET / HTTP/1.1\r\n...". We detect this and respond with a
+        // 302 redirect to the GitHub repo instead of a binary Error message.
+        if peek, err := br.Peek(4); err == nil {
+                if looksLikeHTTPRequest(peek) {
+                        logger.Printf("HTTP request from %s — sending redirect", peerTCPAddr)
+                        sendHTTPRedirect(conn)
+                        return
+                }
+        }
+
         firstMsg, err := readInitialMessage(br)
         if err != nil {
                 logger.Printf("read initial from %s: %v", peerTCPAddr, err)
@@ -280,4 +293,75 @@ func startCleanupLoop(ctx context.Context, rm *RoomManager, interval time.Durati
                         }
                 }
         }
+}
+
+// ============================================================================
+// HTTP redirect for browser hits
+// ============================================================================
+
+// GitHubRepoURL is where browser hits get redirected to.
+// Override at build time with: -ldflags="-X main.GitHubRepoURL=https://..."
+const GitHubRepoURL = "https://github.com/Vmarcelo49/zzcaster"
+
+// httpMethodPrefixes are the first 4 bytes of common HTTP request lines.
+// HTTP methods are uppercase ASCII followed by a space. We check the first
+// 4 bytes against these known prefixes to distinguish HTTP traffic from
+// relay protocol messages (which start with 'T' or 'U').
+//
+// Relay protocol initial messages:
+//   HostRegister:  [u8 'T'|'U'][u16 port][u8 code_len][code]  → starts with T or U
+//   ClientJoin:    [u8 'T'|'U'][u8 code_len][code]            → starts with T or U
+//
+// HTTP methods all start with uppercase letters that are NOT 'T' or 'U'
+// (except "TRACE" which is rare and starts with "TRAC", not "T" alone —
+// the 4-byte check distinguishes it from a relay HostRegister because
+// a HostRegister's 2nd byte is a port number, not 'R').
+var httpMethodPrefixes = [][4]byte{
+        {'G', 'E', 'T', ' '},    // GET
+        {'P', 'O', 'S', 'T'},    // POST
+        {'H', 'E', 'A', 'D'},    // HEAD
+        {'P', 'U', 'T', ' '},    // PUT
+        {'D', 'E', 'L', 'E'},    // DELETE
+        {'O', 'P', 'T', 'I'},    // OPTIONS
+        {'C', 'O', 'N', 'N'},    // CONNECT
+        {'P', 'A', 'T', 'C'},    // PATCH
+        {'T', 'R', 'A', 'C'},    // TRACE (rare, but distinguishable from relay 'T')
+}
+
+// looksLikeHTTPRequest checks if the first 4 bytes of a TCP connection
+// match a known HTTP method prefix. This is a heuristic — it's possible
+// (but unlikely) for a relay protocol message to collide, since
+// HostRegister starts with 'T' or 'U' followed by a port number.
+//
+// The only collision risk is TRACE (starts with 'T'), but a
+// HostRegister's 2nd byte is a u16 port's low byte — for it to be 'R'
+// (0x52 = 82), the port would need to be 82 + 256*n (82, 338, 594, ...).
+// Port 82 is not a common zzcaster port, so this is acceptable.
+func looksLikeHTTPRequest(peek []byte) bool {
+        if len(peek) < 4 {
+                return false
+        }
+        var prefix [4]byte
+        copy(prefix[:], peek[:4])
+        for _, p := range httpMethodPrefixes {
+                if prefix == p {
+                        return true
+                }
+        }
+        return false
+}
+
+// sendHTTPRedirect writes a minimal HTTP 302 redirect response and closes
+// the connection. The body includes a clickable link for browsers with
+// redirects disabled.
+func sendHTTPRedirect(conn net.Conn) {
+        body := `<html><body>Redirecting to <a href="` + GitHubRepoURL + `">` + GitHubRepoURL + `</a>.</body></html>`
+        resp := "HTTP/1.1 302 Found\r\n" +
+                "Location: " + GitHubRepoURL + "\r\n" +
+                "Content-Type: text/html; charset=utf-8\r\n" +
+                "Content-Length: " + fmt.Sprintf("%d", len(body)) + "\r\n" +
+                "Connection: close\r\n" +
+                "\r\n" +
+                body
+        conn.Write([]byte(resp))
 }

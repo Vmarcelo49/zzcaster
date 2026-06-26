@@ -7,6 +7,7 @@ const session = @import("session.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui = @import("ui.zig");
 const ui_theme = @import("ui_theme.zig");
+const connection_detector = @import("net").connection_detector;
 const zgui = @import("zgui");
 
 const UiState = ui.UiState;
@@ -93,6 +94,166 @@ pub fn startJoinSession(
     log.info("Join session started -> {s}:{d} (name='{s}')", .{ host_part, port, np_session.*.?.localName() });
 }
 
+/// Start a relay-assisted host session. The relay handles NAT traversal
+/// so the host doesn't need to port-forward. A 4-letter room code is
+/// generated — display it via getRoomCode().
+///
+/// `relay_source` is the text contents of relay_list.txt or the
+/// relayServers= config field. If empty, uses the hardcoded default.
+pub fn startRelayHostSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    port: u16,
+    relay_source: []const u8,
+    np_session: *?session.NetplaySession,
+) void {
+    cleanupSession(np_session);
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
+    s.lookupHostAddresses();
+    np_session.* = s;
+
+    np_session.*.?.startRelayHost(relay_source, port, false) catch |err| {
+        log.err("startRelayHost failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
+    };
+    if (np_session.*.?.getRoomCode()) |code| {
+        log.info("Relay host session started on port {d} (room code={s}, name='{s}')", .{
+            port, code, np_session.*.?.localName(),
+        });
+    } else {
+        log.info("Relay host session started on port {d} (name='{s}')", .{
+            port, np_session.*.?.localName(),
+        });
+    }
+}
+
+/// Start a relay-assisted join session.
+///
+/// `peer_identifier` is a 4-letter room code.
+///
+/// `relay_source` is the text contents of relay_list.txt. If empty,
+/// uses the hardcoded default.
+pub fn startRelayJoinSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    peer_identifier: []const u8,
+    relay_source: []const u8,
+    np_session: *?session.NetplaySession,
+) void {
+    cleanupSession(np_session);
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
+    np_session.* = s;
+
+    np_session.*.?.startRelayJoin(relay_source, peer_identifier, false) catch |err| {
+        log.err("startRelayJoin failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
+    };
+    log.info("Relay join session started -> {s} (name='{s}')", .{
+        peer_identifier, np_session.*.?.localName(),
+    });
+}
+
+/// Start a smart host session — direct listener + relay in parallel.
+///
+/// This is the unified Host button handler. It opens a direct ENet listener
+/// on `port` AND starts a relay client (for NAT traversal) in parallel.
+/// Whichever peer arrives first wins:
+///
+///   - If a direct peer connects (localhost/LAN), the relay client is
+///     canceled and the existing ENet handshake flow takes over.
+///   - If the relay handshake completes first (peer behind NAT), the direct
+///     listener is torn down and re-created bound to the relay's
+///     local_udp_port — preserving the NAT mapping. The peer's ENet CONNECT
+///     then arrives at the new listener.
+///
+/// This fixes the regression where the smart host flow forced ALL host
+/// sessions through the relay path — breaking localhost/LAN connections
+/// where the relay is unreachable or unnecessary.
+pub fn startSmartHostSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    port: u16,
+    relay_source: []const u8,
+    np_session: *?session.NetplaySession,
+) void {
+    cleanupSession(np_session);
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
+    s.lookupHostAddresses();
+    np_session.* = s;
+
+    np_session.*.?.startSmartHost(relay_source, port, false) catch |err| {
+        log.err("startSmartHost failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
+    };
+    if (np_session.*.?.getRoomCode()) |code| {
+        log.info("Smart host session started (room code={s}, name='{s}')", .{
+            code, np_session.*.?.localName(),
+        });
+    } else {
+        log.info("Smart host session started (direct only, name='{s}')", .{
+            np_session.*.?.localName(),
+        });
+    }
+}
+
+/// Start a smart join session — auto-detects input format and picks
+/// the right connection strategy.
+///
+/// Detection rules (via connection_detector.parseInput):
+///   .room_code (4 letters)     → relay join (room-code based)
+///   .ip_port (any IP:port)     → direct join (relay is room-code only)
+///   .invalid                   → error, don't start a session
+pub fn startSmartJoinSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    input: []const u8,
+    relay_source: []const u8,
+    np_session: *?session.NetplaySession,
+) void {
+    const parsed = connection_detector.parseInput(input);
+
+    switch (parsed.type) {
+        .room_code => {
+            log.info("Smart join: detected room code '{s}' — using relay", .{parsed.value});
+            startRelayJoinSession(allocator, io, cfg, log, parsed.value, relay_source, np_session);
+        },
+        .ip_port => {
+            log.info("Smart join: detected address '{s}' — using direct connection", .{input});
+            startJoinSession(allocator, io, cfg, log, input, np_session);
+        },
+        .port, .empty, .invalid => {
+            log.err("Smart join: invalid input '{s}' — expected #roomcode or ip:port", .{input});
+            // Don't start a session — the UI will show an error.
+        },
+    }
+}
+
 /// Draw the waiting-for-peer screen. Calls session.step() each frame to
 /// drive the handshake forward, then shows progress / confirmation / launch.
 pub fn drawWaitingForPeer(
@@ -142,15 +303,36 @@ pub fn drawWaitingForPeer(
         zgui.spacing();
 
         switch (s.state) {
-            .idle, .listening, .connecting, .handshaking, .ping_exchanging => {
-                // In-progress: show address info + a spinner-ish message.
+            .idle, .listening, .connecting, .handshaking, .ping_exchanging, .relay_connecting => {
+                // --- Status message (most prominent) ---
+                // Show the current status from session.getStatusMsg() — this
+                // tells the user exactly what's happening right now.
+                const status = s.getStatusMsg();
+                if (status.len > 0) {
+                    ui_theme.textColored(ui_theme.COL_TEXT, "{s}", .{status});
+                    zgui.spacing();
+                }
+
+                // --- Share info (room code or IP:port) ---
+                // For host: show what to share with the opponent.
+                // For client: show what we're connecting to.
                 if (is_host) {
-                    if (s.publicIp()) |pub_ip| {
+                    // Host: show room code (relay) or IP:port (direct)
+                    if (s.getRoomCode()) |code| {
+                        var code_buf: [16]u8 = undefined;
+                        const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch "????";
+                        ui_theme.textColored(ui_theme.COL_MUTED, "Share this room code with your opponent:", .{});
+                        zgui.spacing();
+                        ui_theme.textColored(ui_theme.COL_RED, "{s}", .{code_z});
+                        zgui.sameLine(.{ .spacing = 12 });
+                        if (ui_theme.secondaryButton("Copy", 80, 28)) {
+                            setClipboardZ(code_z);
+                        }
+                    } else if (s.publicIp()) |pub_ip| {
                         var addr_buf: [80]u8 = undefined;
                         const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ pub_ip, s.config.peer_port }) catch "?:?";
                         ui_theme.textColored(ui_theme.COL_MUTED, "Share this address with your opponent:", .{});
                         zgui.spacing();
-                        // Highlight the address in red — it's the most important info on the screen.
                         ui_theme.textColored(ui_theme.COL_RED, "{s}", .{addr_z});
                         zgui.sameLine(.{ .spacing = 12 });
                         if (ui_theme.secondaryButton("Copy", 80, 28)) {
@@ -166,13 +348,14 @@ pub fn drawWaitingForPeer(
                         ui_theme.textColored(ui_theme.COL_TEXT_DIM, "{s}", .{addr_z});
                     }
                 } else {
+                    // Client: show what we're connecting to
                     var addr_buf: [80]u8 = undefined;
                     const peer_z = std.mem.sliceTo(&s.config.peer_addr, 0);
-                    const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ peer_z, s.config.peer_port }) catch "?:?";
-                    ui_theme.textColored(ui_theme.COL_MUTED, "Connecting to {s}...", .{addr_z});
+                    if (peer_z.len > 0) {
+                        const addr_z = std.fmt.bufPrintZ(&addr_buf, "Connecting to {s}:{d}", .{ peer_z, s.config.peer_port }) catch "Connecting...";
+                        ui_theme.textColored(ui_theme.COL_MUTED, "{s}", .{addr_z});
+                    }
                 }
-                zgui.spacing();
-                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(make sure the port is open / forwarded on the host's router)", .{});
 
                 const local_ct = s.localConnectionType();
                 if (std.mem.eql(u8, local_ct, "Wired")) {

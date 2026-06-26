@@ -5,6 +5,7 @@ const logging = @import("common").logging;
 const ipc = @import("common").ipc;
 const ui = @import("ui.zig");
 const launcher = @import("launcher.zig");
+const relay_client_mod = @import("net").relay_client;
 
 pub const CliMode = enum {
     menu,
@@ -69,6 +70,16 @@ pub fn main(init: std.process.Init) !void {
     var log = try logging.Logger.init(allocator, io, "zzcaster/debug.log");
     defer log.deinit();
     log.info("CCCaster v{s} (zig port) [mode={s}]", .{ config.version_string, @tagName(cli_mode) });
+
+    // Initialize Winsock BEFORE any networking. ENet calls WSAStartup
+    // internally via enet_initialize(), but the relay client uses raw
+    // ws2_32 sockets (socket, connect, send, recv, select) BEFORE ENet
+    // is initialized — during the relay handshake phase. Without this
+    // call, all relay client socket operations silently fail.
+    if (!relay_client_mod.initWinsock()) {
+        log.err("Failed to initialize Winsock — relay mode will not work", .{});
+    }
+    defer relay_client_mod.deinitWinsock();
 
     // Parse config
     var cfg = try config.loadConfig(allocator, io);

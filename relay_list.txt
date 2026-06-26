@@ -1,0 +1,21 @@
+# zzcaster relay list — format: host[:port]
+#
+# Default port: 3939.
+#
+# The client tries entries in order; on TCP disconnect or timeout, advances
+# to the next. This is the failover chain.
+#
+# ──────────────────────────────────────────────────────────────────────
+# Primary zzcaster relay (room-code based, full NAT traversal support).
+# ──────────────────────────────────────────────────────────────────────
+zzcaster.duckdns.org:3939
+
+# ──────────────────────────────────────────────────────────────────────
+# Users can override via config.ini:
+#   relayServers=nat.example.com:3939
+# ──────────────────────────────────────────────────────────────────────
+
+# ──────────────────────────────────────────────────────────────────────
+# Local dev (uncomment for testing against a local server)
+# ──────────────────────────────────────────────────────────────────────
+# 127.0.0.1:3939

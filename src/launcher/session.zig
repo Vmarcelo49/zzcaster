@@ -3,6 +3,9 @@ const logging = @import("common").logging;
 const net = @import("net").enet_transport;
 const ip_discovery = @import("net").ip_discovery;
 const net_util = @import("net_util.zig");
+const relay_client_mod = @import("net").relay_client;
+const relay_config = @import("net").relay_config;
+const relay_protocol = @import("net").relay_protocol;
 
 pub const NetplayConfig = struct {
     is_host: bool = false,
@@ -38,6 +41,12 @@ pub const SessionState = enum {
     completed,
     failed,
     cancelled,
+
+    // Relay-assisted connection states (Slice 4). The relay path is a
+    // sibling to the direct-IP path — after relay handoff succeeds, the
+    // session transitions to .connecting and the existing ENet handshake
+    // flow takes over.
+    relay_connecting, // relay handshake in progress (host or client)
 };
 
 pub const PingStats = struct {
@@ -94,6 +103,15 @@ pub const NetplaySession = struct {
     error_buf: [128]u8 = [_]u8{0} ** 128,
     error_len: usize = 0,
 
+    // --- Status message for UI display (Slice 5 redesign) ---
+    //
+    // Human-readable status string that describes what the session is
+    // currently doing. Updated by stepRelay(), stepListening(), etc.
+    // The UI reads this via getStatusMsg() and displays it prominently
+    // so the user always knows what's happening.
+    status_buf: [128]u8 = [_]u8{0} ** 128,
+    status_len: usize = 0,
+
     // --- Internal sub-state for the step-based handshake state machine ---
     //
     // `phase_deadline_ms` is the wall-clock millisecond timestamp at which
@@ -111,6 +129,15 @@ pub const NetplaySession = struct {
     // Wall-clock ms of the last ENet heartbeat ping sent. Reset to 0 on
     // init. Polled by maybeHeartbeat() in step().
     last_heartbeat_ms: i64 = 0,
+
+    // --- Relay state (Slice 4) ---
+    //
+    // When non-null, the session is in relay mode (as opposed to direct-IP
+    // mode). The relay_client drives the TCP+UDP hole-punch state machine.
+    // relay_list owns the host strings that relay_client.relay.host points
+    // into — must stay alive for the lifetime of relay_client.
+    relay_client: ?relay_client_mod.RelayClient = null,
+    relay_list: ?relay_config.RelayList = null,
 
     // Wall-clock timeouts (milliseconds) for each handshake phase. Tuned
     // to match the original 60-fps frame counts: 300 frames = 5 s,
@@ -137,6 +164,16 @@ pub const NetplaySession = struct {
     }
 
     pub fn deinit(self: *NetplaySession) void {
+        // Tear down relay state first — relay_client's sockets must be
+        // closed before transport.deinit() to avoid port conflicts.
+        if (self.relay_client) |*rc| {
+            rc.deinit();
+            self.relay_client = null;
+        }
+        if (self.relay_list) |*rl| {
+            rl.deinit(self.allocator);
+            self.relay_list = null;
+        }
         self.transport.deinit();
     }
 
@@ -202,6 +239,15 @@ pub const NetplaySession = struct {
         return self.error_buf[0..self.error_len];
     }
 
+    /// Returns the current status message for UI display.
+    /// This is a human-readable string like "Connecting to relay server..."
+    /// or "Listening on port 46318 (direct mode)..." that tells the user
+    /// exactly what's happening. Never null — returns "Idle." if no status.
+    pub fn getStatusMsg(self: *const NetplaySession) []const u8 {
+        if (self.status_len == 0) return "Idle.";
+        return self.status_buf[0..self.status_len];
+    }
+
     /// Returns the remaining whole seconds for the current phase's timeout,
     /// or null if the current state has no active deadline. Used by the UI
     /// to render a countdown. Wall-clock based, so the countdown runs at
@@ -241,6 +287,16 @@ pub const NetplaySession = struct {
         self.error_len = n;
     }
 
+    /// Set the status message shown to the user on the waiting screen.
+    /// Called by stepRelay(), stepListening(), stepConnecting(), etc.
+    /// to keep the user informed about what's happening.
+    fn setStatus(self: *NetplaySession, msg: []const u8) void {
+        const n = @min(msg.len, self.status_buf.len - 1);
+        @memcpy(self.status_buf[0..n], msg[0..n]);
+        self.status_buf[n] = 0;
+        self.status_len = n;
+    }
+
     pub fn startHost(self: *NetplaySession, port: u16, training: bool) !void {
         self.config.is_host = true;
         self.config.is_training = training;
@@ -252,6 +308,7 @@ pub const NetplaySession = struct {
         self.state = .listening;
         self.setPhaseTimeout(listen_timeout_ms);
         try self.transport.listen(port, self.log);
+        self.setStatus("Listening for direct connection...");
         self.log.info("Waiting for opponent to connect on port {d}...", .{port});
     }
 
@@ -268,6 +325,245 @@ pub const NetplaySession = struct {
         self.state = .connecting;
         self.setPhaseTimeout(connect_timeout_ms);
         try self.transport.connect(host_str, port, self.log);
+        self.setStatus("Connecting directly to peer...");
+    }
+
+    // ========================================================================
+    // Smart host — direct listener + relay in parallel (Slice 4 fix)
+    // ========================================================================
+    //
+    // The smart host flow opens a direct ENet listener on `port` AND starts a
+    // relay client (for NAT traversal) in parallel. Whichever peer arrives
+    // first wins:
+    //
+    //   - If a direct peer connects (localhost/LAN), the relay client is
+    //     canceled and the existing ENet handshake flow takes over.
+    //   - If the relay handshake completes first (peer behind NAT), the
+    //     direct listener is torn down and re-created bound to the relay's
+    //     local_udp_port — preserving the NAT mapping opened during
+    //     hole-punching. The peer's ENet CONNECT then arrives at the new
+    //     listener.
+    //
+    // The relay client uses local_port=0 (random) so its UDP socket does
+    // NOT conflict with the direct ENet listener (which is bound to `port`).
+    // This is safe because the zzcaster relay matches peers by room code,
+    // not by IP:port — so the relay doesn't care which local port the
+    // host's UDP socket is bound to.
+    //
+    // If the relay list is empty or the relay client fails to start, the
+    // session falls back to direct-only mode (still in .listening state).
+    //
+    // This fixes the regression where the smart host flow forced ALL host
+    // sessions through the relay path — breaking localhost/LAN connections
+    // where the relay is unreachable or unnecessary.
+
+    pub fn startSmartHost(
+        self: *NetplaySession,
+        relay_source: []const u8,
+        port: u16,
+        training: bool,
+    ) !void {
+        // Set up config (same as direct host).
+        self.config.is_host = true;
+        self.config.is_training = training;
+        self.config.is_netplay = true;
+        self.config.host_player = 1;
+        self.config.local_player = 1;
+        self.config.remote_player = 2;
+        self.config.peer_port = port;
+
+        // Start the direct ENet listener FIRST. This ensures localhost and
+        // LAN peers can connect immediately, without waiting for the relay
+        // handshake to complete (or fail). This is the critical fix for the
+        // localhost/LAN regression.
+        try self.transport.listen(port, self.log);
+
+        // Try to start the relay client in parallel. The relay client uses
+        // local_port=0 (random) so it doesn't conflict with the direct
+        // listener on `port`. If the relay list is empty or the client
+        // fails to start, we continue with direct-only mode.
+        self.relay_list = relay_config.parseList(self.allocator, relay_source) catch {
+            self.log.warn("Failed to parse relay list — continuing with direct only", .{});
+            self.state = .listening;
+            self.setPhaseTimeout(listen_timeout_ms);
+            self.setStatus("Listening for direct connection...");
+            return;
+        };
+
+        if (self.relay_list.?.count() == 0) {
+            self.log.info("No relay servers configured — continuing with direct only", .{});
+            self.relay_list.?.deinit(self.allocator);
+            self.relay_list = null;
+            self.state = .listening;
+            self.setPhaseTimeout(listen_timeout_ms);
+            self.setStatus("Listening for direct connection...");
+            return;
+        }
+
+        const entry = self.relay_list.?.get(0).?;
+
+        // Initialize the relay client with local_port=0 (random) to avoid
+        // port conflict with the direct ENet listener.
+        self.relay_client = relay_client_mod.RelayClient.init(self.io, .{
+            .relay = entry,
+            .role = .host,
+            .local_port = 0,
+        });
+
+        // Check for immediate failure (e.g., invalid relay address).
+        if (self.relay_client.?.getState() == .failed) {
+            const err = self.relay_client.?.getError() orelse .socket_error;
+            self.log.warn("Relay client failed to start: {s} — continuing with direct only", .{err.label()});
+            self.relay_client.?.deinit();
+            self.relay_client = null;
+            if (self.relay_list) |*rl| {
+                rl.deinit(self.allocator);
+            }
+            self.relay_list = null;
+            self.state = .listening;
+            self.setPhaseTimeout(listen_timeout_ms);
+            self.setStatus("Listening for direct connection...");
+            return;
+        }
+
+        self.state = .listening;
+        self.setPhaseTimeout(listen_timeout_ms);
+        self.setStatus("Listening for direct connection...");
+        self.log.info("Smart host started on port {d} (direct + relay)", .{port});
+    }
+
+    // ========================================================================
+    // Relay-assisted connection (Slice 4)
+    // ========================================================================
+    //
+    // These methods start a relay-assisted connection. The relay handles
+    // NAT traversal (hole-punching) so the host doesn't need to port-forward.
+    //
+    // After the relay handshake completes (peer's UDP endpoint discovered),
+    // the session transitions to .connecting and the existing ENet handshake
+    // flow takes over — the relay is no longer involved.
+    //
+    // `relay_source` is the text contents of relay_list.txt or the
+    // relayServers= config field. The session parses it, picks the first
+    // entry, and owns the parsed list for the session's lifetime.
+    //
+    // For host: generates a 4-letter room code internally.
+    //   Call getRoomCode() after startRelayHost to display it to the user.
+    //
+    // For client: `peer_identifier` is the 4-letter room code.
+
+    pub fn startRelayHost(
+        self: *NetplaySession,
+        relay_source: []const u8,
+        port: u16,
+        training: bool,
+    ) !void {
+        // Parse relay list
+        self.relay_list = relay_config.parseList(self.allocator, relay_source) catch {
+            self.setError("Failed to parse relay server list");
+            self.state = .failed;
+            return;
+        };
+
+        if (self.relay_list.?.count() == 0) {
+            self.setError("No relay servers configured");
+            self.state = .failed;
+            return;
+        }
+
+        const entry = self.relay_list.?.get(0).?;
+
+        // Initialize relay client as host
+        self.relay_client = relay_client_mod.RelayClient.init(self.io, .{
+            .relay = entry,
+            .role = .host,
+            .local_port = port,
+        });
+
+        // Check for immediate failure (e.g., TCP connect failed)
+        if (self.relay_client.?.getState() == .failed) {
+            const err = self.relay_client.?.getError() orelse .socket_error;
+            self.setError(err.label());
+            self.state = .failed;
+            return;
+        }
+
+        // Set up config (same as direct host, but no ENet listen yet)
+        self.config.is_host = true;
+        self.config.is_training = training;
+        self.config.is_netplay = true;
+        self.config.host_player = 1;
+        self.config.local_player = 1;
+        self.config.remote_player = 2;
+        self.config.peer_port = port;
+
+        self.state = .relay_connecting;
+        self.setPhaseTimeout(0); // RelayClient manages its own timeouts
+        self.setStatus("Connecting to relay server...");
+        self.log.info("Relay host started", .{});
+    }
+
+    pub fn startRelayJoin(
+        self: *NetplaySession,
+        relay_source: []const u8,
+        peer_identifier: []const u8,
+        training: bool,
+    ) !void {
+        // Parse relay list
+        self.relay_list = relay_config.parseList(self.allocator, relay_source) catch {
+            self.setError("Failed to parse relay server list");
+            self.state = .failed;
+            return;
+        };
+
+        if (self.relay_list.?.count() == 0) {
+            self.setError("No relay servers configured");
+            self.state = .failed;
+            return;
+        }
+
+        const entry = self.relay_list.?.get(0).?;
+
+        // Initialize relay client as client
+        self.relay_client = relay_client_mod.RelayClient.init(self.io, .{
+            .relay = entry,
+            .role = .client,
+            .local_port = 0, // client uses any available port
+            .peer_identifier = peer_identifier,
+        });
+
+        // Check for immediate failure (e.g., invalid room code, TCP connect failed)
+        if (self.relay_client.?.getState() == .failed) {
+            const err = self.relay_client.?.getError() orelse .socket_error;
+            self.setError(err.label());
+            self.state = .failed;
+            return;
+        }
+
+        // Set up config (same as direct join, but no ENet connect yet)
+        self.config.is_host = false;
+        self.config.is_training = training;
+        self.config.is_netplay = true;
+        self.config.host_player = 1;
+        self.config.local_player = 2;
+        self.config.remote_player = 1;
+
+        self.state = .relay_connecting;
+        self.setPhaseTimeout(0); // RelayClient manages its own timeouts
+        self.setStatus("Connecting to relay server...");
+        self.log.info("Relay join started", .{});
+    }
+
+    /// For relay host: returns the generated 4-letter room code.
+    /// For all other cases: returns null.
+    pub fn getRoomCode(self: *const NetplaySession) ?[4]u8 {
+        if (self.relay_client) |rc| return rc.getRoomCode();
+        return null;
+    }
+
+    /// Returns true if the session is using relay-assisted connection.
+    pub fn isRelayMode(self: *const NetplaySession) bool {
+        return self.relay_client != null;
     }
 
     pub fn step(self: *NetplaySession) void {
@@ -302,6 +598,7 @@ pub const NetplaySession = struct {
             .connecting => self.stepConnecting(),
             .handshaking => self.stepHandshaking(),
             .ping_exchanging => self.stepPingExchanging(),
+            .relay_connecting => self.stepRelay(),
         }
     }
 
@@ -326,13 +623,98 @@ pub const NetplaySession = struct {
             return;
         }
 
+        // Step the parallel relay client if present (smart host mode).
+        // stepParallelRelay may change state (e.g., to .failed if the relay
+        // listener can't be rebound). If state changed, bail out this frame.
+        if (self.relay_client != null) {
+            self.stepParallelRelay();
+            if (self.state != .listening) return;
+        }
+
         if (self.transport.poll(0)) |event| {
             if (event == .connected) {
                 self.log.info("Opponent connected!", .{});
+                // A direct peer connected. Cancel the relay client if it's
+                // still running — we're committing to the direct connection.
+                if (self.relay_client) |*rc| {
+                    rc.deinit();
+                    self.relay_client = null;
+                }
+                if (self.relay_list) |*rl| {
+                    rl.deinit(self.allocator);
+                    self.relay_list = null;
+                }
                 self.recordPeerAddress();
                 self.state = .handshaking;
                 self.startVersionExchange();
             }
+        }
+    }
+
+    /// Drive the parallel relay client (used in .listening state for smart
+    /// host mode). If the relay handshake succeeds, tears down the direct
+    /// ENet listener and re-creates it bound to the relay's local_udp_port
+    /// (preserving the NAT mapping). If the relay fails, just deinit's the
+    /// relay client and continues with direct-only mode.
+    fn stepParallelRelay(self: *NetplaySession) void {
+        const rc = &self.relay_client.?;
+        const result = rc.step(self.io);
+
+        if (result == null) return; // still in progress
+
+        switch (result.?) {
+            .in_progress => return,
+            .success => |r| {
+                self.log.info("Relay handshake succeeded — peer={d}.{d}.{d}.{d}:{d}, local_udp_port={d}", .{
+                    r.peer_ip[0], r.peer_ip[1], r.peer_ip[2], r.peer_ip[3],
+                    r.peer_port, r.local_udp_port,
+                });
+
+                // Tear down the relay sockets FIRST (frees local_udp_port).
+                rc.deinit();
+                self.relay_client = null;
+
+                // Tear down the direct ENet listener so we can rebind to
+                // local_udp_port (the port used for hole-punching). This
+                // preserves the NAT mapping that was opened during
+                // hole-punching — the peer's ENet CONNECT will arrive at
+                // local_udp_port and reach our new listener.
+                self.transport.deinit();
+
+                // Re-create the transport as a listener on local_udp_port.
+                self.transport.listen(r.local_udp_port, self.log) catch |err| {
+                    var err_buf: [128]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&err_buf, "ENet listen after relay failed: {s}", .{@errorName(err)}) catch "ENet listen after relay failed";
+                    self.setError(msg);
+                    self.state = .failed;
+                    return;
+                };
+
+                // Free the relay list — no longer needed.
+                if (self.relay_list) |*rl| {
+                    rl.deinit(self.allocator);
+                    self.relay_list = null;
+                }
+
+                self.setStatus("Connected via relay! Waiting for ENet connect...");
+                // Stay in .listening state — wait for the peer's ENet CONNECT.
+                // The existing stepListening flow will detect the connection
+                // and transition to .handshaking.
+            },
+            .failed => |err| {
+                // Relay failed — continue with direct-only mode. Don't fail
+                // the session: the direct listener is still open, and a
+                // direct peer may still connect.
+                self.log.warn("Relay failed: {s} — continuing with direct only", .{err.label()});
+                rc.deinit();
+                self.relay_client = null;
+                if (self.relay_list) |*rl| {
+                    rl.deinit(self.allocator);
+                    self.relay_list = null;
+                }
+                self.setStatus("Listening for direct connection...");
+                // Stay in .listening state — continue with direct.
+            },
         }
     }
 
@@ -350,6 +732,163 @@ pub const NetplaySession = struct {
                 self.state = .handshaking;
                 self.startVersionExchange();
             }
+        }
+    }
+
+    // ========================================================================
+    // Relay step handler (Slice 4)
+    // ========================================================================
+
+    /// Drives the relay handshake state machine. This is used by the CLIENT
+    /// side (startRelayJoin) — the HOST side uses startSmartHost which drives
+    /// the relay client from stepListening/stepParallelRelay.
+    ///
+    /// When the relay handshake completes successfully (peer's UDP endpoint
+    /// discovered), tears down the relay sockets and transitions to .connecting
+    /// via ENet's connectBound() — preserving the NAT mapping opened during
+    /// hole-punch.
+    ///
+    /// NOTE: This handler is also reached if startRelayHost is called directly
+    /// (i.e., without the parallel direct listener). In that case, on relay
+    /// success the host LISTENs (not connects) on local_udp_port — the peer's
+    /// ENet CONNECT then arrives at this listener. On relay failure, the host
+    /// falls back to direct listen on peer_port.
+    fn stepRelay(self: *NetplaySession) void {
+        if (self.relay_client == null) {
+            self.setError("Relay client not initialized");
+            self.state = .failed;
+            return;
+        }
+
+        const rc = &self.relay_client.?;
+
+        // Update status message based on relay client's internal state
+        switch (rc.getState()) {
+            .tcp_connecting => self.setStatus("Connecting to relay server..."),
+            .waiting_for_hosted => self.setStatus("Registering with relay..."),
+            .waiting_for_match_info => {
+                if (self.config.is_host) {
+                    self.setStatus("Waiting for opponent to join...");
+                } else {
+                    self.setStatus("Joining host via relay...");
+                }
+            },
+            .waiting_for_tun_info => self.setStatus("Negotiating connection..."),
+            .hole_punching => self.setStatus("Hole-punching through NAT..."),
+            else => {},
+        }
+
+        const result = rc.step(self.io);
+
+        if (result == null) return; // still in progress
+
+        switch (result.?) {
+            .in_progress => return,
+            .success => |r| {
+                self.log.info("Relay handshake succeeded — peer={d}.{d}.{d}.{d}:{d}, local_udp_port={d}", .{
+                    r.peer_ip[0], r.peer_ip[1], r.peer_ip[2], r.peer_ip[3],
+                    r.peer_port, r.local_udp_port,
+                });
+                self.setStatus("Connected! Starting ENet handshake...");
+
+                // Format peer IP as string for ENet (needed for client-side
+                // connectBound; harmless on host side).
+                var peer_ip_str: [32]u8 = undefined;
+                const peer_ip_z = std.fmt.bufPrintZ(&peer_ip_str, "{d}.{d}.{d}.{d}", .{
+                    r.peer_ip[0], r.peer_ip[1], r.peer_ip[2], r.peer_ip[3],
+                }) catch {
+                    self.setError("Failed to format peer IP");
+                    self.state = .failed;
+                    return;
+                };
+
+                // Tear down relay sockets BEFORE creating ENet host.
+                // ENet creates its own UDP socket and binds it to
+                // local_udp_port. With SO_REUSEADDR (which both the relay
+                // client and ENet set), the rebind succeeds immediately.
+                rc.deinit();
+                self.relay_client = null;
+
+                // Also free the relay list — no longer needed.
+                if (self.relay_list) |*rl| {
+                    rl.deinit(self.allocator);
+                    self.relay_list = null;
+                }
+
+                if (self.config.is_host) {
+                    // HOST: listen on local_udp_port for the peer's ENet
+                    // CONNECT. The peer (client) will connectBound to us.
+                    // This is the symmetric counterpart to the client's
+                    // connectBound — without it, BOTH sides would try to
+                    // connect and neither would listen, so ENet could never
+                    // establish a connection (the original regression).
+                    self.transport.listen(r.local_udp_port, self.log) catch |err| {
+                        var err_buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&err_buf, "ENet listen failed: {s}", .{@errorName(err)}) catch "ENet listen failed";
+                        self.setError(msg);
+                        self.state = .failed;
+                        return;
+                    };
+                    self.state = .listening;
+                    self.setPhaseTimeout(listen_timeout_ms);
+                    self.setStatus("Connected via relay! Waiting for ENet connect...");
+                } else {
+                    // CLIENT: connect to peer via ENet, bound to the same
+                    // local port that was used for hole-punching (preserves
+                    // NAT mapping).
+                    self.transport.connectBound(
+                        peer_ip_z,
+                        r.peer_port,
+                        r.local_udp_port,
+                        self.log,
+                    ) catch |err| {
+                        var err_buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&err_buf, "ENet connect failed: {s}", .{@errorName(err)}) catch "ENet connect failed";
+                        self.setError(msg);
+                        self.state = .failed;
+                        return;
+                    };
+                    self.state = .connecting;
+                    self.setPhaseTimeout(connect_timeout_ms);
+                }
+            },
+            .failed => |err| {
+                if (self.config.is_host) {
+                    // HOST: fall back to direct listen on peer_port. The
+                    // comment in startSmartHostSession claimed this fallback
+                    // existed, but the original code just set state to .failed
+                    // — breaking localhost/LAN connections when the relay was
+                    // unreachable. Now we actually fall back.
+                    self.log.warn("Relay failed: {s} — falling back to direct listen", .{err.label()});
+                    rc.deinit();
+                    self.relay_client = null;
+                    if (self.relay_list) |*rl| {
+                        rl.deinit(self.allocator);
+                        self.relay_list = null;
+                    }
+                    self.transport.listen(self.config.peer_port, self.log) catch |listen_err| {
+                        var err_buf: [128]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&err_buf, "Direct listen fallback failed: {s}", .{@errorName(listen_err)}) catch "Direct listen fallback failed";
+                        self.setError(msg);
+                        self.state = .failed;
+                        return;
+                    };
+                    self.state = .listening;
+                    self.setPhaseTimeout(listen_timeout_ms);
+                    self.setStatus("Listening for direct connection... (relay failed)");
+                } else {
+                    // CLIENT: report failure with the structured error's
+                    // label + suggestion for a helpful message.
+                    var err_buf: [256]u8 = undefined;
+                    const msg = std.fmt.bufPrint(&err_buf, "{s}. {s}", .{
+                        err.label(),
+                        err.suggestion(),
+                    }) catch err.label();
+                    self.setError(msg);
+                    self.setStatus("Connection failed.");
+                    self.state = .failed;
+                }
+            },
         }
     }
 

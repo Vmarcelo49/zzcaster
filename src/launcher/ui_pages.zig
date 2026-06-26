@@ -8,6 +8,8 @@ const session = @import("session.zig");
 const game_launcher = @import("game_launcher.zig");
 const ui_controller_mapper = @import("ui_controller_mapper.zig");
 const ui_waiting_for_peer = @import("ui_waiting_for_peer.zig");
+const relay_config = @import("net").relay_config;
+const connection_detector = @import("net").connection_detector;
 const ui = @import("ui.zig");
 const ui_theme = @import("ui_theme.zig");
 const zgui = @import("zgui");
@@ -31,7 +33,9 @@ pub fn drawIdlePage(
     pipe_name: []const u8,
     current_page: *MenuPage,
     peer_buf: [:0]u8,
-    port_buf: [:0]u8,
+    play_msg: *[256]u8,
+    play_msg_len: *usize,
+    play_msg_is_error: *bool,
     name_buf: [:0]u8,
     wincount_buf: [:0]u8,
     rollback_buf: [:0]u8,
@@ -80,8 +84,9 @@ pub fn drawIdlePage(
 
     switch (current_page.*) {
         .play => drawPlayPage(
-            allocator, io, cfg, log, pipe_name, peer_buf, port_buf, ui_state,
-            np_session, host_start_clicked, win_launcher, game_pid, ipc_server,
+            allocator, io, cfg, log, pipe_name, peer_buf,
+            play_msg, play_msg_len, play_msg_is_error,
+            ui_state, np_session, host_start_clicked, win_launcher, game_pid, ipc_server,
             error_msg, error_msg_len
         ),
         .game_config => drawConfigPage(allocator, io, cfg, log, name_buf, wincount_buf, rollback_buf),
@@ -185,7 +190,9 @@ fn drawPlayPage(
     log: *logging.Logger,
     pipe_name: []const u8,
     peer_buf: [:0]u8,
-    port_buf: [:0]u8,
+    play_msg: *[256]u8,
+    play_msg_len: *usize,
+    play_msg_is_error: *bool,
     ui_state: *UiState,
     np_session: *?session.NetplaySession,
     host_start_clicked: *bool,
@@ -203,45 +210,157 @@ fn drawPlayPage(
     if (ui_theme.beginCard("##netplay_card", col_w, col_h, false)) {
         ui_theme.cardTitle("NETPLAY");
 
-        zgui.text("Host Port", .{});
-        zgui.pushItemWidth(120);
-        _ = zgui.inputText("##host_port", .{ .buf = port_buf });
-        zgui.popItemWidth();
-
-        zgui.spacing();
-        zgui.separator();
-        zgui.spacing();
-
-        zgui.text("Join / Spectate (IP : Port)", .{});
+        // --- Single unified input field ---
+        // Parses as:
+        //   #ABCD       → room code (join via relay)
+        //   ip:port     → direct or relay-assisted join
+        //   46318       → port number (host on this port)
+        //   (empty)     → host: random port | join: error
+        zgui.text("Port / IP:Port / #RoomCode", .{});
         zgui.pushItemWidth(-1);
-        _ = zgui.inputText("##peer_addr", .{ .buf = peer_buf });
+        _ = zgui.inputText("##unified_input", .{ .buf = peer_buf });
         zgui.popItemWidth();
 
-        // 3 buttons at the bottom: Host, Join, Spectate
+        zgui.spacing();
+        ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Host: type a port or leave empty for random", .{});
+        ui_theme.textColored(ui_theme.COL_TEXT_DIM, "Join: type #ABCD or ip:port", .{});
+
+        // --- Inline message (error or info) ---
+        if (play_msg_len.* > 0) {
+            zgui.spacing();
+            if (play_msg_is_error.*) {
+                ui_theme.textColored(ui_theme.COL_RED, "{s}", .{play_msg[0..play_msg_len.*]});
+            } else {
+                ui_theme.textColored(ui_theme.COL_MUTED, "{s}", .{play_msg[0..play_msg_len.*]});
+            }
+        }
+
+        // --- Bottom action buttons ---
         const card_inner_w = zgui.getContentRegionAvail()[0];
         const btn_w = (card_inner_w - ui_theme.CONTENT_PAD * 2) / 3;
 
         const btn_y = col_h - 32 - ui_theme.CARD_PAD;
         zgui.setCursorPosY(btn_y);
 
+        // --- Host button ---
+        // Empty → random port (0 = OS picks)
+        // Port number → host on that port
+        // #roomcode → info: custom room names not supported yet
+        // ip:port → error: invalid port
+        // else → error: invalid port
         if (ui_theme.primaryButton("Host", btn_w, 32)) {
-            ui_waiting_for_peer.startHostSession(allocator, io, cfg, log, game_launcher.parsePort(port_buf.ptr), np_session);
-            if (np_session.* != null) {
-                host_start_clicked.* = false;
-                ui_state.* = .waiting_for_peer;
+            const input = std.mem.sliceTo(peer_buf, 0);
+            const parsed = connection_detector.parseInput(input);
+
+            switch (parsed.type) {
+                .empty => {
+                    // Random port — pass 0, session/ENet will pick one
+                    const relay_source = getRelaySource(cfg);
+                    ui_waiting_for_peer.startSmartHostSession(
+                        allocator, io, cfg, log, 0, relay_source, np_session,
+                    );
+                    if (np_session.* != null) {
+                        host_start_clicked.* = false;
+                        ui_state.* = .waiting_for_peer;
+                    }
+                },
+                .port => {
+                    const relay_source = getRelaySource(cfg);
+                    ui_waiting_for_peer.startSmartHostSession(
+                        allocator, io, cfg, log, parsed.port, relay_source, np_session,
+                    );
+                    if (np_session.* != null) {
+                        host_start_clicked.* = false;
+                        ui_state.* = .waiting_for_peer;
+                    }
+                },
+                .room_code => {
+                    setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                        false, "Custom room names are not currently supported but are planned. Leave the field empty to auto-generate a code.");
+                },
+                .ip_port => {
+                    setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                        true, "Invalid port. To host, type a port number or leave empty for random.");
+                },
+                .invalid => {
+                    setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                        true, "Invalid port. Type a port number, ip:port, or #roomcode.");
+                },
             }
         }
         zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
+
+        // --- Join button ---
+        // #ABCD → relay join
+        // ip:port → direct or relay-assisted join
+        // port number → join localhost on that port (convenience)
+        // empty → error
+        // else → error
         if (ui_theme.primaryButton("Join", btn_w, 32)) {
-            ui_waiting_for_peer.startJoinSession(allocator, io, cfg, log, std.mem.sliceTo(peer_buf, 0), np_session);
-            if (np_session.* != null) {
-                ui_state.* = .waiting_for_peer;
+            const input = std.mem.sliceTo(peer_buf, 0);
+            const parsed = connection_detector.parseInput(input);
+
+            switch (parsed.type) {
+                .room_code => {
+                    const relay_source = getRelaySource(cfg);
+                    ui_waiting_for_peer.startRelayJoinSession(
+                        allocator, io, cfg, log, parsed.value, relay_source, np_session,
+                    );
+                    if (np_session.* != null) {
+                        ui_state.* = .waiting_for_peer;
+                    }
+                },
+                .ip_port => {
+                    const relay_source = getRelaySource(cfg);
+                    ui_waiting_for_peer.startSmartJoinSession(
+                        allocator, io, cfg, log, input, relay_source, np_session,
+                    );
+                    if (np_session.* != null) {
+                        ui_state.* = .waiting_for_peer;
+                    }
+                },
+                .port => {
+                    // Convenience: bare port = join localhost:port
+                    var addr_buf: [32]u8 = undefined;
+                    if (std.fmt.bufPrint(&addr_buf, "127.0.0.1:{d}", .{parsed.port})) |addr| {
+                        ui_waiting_for_peer.startJoinSession(
+                            allocator, io, cfg, log, addr, np_session,
+                        );
+                        if (np_session.* != null) {
+                            ui_state.* = .waiting_for_peer;
+                        }
+                    } else |_| {
+                        setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                            true, "Invalid port.");
+                    }
+                },
+                .empty => {
+                    setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                        true, "Enter a room code (#ABCD) or address (ip:port) to join.");
+                },
+                .invalid => {
+                    setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                        true, "Invalid input. Type #ABCD or ip:port to join.");
+                },
             }
         }
         zgui.sameLine(.{ .spacing = ui_theme.CONTENT_PAD });
+
+        // --- Spectate button ---
+        // Always uses direct IP — spectate via relay not yet implemented.
         if (ui_theme.secondaryButton("Spectate", btn_w, 32)) {
-            game_launcher.launchNetplayImpl(allocator, io, cfg, log, std.mem.sliceTo(peer_buf, 0), true, pipe_name, win_launcher, game_pid, ipc_server, error_msg, error_msg_len);
-            if (game_pid.* > 0) ui_state.* = .in_game else ui_state.* = .error_state;
+            const input = std.mem.sliceTo(peer_buf, 0);
+            const parsed = connection_detector.parseInput(input);
+            switch (parsed.type) {
+                .ip_port => {
+                    game_launcher.launchNetplayImpl(allocator, io, cfg, log, input, true, pipe_name, win_launcher, game_pid, ipc_server, error_msg, error_msg_len);
+                    if (game_pid.* > 0) ui_state.* = .in_game else ui_state.* = .error_state;
+                },
+                else => {
+                    setPlayMsg(play_msg, play_msg_len, play_msg_is_error,
+                        true, "Spectate requires an ip:port address.");
+                },
+            }
         }
     }
     ui_theme.endCard();
@@ -256,7 +375,6 @@ fn drawPlayPage(
         const btn_w: f32 = 280.0;
         const btn_h: f32 = 44.0;
 
-        // Centered stacked buttons inside card
         const cy = (col_h - ui_theme.CARD_PAD * 2 - (btn_h * 2 + 8)) / 2;
         const cx = (card_inner_w - btn_w) / 2;
 
@@ -273,6 +391,31 @@ fn drawPlayPage(
         }
     }
     ui_theme.endCard();
+}
+
+fn setPlayMsg(
+    buf: *[256]u8,
+    len: *usize,
+    is_error: *bool,
+    error_flag: bool,
+    msg: []const u8,
+) void {
+    const n = @min(msg.len, buf.len - 1);
+    @memcpy(buf[0..n], msg[0..n]);
+    buf[n] = 0;
+    len.* = n;
+    is_error.* = error_flag;
+}
+
+/// Returns the relay source string — either from config.ini's
+/// relayServers= field, or the hardcoded DEFAULT_RELAY_LIST.
+///
+/// The returned slice points to memory owned by `cfg` (if config has
+/// relayServers) or to a compile-time constant (if using defaults).
+/// Either way, the caller doesn't need to free it.
+fn getRelaySource(cfg: *const config.Config) []const u8 {
+    if (cfg.relay_servers.len > 0) return cfg.relay_servers;
+    return relay_config.DEFAULT_RELAY_LIST;
 }
 
 // ---------------------------------------------------------------------------

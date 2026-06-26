@@ -467,26 +467,20 @@ pub const NetplayManager = struct {
 
     spectators: ?spectator_manager_mod.SpectatorManager = null,
 
-    // Defaults to false: armed by `onStateTransition` (on entering `.in_game`)
-    // and by `checkIntroDone` (when `game_state == 99`, per-round re-arm).
+    // Defaults to false: armed by `onStateTransition` (on entering `.chara_select`
+    // or `.in_game`) and by `checkIntroDone` (when `game_state == 99`, per-round
+    // re-arm).
     //
-    // The Zig port deliberately arms only at InGame / INTRO_DONE, NOT at
-    // CharaSelect — even though the legacy CCCaster arms at all three
-    // (`DllMain.cpp:1075-1081`). The reason is that ZZCaster's
-    // `applyRemoteRng` writes to game memory immediately on packet receipt,
-    // whereas CCCaster defers application to a deterministic point after
-    // the poll loop (`DllMain.cpp:624-646`). With deferred application
-    // AND an `isRngStateReady` gate on the client's poll loop, CharaSelect
-    // arming is safe. With immediate application but NO gate (the
-    // pre-fix Zig port), arming at CharaSelect allowed the client to
-    // apply the host's RNG snapshot at a non-deterministic frame and
-    // diverge. The gate is now in place (see `isRemoteInputReady`), so
-    // CharaSelect arming COULD be re-enabled for parity — but it's left
-    // disabled because the SyncHash detector only checks from CharaSelect
-    // onward, and there's no gameplay simulation during CharaSelect to
-    // advance the RNG anyway.
+    // CharaSelect arming is REQUIRED because MBAACC's character-select screen
+    // consumes RNG (Random character pick, preview animations, stage-select
+    // effects). The four RNG state words are global MBAACC memory, not
+    // UI-scoped, so a Random pick is baked into the round's determinism root.
+    // Without chara_select RNG sync, host and client diverge on the very first
+    // Random pick. See `onStateTransition` for the full rationale.
     //
-    // `syncRngState` also gates on `intro_rng_enabled` as defense-in-depth.
+    // Determinism of the apply-frame is guaranteed by the `isRemoteInputReady`
+    // gate (see that function): the client blocks in the lockstep wait loop
+    // until `rng_synced` becomes true.
     should_sync_rng: bool = false,
     rng_synced: bool = false,
     // The transition index for which `rng_synced` was set. Used by
@@ -1232,10 +1226,15 @@ pub const NetplayManager = struct {
         // RNG).
         //
         // This gate only applies during .chara_intro and .in_game — NOT
-        // during .chara_select. The host never sends RNG during chara_select
-        // (intro_rng_enabled is false), so gating during chara_select would
-        // deadlock the client until the 10s timeout force-exits the game.
-        // RNG sync is only meaningful for gameplay (chara_intro/in_game).
+        // during .chara_select. CharaSelect is a low-stakes state (no
+        // gameplay yet) where blocking on RNG risks the 10s input-wait
+        // timeout force-exit if the host's RNG packet is delayed. The
+        // deferred-application logic in `applyRemoteRng` (see "If this
+        // RNG is for the next index, cache it but defer application")
+        // handles early-arrival packets correctly, so the client can
+        // safely run a few chara_select frames without `rng_synced` and
+        // apply the host's RNG via the cached-state path in
+        // `onStateTransition` when it enters .in_game.
         // ----------------------------------------------------------------
         if (self.state != .chara_select and
             self.should_sync_rng and !self.config.is_host and !self.rng_synced)
@@ -1292,22 +1291,27 @@ pub const NetplayManager = struct {
     pub fn syncRngState(self: *NetplayManager) void {
         if (!self.should_sync_rng or self.rng_acked) return;
         if (!self.config.is_host) return;
-        // Defense-in-depth: only sync RNG after `game_state == 99` (intro-done)
-        // has been observed. `should_sync_rng` is armed by `onStateTransition`
-        // to `.in_game` and by `checkIntroDone` on the per-round re-arm, so in
-        // principle this gate is redundant — but it ensures we can NEVER fire
-        // during chara_select even if some future code path arms
-        // `should_sync_rng` early.
+        // `should_sync_rng` is the single source of truth for "should the
+        // host send RNG now?" It's armed at exactly the right moments by
+        // `onStateTransition` (chara_select entry, in_game entry) and by
+        // `checkIntroDone` (intro-done edge for rounds 2+).
         //
-        // Note: the legacy CCCaster actually arms RNG sync at THREE points —
-        // CharaSelect, InGame, and INTRO_DONE (`DllMain.cpp:1075-1081`) —
-        // and relies on the `isRngStateReady` poll-loop gate
-        // (`DllNetplayManager.cpp:1054`) plus deferred application
-        // (`DllMain.cpp:624-646`) to keep it deterministic. The Zig port
-        // arms at only InGame / INTRO_DONE and additionally gates
-        // `isRemoteInputReady` on `rng_synced` (see that function) to
-        // achieve the same determinism with immediate application.
-        if (!self.intro_rng_enabled) return;
+        // The legacy `intro_rng_enabled` defense-in-depth gate that used
+        // to live here was removed because it incorrectly blocked
+        // chara_select RNG sync even when `should_sync_rng` was armed.
+        // The `intro_rng_enabled` FIELD is still used by `checkIntroDone`
+        // for one-shot edge detection on rounds 2+ — it just no longer
+        // gates `syncRngState` itself.
+        //
+        // The legacy CCCaster arms RNG sync at THREE points — CharaSelect,
+        // InGame, and INTRO_DONE (`DllMain.cpp:1075-1081`) — and relies on
+        // the `isRngStateReady` poll-loop gate (`DllNetplayManager.cpp:1054`)
+        // plus deferred application (`DllMain.cpp:624-646`) to keep it
+        // deterministic. The Zig port arms at the same three points and
+        // additionally gates `isRemoteInputReady` on `rng_synced` (see
+        // that function) to achieve the same determinism with immediate
+        // application.
+        //
         // Lazy-reconnect: only send once the ENet peer has actually connected.
         // The peer's CONNECT event may not have arrived yet on the first
         // frames of chara-select; sending before that silently drops the
@@ -1911,25 +1915,30 @@ pub const NetplayManager = struct {
         self.start_world_time = world_timer_addr.*;
         self.indexed_frame.frame = 0;
 
-        // Arm RNG sync only when entering `.in_game` (round 1 entry from
-        // chara_intro, or training mode direct entry). The per-round re-arm
-        // for rounds 2+ is handled by `checkIntroDone` when `game_state == 99`.
+        // Arm RNG sync when entering `.in_game` (round 1 entry from
+        // chara_intro, training mode direct entry) AND when entering
+        // `.chara_select` (match start / character-select after retry menu).
+        // Per-round re-arm for rounds 2+ is handled by `checkIntroDone`
+        // when `game_state == 99`.
         //
-        // We deliberately do NOT arm for `.chara_select`, even though the
-        // legacy CCCaster does (`DllMain.cpp:1075-1081`). The Zig port
-        // historically omitted CharaSelect arming because, without an
-        // `isRngStateReady` gate on the client's poll loop, arming at
-        // CharaSelect allowed the client to apply the host's RNG snapshot
-        // at a non-deterministic frame and diverge. That gate is now in
-        // place (see `isRemoteInputReady`), so CharaSelect arming COULD
-        // be re-enabled for parity — but it's left disabled because
-        // there's no gameplay simulation during CharaSelect to advance
-        // the RNG anyway (MBAACC's CharaSelect RNG draws are scoped to UI
-        // state that is overwritten when InGame starts). The SyncHash
-        // detector only runs during `.in_game` (see `maybeSendSyncHash`
-        // and `checkSyncHashDesync`), so CharaSelect RNG divergence is
-        // neither observable nor harmful.
-        if (new == .in_game) {
+        // CharaSelect arming is REQUIRED because MBAACC's character-select
+        // screen consumes RNG (Random character pick, preview animations,
+        // stage-select effects). The four RNG state words
+        // (`rng_state0..3_addr`) are global MBAACC memory, NOT scoped to
+        // UI state — a Random pick during chara_select is baked into the
+        // determinism root for the round that follows. Without chara_select
+        // RNG sync, host and client diverge on the very first Random pick.
+        //
+        // This matches the legacy CCCaster, which arms at all three points
+        // (`DllMain.cpp:1075-1081`): CharaSelect, InGame, and INTRO_DONE.
+        //
+        // Determinism of the apply-frame is guaranteed by the
+        // `isRemoteInputReady` gate (see that function): the client blocks
+        // in the lockstep wait loop until `rng_synced` becomes true, so the
+        // host's RNG snapshot is applied at the same logical frame on both
+        // peers. This closes the original frame-149 desync race that
+        // motivated disabling chara_select arming in commit 033de46.
+        if (new == .in_game or new == .chara_select) {
             self.rng_synced = false;
             self.rng_acked = false;
             self.rng_send_cooldown = 0;
@@ -1958,7 +1967,11 @@ pub const NetplayManager = struct {
             }
         }
 
-        if (new == .loading or new == .chara_select) {
+        // Loading still clears intro_rng_enabled — Loading is between
+        // chara_select and chara_intro/in_game and we don't want stale
+        // RNG sync state lingering from a previous match. CharaSelect no
+        // longer clears it because we WANT chara_select to be armed.
+        if (new == .loading) {
             self.intro_rng_enabled = false;
         }
 

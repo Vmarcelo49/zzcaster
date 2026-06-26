@@ -93,10 +93,14 @@ const MockPeer = struct {
             .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
             .chara_select, .chara_intro, .in_game => {},
         }
-        
+
         if (!self.is_netplay or self.is_spectator) return true;
-        
-        if (self.should_sync_rng and !self.is_host and !self.rng_synced) {
+
+        // Match production: gate only during .chara_intro and .in_game,
+        // NOT during .chara_select. See netplay_manager.zig for rationale.
+        if (self.state != .chara_select and
+            self.should_sync_rng and !self.is_host and !self.rng_synced)
+        {
             return false;
         }
         
@@ -177,18 +181,19 @@ const MockPeer = struct {
         _ = old;
         const new_val = @intFromEnum(new);
         const chara_select_val = @intFromEnum(NetplayState.chara_select);
-        
+
         if (new_val < chara_select_val) return;
-        
+
         self.index += 1;
         self.frame = 0;
-        
-        if (new == .in_game) {
+
+        // Match production: arm RNG sync on .chara_select AND .in_game entry.
+        if (new == .in_game or new == .chara_select) {
             self.rng_synced = false;
             self.rng_acked = false;
             self.should_sync_rng = true;
             self.intro_rng_enabled = true;
-            
+
             if (!self.is_host) {
                 var cached_val: u32 = 0;
                 if (self.getCachedRngState(self.index, &cached_val)) {
@@ -198,8 +203,9 @@ const MockPeer = struct {
                 }
             }
         }
-        
-        if (new == .loading or new == .chara_select) {
+
+        // Match production: only .loading clears intro_rng_enabled (not .chara_select).
+        if (new == .loading) {
             self.intro_rng_enabled = false;
         }
     }
@@ -595,6 +601,48 @@ test "RNG Caching and Transition Application" {
     try expectEqual(@as(u32, 4), client.rng_synced_index);
 }
 
+test "CharaSelect RNG sync — Random character pick matches between peers" {
+    const allocator = std.testing.allocator;
+    var network = MockNetwork.init(42);
+    defer network.deinit(allocator);
+
+    var host = MockPeer.init("Host", true, 0, 0);
+    var client = MockPeer.init("Client", false, 0, 0);
+
+    // Both peers enter chara_select.
+    host.state = .chara_select;
+    client.state = .chara_select;
+    host.onStateTransition(.pre_initial, .chara_select);
+    client.onStateTransition(.pre_initial, .chara_select);
+
+    // Host should have armed RNG sync (this is the fix — was previously
+    // NOT armed during chara_select, causing Random pick divergence).
+    try expect(host.should_sync_rng == true);
+    try expect(host.intro_rng_enabled == true);
+
+    // Host captures and sends RNG for the chara_select index.
+    const chara_select_index = host.index;
+    const host_rng_value: u32 = 99999;
+    host.rng_value = host_rng_value; // host "captures" its RNG state
+    try network.sendToClient(allocator, .{ .rng = .{ .index = chara_select_index, .value = host_rng_value } });
+    network.deliverAll(allocator, &host, &client);
+
+    // Client applies the host's RNG.
+    try expect(client.rng_value == host_rng_value);
+    try expect(client.rng_synced == true);
+
+    // Both peers advance several chara_select frames (simulating
+    // the Random character pick consuming RNG). Because both
+    // started from the same RNG state, they must produce the
+    // same Random pick.
+    var frame: u32 = 0;
+    while (frame < 30) : (frame += 1) {
+        host.rng_value +%= frame; // mock "RNG advance"
+        client.rng_value +%= frame;
+    }
+    try expect(host.rng_value == client.rng_value);
+}
+
 test "Lockstep vs Rollback needed check" {
     // 1. Lockstep (rollback = 0)
     {
@@ -875,24 +923,31 @@ test "Full Game Cycle State Transition Simulation" {
     host.state = .chara_select;
     try expectEqual(@as(u32, 1), host.index);
     try network.sendToClient(allocator, .{ .transition = .{ .index = host.index, .state = .chara_select } });
-    
+
     // Host should block waiting for Client to enter index 1 (remote_end_index is still 0)
     try expectEqual(false, host.isRemoteInputReady());
-    
+
     // Client transitions locally
     client.onStateTransition(.initial, .chara_select);
     client.state = .chara_select;
     try expectEqual(@as(u32, 1), client.index);
     try network.sendToHost(allocator, .{ .transition = .{ .index = client.index, .state = .chara_select } });
-    
+
     // Deliver packets
     network.deliverAll(allocator, &host, &client);
-    
+
     // Both send frame 0 input in chara_select
     try network.sendToClient(allocator, .{ .input = .{ .index = 1, .frame = 0 } });
     try network.sendToHost(allocator, .{ .input = .{ .index = 1, .frame = 0 } });
     network.deliverAll(allocator, &host, &client);
-    
+
+    // Host sends RNG for chara_select (index 1). With chara_select RNG sync
+    // now armed (matching production), the host captures and sends its RNG.
+    // The client must receive and apply it before isRemoteInputReady returns
+    // true during .chara_intro and .in_game.
+    try network.sendToClient(allocator, .{ .rng = .{ .index = 1, .value = host.rng_value } });
+    network.deliverAll(allocator, &host, &client);
+
     // Both should now be unblocked
     try expect(host.isRemoteInputReady());
     try expect(client.isRemoteInputReady());

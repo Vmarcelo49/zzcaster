@@ -345,9 +345,9 @@ test "encodeHostRegister produces correct bytes" {
     const encoded = encodeHostRegister(&buf, TYPE_UDP, 46318, "ABCD");
     try std.testing.expectEqual(@as(usize, 8), encoded.len);
     try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
-    // 46318 = 0xB50E → little-endian: 0x0E 0xB5
-    try std.testing.expectEqual(@as(u8, 0x0E), encoded[1]);
-    try std.testing.expectEqual(@as(u8, 0xB5), encoded[2]);
+    // 46318 = 0xB4EE → little-endian: 0xEE 0xB4
+    try std.testing.expectEqual(@as(u8, 0xEE), encoded[1]);
+    try std.testing.expectEqual(@as(u8, 0xB4), encoded[2]);
     try std.testing.expectEqual(@as(u8, 4), encoded[3]);
     try std.testing.expectEqualStrings("ABCD", encoded[4..8]);
 }
@@ -373,8 +373,9 @@ test "encodeTypedHostingPort produces correct 3 bytes (cccaster flavor)" {
     const encoded = encodeTypedHostingPort(&buf, TYPE_UDP, 46318);
     try std.testing.expectEqual(@as(usize, 3), encoded.len);
     try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
-    try std.testing.expectEqual(@as(u8, 0x0E), encoded[1]); // 46318 LE low byte
-    try std.testing.expectEqual(@as(u8, 0xB5), encoded[2]); // 46318 LE high byte
+    // 46318 = 0xB4EE → little-endian: 0xEE 0xB4
+    try std.testing.expectEqual(@as(u8, 0xEE), encoded[1]);
+    try std.testing.expectEqual(@as(u8, 0xB4), encoded[2]);
 }
 
 test "encodeTypedConnectionAddress produces correct bytes (cccaster flavor)" {
@@ -410,7 +411,7 @@ test "encodeStunProbe produces 1 byte" {
 test "decodeStunReply parses 8 bytes correctly" {
     // 203.0.113.10 : 54321 = 0xD431 → BE: 0xD4 0x31
     const reply = [_]u8{ 203, 0, 113, 10, 0xD4, 0x31, 0, 0 };
-    const parsed = try decodeStunReply(&reply) orelse return error.TestExpectedSome;
+    const parsed = decodeStunReply(&reply) orelse return error.TestExpectedSome;
     try std.testing.expectEqual(@as(u8, 203), parsed.ip[0]);
     try std.testing.expectEqual(@as(u8, 0), parsed.ip[1]);
     try std.testing.expectEqual(@as(u8, 113), parsed.ip[2]);

@@ -39,7 +39,7 @@ const ws2_32 = struct {
     extern "ws2_32" fn sendto(s: c_int, buf: [*]const u8, len: c_int, flags: c_int, to: ?*const sockaddr_in, tolen: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn recvfrom(s: c_int, buf: [*]u8, len: c_int, flags: c_int, from: ?*sockaddr_in, fromlen: ?*c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn select(nfds: c_int, readfds: ?*fd_set, writefds: ?*fd_set, exceptfds: ?*fd_set, timeout: ?*const timeval) callconv(.winapi) c_int;
-    extern "ws2_32" fn ioctlsocket(s: c_int, cmd: c_long, argp: *u32) callconv(.winapi) c_int;
+    extern "ws2_32" fn ioctlsocket(s: c_int, cmd: u32, argp: *u32) callconv(.winapi) c_int;
     extern "ws2_32" fn setsockopt(s: c_int, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn getsockopt(s: c_int, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_int) callconv(.winapi) c_int;
     extern "ws2_32" fn getsockname(s: c_int, name: ?*sockaddr_in, namelen: ?*c_int) callconv(.winapi) c_int;
@@ -72,7 +72,7 @@ const ws2_32 = struct {
     const SO_REUSEADDR: c_int = 0x0004;
     const SO_RCVTIMEO: c_int = 0x1006;
     const SO_ERROR: c_int = 0x1007;
-    const FIONBIO: c_long = 0x8004667E;
+    const FIONBIO: u32 = 0x8004667E;
 
     const WSAEWOULDBLOCK: c_int = 10035;
     const WSAEINPROGRESS: c_int = 10036;

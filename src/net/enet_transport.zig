@@ -130,6 +130,61 @@ pub const EnetTransport = struct {
         log.info("ENet connecting to {s}:{d}", .{ host_str, port });
     }
 
+    /// Same as connect(), but binds the ENet host to a specific local UDP
+    /// port before connecting. Used after relay-assisted hole-punching to
+    /// preserve the NAT mapping that was opened on that port.
+    ///
+    /// The relay client's UDP socket (which was used for hole-punching)
+    /// must be closed BEFORE calling this — ENet creates its own socket
+    /// and binds it to `local_port`. With SO_REUSEADDR (which ENet sets
+    /// by default in win32.c), the rebind succeeds immediately.
+    ///
+    /// If `local_port` is 0, behaves identically to connect() (OS picks
+    /// a random port).
+    pub fn connectBound(
+        self: *EnetTransport,
+        host_str: []const u8,
+        port: u16,
+        local_port: u16,
+        log: *logging.Logger,
+    ) !void {
+        if (enet.enet_initialize() != 0) return error.EnetInitFailed;
+        self.owns_enet_init = true;
+        errdefer {
+            enet.enet_deinitialize();
+            self.owns_enet_init = false;
+        }
+
+        // Bind the ENet host to local_port (or ENET_HOST_ANY:0 for random)
+        var bind_addr: enet.ENetAddress = undefined;
+        bind_addr.host = enet.ENET_HOST_ANY;
+        bind_addr.port = local_port;
+        self.host = enet.enet_host_create(&bind_addr, 1, 2, 0, 0);
+        if (self.host == null) {
+            log.err("enet_host_create (bound client, port {d}) failed", .{local_port});
+            return error.HostCreateFailed;
+        }
+
+        // Parse peer IP address
+        var addr: enet.ENetAddress = undefined;
+        var host_buf: [64]u8 = undefined;
+        const host_z = std.fmt.bufPrintZ(&host_buf, "{s}", .{host_str}) catch return error.HostTooLong;
+        if (enet.enet_address_set_host(&addr, host_z.ptr) != 0) {
+            log.err("Failed to parse host: {s}", .{host_str});
+            return error.InvalidHost;
+        }
+        addr.port = port;
+
+        self.peer = enet.enet_host_connect(self.host, &addr, 2, 0);
+        if (self.peer == null) {
+            log.err("enet_host_connect failed", .{});
+            return error.ConnectFailed;
+        }
+        enet.enet_peer_timeout(self.peer, 0, 30000, 120000);
+        self.is_host = false;
+        log.info("ENet connecting to {s}:{d} (bound to local port {d})", .{ host_str, port, local_port });
+    }
+
     pub fn sendReliable(self: *EnetTransport, data: []const u8) bool {
         if (self.peer == null or !self.connected) return false;
         const packet = enet.enet_packet_create(data.ptr, data.len, enet.ENET_PACKET_FLAG_RELIABLE);

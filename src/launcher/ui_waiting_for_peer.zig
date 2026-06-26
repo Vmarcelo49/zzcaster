@@ -93,6 +93,83 @@ pub fn startJoinSession(
     log.info("Join session started -> {s}:{d} (name='{s}')", .{ host_part, port, np_session.*.?.localName() });
 }
 
+/// Start a relay-assisted host session. The relay handles NAT traversal
+/// so the host doesn't need to port-forward. For zzcaster flavor, a
+/// 4-letter room code is generated — display it via getRoomCode().
+///
+/// `relay_source` is the text contents of relay_list.txt or the
+/// relayServers= config field. If empty, uses the hardcoded default.
+pub fn startRelayHostSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    port: u16,
+    relay_source: []const u8,
+    np_session: *?session.NetplaySession,
+) void {
+    cleanupSession(np_session);
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
+    s.lookupHostAddresses();
+    np_session.* = s;
+
+    np_session.*.?.startRelayHost(relay_source, port, false) catch |err| {
+        log.err("startRelayHost failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
+    };
+    if (np_session.*.?.getRoomCode()) |code| {
+        log.info("Relay host session started on port {d} (room code={s}, name='{s}')", .{
+            port, code, np_session.*.?.localName(),
+        });
+    } else {
+        log.info("Relay host session started on port {d} (cccaster flavor, name='{s}')", .{
+            port, np_session.*.?.localName(),
+        });
+    }
+}
+
+/// Start a relay-assisted join session.
+///
+/// `peer_identifier` is either:
+///   - A 4-letter room code (for zzcaster flavor relays)
+///   - A "ip:port" string (for cccaster flavor relays)
+///
+/// `relay_source` is the text contents of relay_list.txt. If empty,
+/// uses the hardcoded default.
+pub fn startRelayJoinSession(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    cfg: *config.Config,
+    log: *logging.Logger,
+    peer_identifier: []const u8,
+    relay_source: []const u8,
+    np_session: *?session.NetplaySession,
+) void {
+    cleanupSession(np_session);
+
+    var s = session.NetplaySession.init(allocator, io, log);
+    s.config.rollback = cfg.default_rollback;
+    s.config.win_count = cfg.versus_win_count;
+    s.setLocalName(cfg.display_name);
+    s.detectConnectionType();
+    np_session.* = s;
+
+    np_session.*.?.startRelayJoin(relay_source, peer_identifier, false) catch |err| {
+        log.err("startRelayJoin failed: {s}", .{@errorName(err)});
+        cleanupSession(np_session);
+        return;
+    };
+    log.info("Relay join session started -> {s} (name='{s}')", .{
+        peer_identifier, np_session.*.?.localName(),
+    });
+}
+
 /// Draw the waiting-for-peer screen. Calls session.step() each frame to
 /// drive the handshake forward, then shows progress / confirmation / launch.
 pub fn drawWaitingForPeer(
@@ -142,9 +219,47 @@ pub fn drawWaitingForPeer(
         zgui.spacing();
 
         switch (s.state) {
-            .idle, .listening, .connecting, .handshaking, .ping_exchanging => {
+            .idle, .listening, .connecting, .handshaking, .ping_exchanging, .relay_connecting => {
                 // In-progress: show address info + a spinner-ish message.
-                if (is_host) {
+
+                // Relay mode: show room code (zzcaster) or relay status
+                if (s.state == .relay_connecting) {
+                    if (is_host) {
+                        // Host: show room code if available (zzcaster flavor)
+                        if (s.getRoomCode()) |code| {
+                            var code_buf: [16]u8 = undefined;
+                            const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch "????";
+                            ui_theme.textColored(ui_theme.COL_MUTED, "Share this room code with your opponent:", .{});
+                            zgui.spacing();
+                            ui_theme.textColored(ui_theme.COL_RED, "{s}", .{code_z});
+                            zgui.sameLine(.{ .spacing = 12 });
+                            if (ui_theme.secondaryButton("Copy", 80, 28)) {
+                                setClipboardZ(code_z);
+                            }
+                        } else {
+                            // cccaster flavor: show IP:port (same as direct mode)
+                            if (s.publicIp()) |pub_ip| {
+                                var addr_buf: [80]u8 = undefined;
+                                const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ pub_ip, s.config.peer_port }) catch "?:?";
+                                ui_theme.textColored(ui_theme.COL_MUTED, "Share this address with your opponent:", .{});
+                                zgui.spacing();
+                                ui_theme.textColored(ui_theme.COL_RED, "{s}", .{addr_z});
+                                zgui.sameLine(.{ .spacing = 12 });
+                                if (ui_theme.secondaryButton("Copy", 80, 28)) {
+                                    setClipboardZ(addr_z);
+                                }
+                            } else {
+                                ui_theme.textColored(ui_theme.COL_MUTED, "Looking up public IP...", .{});
+                            }
+                        }
+                    } else {
+                        // Client: show "Connecting via relay..."
+                        ui_theme.textColored(ui_theme.COL_MUTED, "Connecting via relay...", .{});
+                    }
+                    zgui.spacing();
+                    ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(relay-assisted — no port forwarding needed)", .{});
+                } else if (is_host) {
+                    // Direct mode host
                     if (s.publicIp()) |pub_ip| {
                         var addr_buf: [80]u8 = undefined;
                         const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ pub_ip, s.config.peer_port }) catch "?:?";
@@ -166,13 +281,14 @@ pub fn drawWaitingForPeer(
                         ui_theme.textColored(ui_theme.COL_TEXT_DIM, "{s}", .{addr_z});
                     }
                 } else {
+                    // Direct mode client
                     var addr_buf: [80]u8 = undefined;
                     const peer_z = std.mem.sliceTo(&s.config.peer_addr, 0);
                     const addr_z = std.fmt.bufPrintZ(&addr_buf, "{s}:{d}", .{ peer_z, s.config.peer_port }) catch "?:?";
                     ui_theme.textColored(ui_theme.COL_MUTED, "Connecting to {s}...", .{addr_z});
+                    zgui.spacing();
+                    ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(make sure the port is open / forwarded on the host's router)", .{});
                 }
-                zgui.spacing();
-                ui_theme.textColored(ui_theme.COL_TEXT_DIM, "(make sure the port is open / forwarded on the host's router)", .{});
 
                 const local_ct = s.localConnectionType();
                 if (std.mem.eql(u8, local_ct, "Wired")) {

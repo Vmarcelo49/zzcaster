@@ -201,8 +201,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var error_msg_len: usize = 0;
 
     // Input buffers — sentinel-terminated for ImGui InputText
-    var port_buf = [_:0]u8{ '4', '6', '3', '1', '8' } ++ [_]u8{0} ** 10;
-    var peer_buf = [_:0]u8{ '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '4', '6', '3', '1', '8' } ++ [_]u8{0} ** 112;
+    // Single unified field for host/join: port, ip:port, or #roomcode
+    var peer_buf = [_:0]u8{0} ** 128;
+    // Inline message shown on the play page (errors, info)
+    var play_msg: [256]u8 = undefined;
+    var play_msg_len: usize = 0;
+    var play_msg_is_error: bool = false;
 
     // Text input buffers for config
     var wincount_buf = [_:0]u8{ '2' } ++ [_]u8{0} ** 6;
@@ -307,7 +311,9 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
                         pipe_name,
                         &current_page,
                         peer_buf[0..],
-                        port_buf[0..],
+                        &play_msg,
+                        &play_msg_len,
+                        &play_msg_is_error,
                         name_buf[0..],
                         wincount_buf[0..],
                         rollback_buf[0..],

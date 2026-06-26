@@ -239,30 +239,28 @@ pub fn startSmartJoinSession(
     relay_source: []const u8,
     np_session: *?session.NetplaySession,
 ) void {
-    const input_type = connection_detector.detectInputType(input);
+    const parsed = connection_detector.parseInput(input);
 
-    switch (input_type) {
+    switch (parsed.type) {
         .room_code => {
-            log.info("Smart join: detected room code '{s}' — using zzcaster relay", .{input});
-            startRelayJoinSession(allocator, io, cfg, log, input, relay_source, np_session);
+            log.info("Smart join: detected room code '{s}' — using zzcaster relay", .{parsed.value});
+            startRelayJoinSession(allocator, io, cfg, log, parsed.value, relay_source, np_session);
         },
-        .local_ip => {
-            log.info("Smart join: detected local IP '{s}' — using direct connection", .{input});
-            startJoinSession(allocator, io, cfg, log, input, np_session);
+        .ip_port => {
+            if (parsed.is_local) {
+                log.info("Smart join: detected local address '{s}' — using direct connection", .{input});
+                startJoinSession(allocator, io, cfg, log, input, np_session);
+            } else {
+                log.info("Smart join: detected public address '{s}' — trying relay first, then direct", .{input});
+                // For public IPs, try relay-assisted (cccaster flavor) first.
+                // The relay uses the IP:port as the match key — same as direct,
+                // but relay-assisted hole-punching means no port-forward needed.
+                startRelayJoinSession(allocator, io, cfg, log, input, relay_source, np_session);
+            }
         },
-        .public_ip_or_host => {
-            log.info("Smart join: detected public address '{s}' — trying relay first, then direct", .{input});
-            // For public IPs, try relay-assisted (cccaster flavor) first.
-            // The relay uses the IP:port as the match key — same as direct,
-            // but relay-assisted hole-punching means no port-forward needed.
-            startRelayJoinSession(allocator, io, cfg, log, input, relay_source, np_session);
-        },
-        .invalid => {
-            log.err("Smart join: invalid input '{s}' — expected room code or ip:port", .{input});
+        .port, .empty, .invalid => {
+            log.err("Smart join: invalid input '{s}' — expected #roomcode or ip:port", .{input});
             // Don't start a session — the UI will show an error.
-            // We could set an error message on a dummy session, but
-            // it's simpler to just not start one and let the UI stay
-            // on the idle page.
         },
     }
 }

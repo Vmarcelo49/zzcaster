@@ -613,21 +613,40 @@ pub const RelayClient = struct {
             self.sendNullMsg(now_ms);
         }
 
-        // Poll UDP socket for incoming packets
-        var from: ws2_32.sockaddr_in = undefined;
-        var from_len: c_int = @sizeOf(ws2_32.sockaddr_in);
-        var buf: [udp_buf_size]u8 = undefined;
-        const recv_len = ws2_32.recvfrom(self.udp_sock, &buf, buf.len, 0, &from, &from_len);
-        if (recv_len > 0) {
-            // Check if this packet is from the peer (not from the relay)
-            if (self.peer_addr) |peer| {
-                if (from.addr == peer.addr and from.port == peer.port) {
-                    // Hole-punch succeeded!
-                    self.state = .connected;
+        // Poll UDP socket for incoming packets. Drain ALL pending packets
+        // in this frame rather than just one — this avoids delaying
+        // hole-punch detection by one frame when multiple probes arrive
+        // simultaneously (common on high-latency links where the peer's
+        // 50ms probes bunch up).
+        while (true) {
+            var from: ws2_32.sockaddr_in = undefined;
+            var from_len: c_int = @sizeOf(ws2_32.sockaddr_in);
+            var buf: [udp_buf_size]u8 = undefined;
+            const recv_len = ws2_32.recvfrom(self.udp_sock, &buf, buf.len, 0, &from, &from_len);
+            if (recv_len > 0) {
+                // Check if this packet is from the peer (not from the relay)
+                if (self.peer_addr) |peer| {
+                    if (from.addr == peer.addr and from.port == peer.port) {
+                        // Hole-punch succeeded!
+                        self.state = .connected;
+                        return;
+                    }
+                }
+                // Packet from unknown source — ignore and keep draining.
+                continue;
+            }
+            // recv_len <= 0 — check for errors
+            if (recv_len < 0) {
+                const err = ws2_32.WSAGetLastError();
+                if (err != ws2_32.WSAEWOULDBLOCK) {
+                    // Real socket error — fail fast instead of waiting
+                    // for the 10s hole-punch timeout.
+                    self.fail(.socket_error);
                     return;
                 }
+                // WSAEWOULDBLOCK — no more data, break the drain loop.
             }
-            // Packet from unknown source — ignore and keep punching
+            break;
         }
     }
 
@@ -826,7 +845,11 @@ pub const RelayClient = struct {
             .match_info => 9 + 4, // "MatchInfo" + u32
             .hosted => 6 + 4, // "Hosted" + 4-byte code
             .tun_info => |t| 7 + 4 + t.addr.len + 1, // "TunInfo" + u32 + addr + null
-            .err => data.len, // "Error" + code + rest of buffer
+            // Error has no length prefix, so we consume up to MAX_ERROR_LEN.
+            // The server closes the TCP connection after sending Error, so
+            // in practice there won't be a subsequent message — but capping
+            // at MAX_ERROR_LEN is defensive and follows good TCP framing.
+            .err => @min(data.len, protocol.MAX_ERROR_LEN),
             .unknown => return null,
         };
 
@@ -909,7 +932,14 @@ fn resolveHost(host: []const u8) u32 {
     const addr_list = he.h_addr_list orelse return 0;
     const first_addr_ptr = addr_list[0] orelse return 0;
     const a: [*]u8 = first_addr_ptr;
-    return std.mem.readInt(u32, a[0..4], .little);
+    // gethostbyname returns addresses in network byte order (big-endian),
+    // same as inet_addr. Copy the raw bytes into a u32 so the result
+    // matches inet_addr's return value on any platform endianness.
+    // (The previous std.mem.readInt(..., .little) was correct only on
+    // little-endian targets like x86-windows-gnu.)
+    var result: u32 = undefined;
+    @memcpy(std.mem.asBytes(&result), a[0..4]);
+    return result;
 }
 
 const IpPort = struct { ip: u32, port: u16 };

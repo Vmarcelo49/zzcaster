@@ -261,6 +261,12 @@ pub fn decodeServerMsg(data: []const u8) ServerMsg {
     }
 
     // TunInfo: "TunInfo" + u32 le matchId + "ip:port\0"
+    //
+    // TCP is a stream protocol — a single server Write can arrive as
+    // multiple recv calls. If the null terminator hasn't arrived yet,
+    // we MUST return .unknown so the caller waits for more data instead
+    // of treating a partial address as a complete message (which would
+    // cause parseIpPort to fail and the client to abort the connection).
     if (data.len >= 7 + 4 and std.mem.eql(u8, data[0..7], TUN_INFO_HEADER)) {
         const match_id = std.mem.readInt(u32, data[7..11], .little);
         // Find null terminator
@@ -268,6 +274,10 @@ pub fn decodeServerMsg(data: []const u8) ServerMsg {
         while (end < data.len and data[end] != 0 and end - 11 < MAX_TUN_INFO_ADDR_LEN) {
             end += 1;
         }
+        // If we didn't find the null terminator, the message is incomplete
+        // (TCP fragmentation) or malformed (addr exceeds MAX_TUN_INFO_ADDR_LEN).
+        // Return .unknown so the caller waits for more data.
+        if (end >= data.len or data[end] != 0) return .{ .unknown = {} };
         return .{
             .tun_info = .{
                 .match_id = match_id,
@@ -476,6 +486,39 @@ test "decodeServerMsg returns unknown for garbage" {
     const garbage = [_]u8{ 0xFF, 0xEE, 0xDD, 0xCC };
     const decoded = decodeServerMsg(&garbage);
     try std.testing.expect(decoded == .unknown);
+}
+
+test "decodeServerMsg returns unknown for TunInfo without null terminator (TCP fragmentation)" {
+    // "TunInfo" + matchId=42 LE + "203.0.113.10:5432" (NO null terminator)
+    // This simulates a partial TCP read where the null hasn't arrived yet.
+    var msg: [40]u8 = undefined;
+    @memcpy(msg[0..7], TUN_INFO_HEADER);
+    std.mem.writeInt(u32, msg[7..11], 42, .little);
+    const addr = "203.0.113.10:5432"; // 16 chars, no \0
+    @memcpy(msg[11 .. 11 + addr.len], addr);
+    const decoded = decodeServerMsg(msg[0 .. 11 + addr.len]);
+    try std.testing.expect(decoded == .unknown);
+}
+
+test "decodeServerMsg returns unknown for TunInfo with only matchId (addr not yet received)" {
+    // "TunInfo" + matchId=42 LE, no addr at all
+    var msg: [11]u8 = undefined;
+    @memcpy(msg[0..7], TUN_INFO_HEADER);
+    std.mem.writeInt(u32, msg[7..11], 42, .little);
+    const decoded = decodeServerMsg(&msg);
+    try std.testing.expect(decoded == .unknown);
+}
+
+test "decodeServerMsg parses TunInfo with empty addr (just null terminator)" {
+    // "TunInfo" + matchId=42 LE + "\0" (empty addr — edge case)
+    var msg: [12]u8 = undefined;
+    @memcpy(msg[0..7], TUN_INFO_HEADER);
+    std.mem.writeInt(u32, msg[7..11], 42, .little);
+    msg[11] = 0;
+    const decoded = decodeServerMsg(&msg);
+    try std.testing.expect(decoded == .tun_info);
+    try std.testing.expectEqual(@as(u32, 42), decoded.tun_info.match_id);
+    try std.testing.expectEqualStrings("", decoded.tun_info.addr);
 }
 
 test "isValidRoomCode accepts valid codes" {

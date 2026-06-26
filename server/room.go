@@ -252,10 +252,16 @@ func (rm *RoomManager) RecordPeerUdpAddr(matchId uint32, isClient bool, udpAddr 
         if room.HostTunSent && room.ClientTunSent {
                 room.State = RoomDone
                 // Defer the delete — return first so the caller can log.
-                go func(code string) {
+                //
+                // We pass the matchId to the deletion goroutine so it can
+                // verify the room hasn't been recycled (same 4-letter code
+                // re-registered by a different host during the grace period).
+                // Without this check, a delayed Delete could remove a new,
+                // unrelated room that happened to get the same code.
+                go func(code string, matchId uint32) {
                         time.Sleep(2 * time.Second) // grace period for late UdpData
-                        rm.Delete(code)
-                }(room.Code)
+                        rm.DeleteIfMatch(code, matchId)
+                }(room.Code, room.MatchId)
         }
 
         return tunInfo, opposite, nil
@@ -269,6 +275,20 @@ func (rm *RoomManager) Delete(code string) {
         rm.mu.Lock()
         defer rm.mu.Unlock()
         delete(rm.rooms, code)
+}
+
+// DeleteIfMatch removes a room by code ONLY if its matchId matches.
+// This prevents a delayed grace-period deletion from removing a new,
+// unrelated room that was re-registered with the same 4-letter code
+// during the 2-second grace period.
+//
+// Used by RecordPeerUdpAddr's deferred deletion goroutine.
+func (rm *RoomManager) DeleteIfMatch(code string, matchId uint32) {
+        rm.mu.Lock()
+        defer rm.mu.Unlock()
+        if r, ok := rm.rooms[code]; ok && r.MatchId == matchId {
+                delete(rm.rooms, code)
+        }
 }
 
 // DeleteByMatchId removes a room by matchId.

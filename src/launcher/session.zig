@@ -429,9 +429,7 @@ pub const NetplaySession = struct {
         self.state = .listening;
         self.setPhaseTimeout(listen_timeout_ms);
         self.setStatus("Listening for direct connection...");
-        self.log.info("Smart host started on port {d} (direct + relay, flavor={s})", .{
-            port, entry.flavor.label(),
-        });
+        self.log.info("Smart host started on port {d} (direct + relay)", .{port});
     }
 
     // ========================================================================
@@ -449,14 +447,10 @@ pub const NetplaySession = struct {
     // relayServers= config field. The session parses it, picks the first
     // entry, and owns the parsed list for the session's lifetime.
     //
-    // For zzcaster host: generates a 4-letter room code internally.
+    // For host: generates a 4-letter room code internally.
     //   Call getRoomCode() after startRelayHost to display it to the user.
     //
-    // For cccaster host: the host's public IP:port is shared out-of-band
-    //   (same UX as direct IP). The relay just helps with hole-punching.
-    //
-    // For zzcaster client: `peer_identifier` is the 4-letter room code.
-    // For cccaster client: `peer_identifier` is the host's "ip:port" string.
+    // For client: `peer_identifier` is the 4-letter room code.
 
     pub fn startRelayHost(
         self: *NetplaySession,
@@ -506,7 +500,7 @@ pub const NetplaySession = struct {
         self.state = .relay_connecting;
         self.setPhaseTimeout(0); // RelayClient manages its own timeouts
         self.setStatus("Connecting to relay server...");
-        self.log.info("Relay host started (flavor={s})", .{entry.flavor.label()});
+        self.log.info("Relay host started", .{});
     }
 
     pub fn startRelayJoin(
@@ -557,10 +551,10 @@ pub const NetplaySession = struct {
         self.state = .relay_connecting;
         self.setPhaseTimeout(0); // RelayClient manages its own timeouts
         self.setStatus("Connecting to relay server...");
-        self.log.info("Relay join started (flavor={s})", .{entry.flavor.label()});
+        self.log.info("Relay join started", .{});
     }
 
-    /// For zzcaster relay host: returns the generated 4-letter room code.
+    /// For relay host: returns the generated 4-letter room code.
     /// For all other cases: returns null.
     pub fn getRoomCode(self: *const NetplaySession) ?[4]u8 {
         if (self.relay_client) |rc| return rc.getRoomCode();

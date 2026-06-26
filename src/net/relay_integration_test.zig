@@ -65,38 +65,34 @@ test "Room code rejects ambiguous characters" {
 test "Relay list parses config.ini relayServers format" {
     // Simulates what config.zig produces when it reads multiple
     // relayServers= lines from config.ini
-    const config_content = "zzcaster:nat.example.com:3939\ncccaster:melty.argoneus.com:3939";
+    const config_content = "nat.example.com:3939\nzzcaster.duckdns.org:3939";
     var list = try relay_config.parseList(std.testing.allocator, config_content);
     defer list.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 2), list.count());
 
     const e0 = list.get(0).?;
-    try std.testing.expectEqual(protocol.RelayFlavor.zzcaster, e0.flavor);
     try std.testing.expectEqualStrings("nat.example.com", e0.host);
     try std.testing.expectEqual(@as(u16, 3939), e0.port);
 
     const e1 = list.get(1).?;
-    try std.testing.expectEqual(protocol.RelayFlavor.cccaster, e1.flavor);
-    try std.testing.expectEqualStrings("melty.argoneus.com", e1.host);
+    try std.testing.expectEqualStrings("zzcaster.duckdns.org", e1.host);
 }
 
-test "Relay list handles bare IP without flavor prefix" {
+test "Relay list handles bare IP" {
     // User writes: relayServers=64.181.172.230:3939
-    // Should default to zzcaster flavor
     const config_content = "64.181.172.230:3939";
     var list = try relay_config.parseList(std.testing.allocator, config_content);
     defer list.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), list.count());
     const e = list.get(0).?;
-    try std.testing.expectEqual(protocol.RelayFlavor.zzcaster, e.flavor);
     try std.testing.expectEqualStrings("64.181.172.230", e.host);
     try std.testing.expectEqual(@as(u16, 3939), e.port);
 }
 
 test "Relay list handles hostname without port" {
-    const config_content = "zzcaster:nat.example.com";
+    const config_content = "nat.example.com";
     var list = try relay_config.parseList(std.testing.allocator, config_content);
     defer list.deinit(std.testing.allocator);
 
@@ -117,17 +113,19 @@ test "Relay list handles duckdns hostname" {
     try std.testing.expectEqual(@as(u16, 3939), e.port);
 }
 
-test "DEFAULT_RELAY_LIST contains cccaster fallbacks" {
+test "DEFAULT_RELAY_LIST contains the primary relay" {
     var list = try relay_config.parseList(std.testing.allocator, relay_config.DEFAULT_RELAY_LIST);
     defer list.deinit(std.testing.allocator);
-    try std.testing.expect(list.count() >= 2);
+    try std.testing.expectEqual(@as(usize, 1), list.count());
+    const e = list.get(0).?;
+    try std.testing.expectEqualStrings("zzcaster.duckdns.org", e.host);
 }
 
 // ============================================================================
 // Wire format encoding — verify exact bytes sent to relay
 // ============================================================================
 
-test "HostRegister encodes correctly for zzcaster flavor" {
+test "HostRegister encodes correctly" {
     var buf: [64]u8 = undefined;
     const encoded = protocol.encodeHostRegister(&buf, protocol.TYPE_UDP, 46318, "ABCD");
     try std.testing.expectEqual(@as(usize, 8), encoded.len);
@@ -139,31 +137,13 @@ test "HostRegister encodes correctly for zzcaster flavor" {
     try std.testing.expectEqualStrings("ABCD", encoded[4..8]);
 }
 
-test "ClientJoin encodes correctly for zzcaster flavor" {
+test "ClientJoin encodes correctly" {
     var buf: [64]u8 = undefined;
     const encoded = protocol.encodeClientJoin(&buf, protocol.TYPE_UDP, "WXYZ");
     try std.testing.expectEqual(@as(usize, 6), encoded.len);
     try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
     try std.testing.expectEqual(@as(u8, 4), encoded[1]);
     try std.testing.expectEqualStrings("WXYZ", encoded[2..6]);
-}
-
-test "TypedHostingPort encodes correctly for cccaster flavor" {
-    var buf: [64]u8 = undefined;
-    const encoded = protocol.encodeTypedHostingPort(&buf, protocol.TYPE_UDP, 46318);
-    try std.testing.expectEqual(@as(usize, 3), encoded.len);
-    try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
-    try std.testing.expectEqual(@as(u8, 0xEE), encoded[1]);
-    try std.testing.expectEqual(@as(u8, 0xB4), encoded[2]);
-}
-
-test "TypedConnectionAddress encodes correctly for cccaster flavor" {
-    var buf: [64]u8 = undefined;
-    const addr = "203.0.113.10:46318";
-    const encoded = protocol.encodeTypedConnectionAddress(&buf, protocol.TYPE_UDP, addr);
-    try std.testing.expectEqual(@as(usize, 1 + addr.len), encoded.len);
-    try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
-    try std.testing.expectEqualStrings(addr, encoded[1..]);
 }
 
 test "UdpData encodes correctly for host (isClient=false)" {
@@ -238,7 +218,7 @@ test "RelayClient init fails gracefully with invalid room code" {
     // Can't test the full init (it tries to connect via ws2_32), but we
     // can test the validation logic that runs before any socket ops.
     //
-    // The init function validates the room code for zzcaster client flavor
+    // The init function validates the room code for the client role
     // and sets state=.failed + error_val=.invalid_room_code if it's bad.
     //
     // We can't easily call init() without a real std.Io + Winsock, so
@@ -246,26 +226,6 @@ test "RelayClient init fails gracefully with invalid room code" {
     try std.testing.expect(!protocol.isValidRoomCode("BAD")); // too short
     try std.testing.expect(!protocol.isValidRoomCode("BAD!")); // invalid char
     try std.testing.expect(protocol.isValidRoomCode("ABCD")); // valid
-}
-
-test "RelayClient init validates cccaster peer_address format" {
-    // For cccaster client, peer_identifier must be "ip:port" format.
-    // The init function checks: length 9-21, contains colon.
-    // We test the logic here since we can't call init() without Winsock.
-
-    const valid = "203.0.113.10:46318";
-    try std.testing.expect(valid.len >= 9 and valid.len <= 21);
-    try std.testing.expect(std.mem.indexOfScalar(u8, valid, ':') != null);
-
-    // "1.1.1.1:0" is the minimum valid ip:port (9 chars)
-    const min_valid = "1.1.1.1:0";
-    try std.testing.expect(min_valid.len == 9);
-
-    const too_short = "1.2.3.4";
-    try std.testing.expect(too_short.len < 9);
-
-    const no_colon = "203.0.113.10";
-    try std.testing.expect(std.mem.indexOfScalar(u8, no_colon, ':') == null);
 }
 
 // ============================================================================
@@ -304,16 +264,4 @@ test "RelayError hole_punch_failed suggests port forwarding" {
     // Should mention port-forwarding or VPN
     try std.testing.expect(std.mem.indexOf(u8, suggestion, "port") != null or
         std.mem.indexOf(u8, suggestion, "VPN") != null);
-}
-
-// ============================================================================
-// RelayFlavor round-trip
-// ============================================================================
-
-test "RelayFlavor label round-trips" {
-    try std.testing.expectEqualStrings("zzcaster", protocol.RelayFlavor.zzcaster.label());
-    try std.testing.expectEqualStrings("cccaster", protocol.RelayFlavor.cccaster.label());
-    try std.testing.expectEqual(protocol.RelayFlavor.zzcaster, protocol.RelayFlavor.fromLabel("zzcaster").?);
-    try std.testing.expectEqual(protocol.RelayFlavor.cccaster, protocol.RelayFlavor.fromLabel("cccaster").?);
-    try std.testing.expect(protocol.RelayFlavor.fromLabel("unknown") == null);
 }

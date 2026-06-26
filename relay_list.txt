@@ -1,30 +1,21 @@
-# zzcaster relay list — format: [flavor:]host[:port]
+# zzcaster relay list — format: host[:port]
 #
-# Flavors:
-#   zzcaster  — room codes, Hosted reply, Error replies (our protocol)
-#   cccaster  — IP-based matching, no Hosted/Error (original CCCaster)
-#
-# Default port: 3939. Default flavor (no prefix): zzcaster.
+# Default port: 3939.
 #
 # The client tries entries in order; on TCP disconnect or timeout, advances
 # to the next. This is the failover chain.
 #
 # ──────────────────────────────────────────────────────────────────────
-# Live CCCaster relays (fallback — work today, tested in production).
-# These let zzcaster ship with NAT traversal working on day 1, even
-# before we deploy our own relay.
+# Primary zzcaster relay (room-code based, full NAT traversal support).
 # ──────────────────────────────────────────────────────────────────────
-cccaster:melty.argoneus.com:3939
-cccaster:104.238.130.23:3939
+zzcaster.duckdns.org:3939
 
 # ──────────────────────────────────────────────────────────────────────
-# zzcaster relay — uncomment when one is deployed.
-# Users can also override via config.ini:
-#   relayServers=zzcaster:nat.example.com:3939
+# Users can override via config.ini:
+#   relayServers=nat.example.com:3939
 # ──────────────────────────────────────────────────────────────────────
-# zzcaster:nat.zzcaster.com:3939
 
 # ──────────────────────────────────────────────────────────────────────
 # Local dev (uncomment for testing against a local server)
 # ──────────────────────────────────────────────────────────────────────
-# zzcaster:127.0.0.1:3939
+# 127.0.0.1:3939

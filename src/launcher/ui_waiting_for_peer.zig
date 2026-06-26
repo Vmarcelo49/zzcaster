@@ -95,8 +95,8 @@ pub fn startJoinSession(
 }
 
 /// Start a relay-assisted host session. The relay handles NAT traversal
-/// so the host doesn't need to port-forward. For zzcaster flavor, a
-/// 4-letter room code is generated — display it via getRoomCode().
+/// so the host doesn't need to port-forward. A 4-letter room code is
+/// generated — display it via getRoomCode().
 ///
 /// `relay_source` is the text contents of relay_list.txt or the
 /// relayServers= config field. If empty, uses the hardcoded default.
@@ -129,7 +129,7 @@ pub fn startRelayHostSession(
             port, code, np_session.*.?.localName(),
         });
     } else {
-        log.info("Relay host session started on port {d} (cccaster flavor, name='{s}')", .{
+        log.info("Relay host session started on port {d} (name='{s}')", .{
             port, np_session.*.?.localName(),
         });
     }
@@ -137,9 +137,7 @@ pub fn startRelayHostSession(
 
 /// Start a relay-assisted join session.
 ///
-/// `peer_identifier` is either:
-///   - A 4-letter room code (for zzcaster flavor relays)
-///   - A "ip:port" string (for cccaster flavor relays)
+/// `peer_identifier` is a 4-letter room code.
 ///
 /// `relay_source` is the text contents of relay_list.txt. If empty,
 /// uses the hardcoded default.
@@ -225,11 +223,9 @@ pub fn startSmartHostSession(
 /// Start a smart join session — auto-detects input format and picks
 /// the right connection strategy.
 ///
-/// Detection rules (via connection_detector.detectInputType):
-///   .room_code (4 letters)     → relay join (zzcaster flavor)
-///   .local_ip (private/loopback) → direct join (no relay needed)
-///   .public_ip_or_host         → relay join (cccaster flavor) first,
-///                                 then direct as fallback
+/// Detection rules (via connection_detector.parseInput):
+///   .room_code (4 letters)     → relay join (room-code based)
+///   .ip_port (any IP:port)     → direct join (relay is room-code only)
 ///   .invalid                   → error, don't start a session
 pub fn startSmartJoinSession(
     allocator: std.mem.Allocator,
@@ -244,20 +240,12 @@ pub fn startSmartJoinSession(
 
     switch (parsed.type) {
         .room_code => {
-            log.info("Smart join: detected room code '{s}' — using zzcaster relay", .{parsed.value});
+            log.info("Smart join: detected room code '{s}' — using relay", .{parsed.value});
             startRelayJoinSession(allocator, io, cfg, log, parsed.value, relay_source, np_session);
         },
         .ip_port => {
-            if (parsed.is_local) {
-                log.info("Smart join: detected local address '{s}' — using direct connection", .{input});
-                startJoinSession(allocator, io, cfg, log, input, np_session);
-            } else {
-                log.info("Smart join: detected public address '{s}' — trying relay first, then direct", .{input});
-                // For public IPs, try relay-assisted (cccaster flavor) first.
-                // The relay uses the IP:port as the match key — same as direct,
-                // but relay-assisted hole-punching means no port-forward needed.
-                startRelayJoinSession(allocator, io, cfg, log, input, relay_source, np_session);
-            }
+            log.info("Smart join: detected address '{s}' — using direct connection", .{input});
+            startJoinSession(allocator, io, cfg, log, input, np_session);
         },
         .port, .empty, .invalid => {
             log.err("Smart join: invalid input '{s}' — expected #roomcode or ip:port", .{input});
@@ -329,7 +317,7 @@ pub fn drawWaitingForPeer(
                 // For host: show what to share with the opponent.
                 // For client: show what we're connecting to.
                 if (is_host) {
-                    // Host: show room code (zzcaster relay) or IP:port (direct/cccaster)
+                    // Host: show room code (relay) or IP:port (direct)
                     if (s.getRoomCode()) |code| {
                         var code_buf: [16]u8 = undefined;
                         const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch "????";

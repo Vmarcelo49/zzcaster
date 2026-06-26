@@ -18,9 +18,8 @@
 //   - .unknown      — probe failed (network error, relay down, etc.)
 //
 // This module talks to the relay server's UDP port (3939 by default).
-// Both cccaster and zzcaster relays handle STUN probes identically —
-// any UDP packet that isn't a valid 5-byte UdpData is treated as a
-// STUN probe and gets an 8-byte reply.
+// The relay handles STUN probes — any UDP packet that isn't a valid
+// 5-byte UdpData is treated as a STUN probe and gets an 8-byte reply.
 //
 // IMPORTANT: this module uses raw ws2_32 sockets (not ENet). ENet is
 // for game traffic; STUN probes are a one-shot query best done with a

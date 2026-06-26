@@ -25,11 +25,11 @@ pub const Config = struct {
 
     /// Custom relay server list (one entry per line, format documented in
     /// src/net/relay_config.zig). If empty, the hardcoded DEFAULT_RELAY_LIST
-    /// is used (live CCCaster relays as fallback).
+    /// is used (zzcaster.duckdns.org as the primary relay).
     ///
     /// Example config.ini content:
-    ///   relayServers=zzcaster:nat.example.com:3939
-    ///   relayServers=cccaster:melty.argoneus.com:3939
+    ///   relayServers=nat.example.com:3939
+    ///   relayServers=zzcaster.duckdns.org:3939
     ///
     /// Multiple lines append multiple entries (in order).
     relay_servers: []u8 = &.{},
@@ -331,13 +331,13 @@ test "parseConfig accumulates multiple relayServers lines" {
     defer cfg.deinit();
 
     parseConfig(&cfg,
-        \\relayServers=zzcaster:nat.example.com:3939
-        \\relayServers=cccaster:melty.argoneus.com:3939
+        \\relayServers=nat.example.com:3939
+        \\relayServers=zzcaster.duckdns.org:3939
         \\
     );
     // Should contain both entries, separated by a newline.
     try std.testing.expectEqualStrings(
-        "zzcaster:nat.example.com:3939\ncccaster:melty.argoneus.com:3939",
+        "nat.example.com:3939\nzzcaster.duckdns.org:3939",
         cfg.relay_servers,
     );
 }

@@ -60,38 +60,29 @@ host+client match flow + STUN probe + error cases.
 Wire-format codec, relay list parser with failover, and STUN probe
 client. No UI yet — just the building blocks the next slices will use.
 
-**Key design decision — dual-protocol support:**
+**Key design decision — room-code based protocol:**
 
-The client speaks **both** the zzcaster relay protocol (room codes,
-`Hosted` reply, `Error` replies) AND the original CCCaster relay
-protocol (IP-based matching, no `Hosted`/`Error`). This is possible
-because the two protocols share `MatchInfo`, `TunInfo`, and `UdpData`
-byte-for-byte — only the initial TCP handshake differs.
-
-This means we can ship with **CCCaster's live relays as the default
-fallback** — NAT traversal works on day 1, before we deploy our own
-server. When the zzcaster relay is ready, the user just adds it to
-`relay_list.txt` or `config.ini`, and it'll be tried first.
+The client speaks the zzcaster relay protocol (room codes, `Hosted` reply,
+`Error` replies). This is a single, self-contained protocol — we no longer
+support the original CCCaster relay protocol (IP-based matching), since
+testing showed those servers don't have working UDP and can't help with
+hole-punching.
 
 **Failover chain** (from `relay_list.txt`):
-1. `cccaster:melty.argoneus.com:3939` (live, tested)
-2. `cccaster:104.238.130.23:3939` (live, tested)
-3. (commented out) `zzcaster:nat.zzcaster.com:3939` — uncomment when deployed
-4. (commented out) `zzcaster:127.0.0.1:3939` — for local dev
+1. `zzcaster.duckdns.org:3939` (primary, deployed)
+2. (commented out) `127.0.0.1:3939` — for local dev
 
 **Files:**
-- `src/net/relay_protocol.zig` (513 lines, 24 tests)
-  - `RelayFlavor` enum (`zzcaster` / `cccaster`)
-  - Encoders for both flavors: `encodeHostRegister`, `encodeClientJoin`,
-    `encodeTypedHostingPort`, `encodeTypedConnectionAddress`
-  - Shared encoders: `encodeUdpData`, `encodeStunProbe`
+- `src/net/relay_protocol.zig`
+  - Encoders: `encodeHostRegister`, `encodeClientJoin`,
+    `encodeUdpData`, `encodeStunProbe`
   - Decoders: `decodeServerMsg` (handles MatchInfo/TunInfo/Hosted/Error)
   - `decodeStunReply` (8-byte STUN response)
   - Room code generation + validation (unambiguous alphabet)
-- `src/net/relay_config.zig` (323 lines, 9 tests)
-  - `RelayEntry` struct (flavor + host + port)
+- `src/net/relay_config.zig`
+  - `RelayEntry` struct (host + port)
   - `RelayList` with `.empty` + per-call allocator (Zig 0.16 pattern)
-  - `parseLine` / `parseList` — format `[flavor:]host[:port]`
+  - `parseLine` / `parseList` — format `host[:port]`
   - `DEFAULT_RELAY_LIST` constant (hardcoded fallback)
 - `src/net/nat_probe.zig` (383 lines, 3 tests)
   - `NatType` enum (direct / full_cone / restricted / port_restricted /

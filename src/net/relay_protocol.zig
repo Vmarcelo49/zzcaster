@@ -1,24 +1,16 @@
 // src/net/relay_protocol.zig
 // ============================================================================
-// Wire format for the zzcaster NAT-traversal relay protocol, with
-// dual-mode support for the original CCCaster relay protocol.
+// Wire format for the zzcaster NAT-traversal relay protocol.
 //
-// Both protocols share the same MatchInfo / TunInfo / UdpData formats.
-// Only the initial TCP handshake differs:
+//   Host   → [u8 type][u16 le port][u8 code_len][code bytes]
+//     (HostRegister — type is 'T' or 'U', port is the host's local listen
+//     port, code is the 4-letter room code; empty code = server assigns)
+//   Client → [u8 type][u8 code_len][code bytes]
+//     (ClientJoin — code is the 4-letter room code)
+//   Server → Hosted / MatchInfo / TunInfo / Error
+//   Match key: 4-letter room code
 //
-//   zzcaster relay:
-//     Host   → [u8 type][u16 le port][u8 code_len][code bytes]
-//     Client → [u8 type][u8 code_len][code bytes]
-//     Server → Hosted / MatchInfo / TunInfo / Error
-//     Match key: 4-letter room code
-//
-//   cccaster relay:
-//     Host   → [u8 type][u16 le port]                        (3 bytes — TypedHostingPort)
-//     Client → [u8 type]["ip:port" ASCII, no null]           (10-22 bytes — TypedConnectionAddress)
-//     Server → MatchInfo / TunInfo  (NO Hosted, NO Error — just closes TCP on failure)
-//     Match key: string-equal on "{type}{host_public_ip}:{host_local_port}"
-//
-// All integers are LITTLE-ENDIAN (matches CCCaster).
+// All integers are LITTLE-ENDIAN.
 //
 // Authoritative spec: docs/nat-traversal-protocol.md
 // ============================================================================
@@ -36,13 +28,13 @@ pub const TYPE_UDP: u8 = 'U'; // 0x55
 pub const ROOM_CODE_LEN: usize = 4;
 pub const ROOM_CODE_ALPHABET: []const u8 = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 
-/// Magic header strings — shared between both protocols.
+/// Magic header strings.
 pub const MATCH_INFO_HEADER: []const u8 = "MatchInfo"; // 9 bytes
 pub const TUN_INFO_HEADER: []const u8 = "TunInfo"; // 7 bytes
-pub const HOSTED_HEADER: []const u8 = "Hosted"; // 6 bytes — zzcaster only
-pub const ERROR_HEADER: []const u8 = "Error"; // 5 bytes — zzcaster only
+pub const HOSTED_HEADER: []const u8 = "Hosted"; // 6 bytes
+pub const ERROR_HEADER: []const u8 = "Error"; // 5 bytes
 
-/// Error codes (zzcaster protocol only — CCCaster has no Error reply).
+/// Error codes.
 pub const ERR_ROOM_NOT_FOUND: u8 = 1;
 pub const ERR_ROOM_EXPIRED: u8 = 2;
 pub const ERR_PROTOCOL_ERROR: u8 = 3;
@@ -61,42 +53,10 @@ pub const MAX_INITIAL_MSG_LEN: usize = 64;
 pub const INVALID_MATCH_ID: u32 = 0;
 
 // ============================================================================
-// Relay flavor — which protocol variant to speak
-// ============================================================================
-
-/// RelayFlavor identifies which protocol variant a relay speaks.
-///
-/// The two flavors share MatchInfo / TunInfo / UdpData wire formats but
-/// differ in the initial TCP handshake:
-///   - .zzcaster: room codes, Hosted reply, Error replies
-///   - .cccaster: IP-based matching, no Hosted, no Error (just TCP close)
-///
-/// The client picks the flavor based on the entry in relay_list.txt.
-pub const RelayFlavor = enum {
-    zzcaster,
-    cccaster,
-
-    /// String label for the relay_list.txt format ("zzcaster:" / "cccaster:").
-    pub fn label(self: RelayFlavor) []const u8 {
-        return switch (self) {
-            .zzcaster => "zzcaster",
-            .cccaster => "cccaster",
-        };
-    }
-
-    /// Parse a label string into a flavor. Returns null for unknown labels.
-    pub fn fromLabel(s: []const u8) ?RelayFlavor {
-        if (std.mem.eql(u8, s, "zzcaster")) return .zzcaster;
-        if (std.mem.eql(u8, s, "cccaster")) return .cccaster;
-        return null;
-    }
-};
-
-// ============================================================================
 // Outgoing message encoders — initial TCP handshake (client → server)
 // ============================================================================
 
-/// Encode a HostRegister message (zzcaster flavor).
+/// Encode a HostRegister message.
 ///
 /// Wire format: [u8 type 'T'|'U'][u16 le port][u8 code_len][code bytes]
 ///
@@ -116,7 +76,7 @@ pub fn encodeHostRegister(buf: []u8, t: u8, port: u16, code: []const u8) []u8 {
     return buf[0 .. 4 + code.len];
 }
 
-/// Encode a ClientJoin message (zzcaster flavor).
+/// Encode a ClientJoin message.
 ///
 /// Wire format: [u8 type 'T'|'U'][u8 code_len][code bytes]
 ///
@@ -132,47 +92,11 @@ pub fn encodeClientJoin(buf: []u8, t: u8, code: []const u8) []u8 {
     return buf[0 .. 2 + code.len];
 }
 
-/// Encode a TypedHostingPort message (cccaster flavor) — host side.
-///
-/// Wire format: [u8 type 'T'|'U'][u16 le port]
-///
-/// CCCaster's server.py reads exactly 3 bytes for this; the host's TCP
-/// address is the match key (the server stores "T<host_ip>:<port>" keyed
-/// by the TCP socket).
-pub fn encodeTypedHostingPort(buf: []u8, t: u8, port: u16) []u8 {
-    std.debug.assert(buf.len >= 3);
-    std.debug.assert(t == TYPE_TCP or t == TYPE_UDP);
-
-    buf[0] = t;
-    std.mem.writeInt(u16, buf[1..3], port, .little);
-    return buf[0..3];
-}
-
-/// Encode a TypedConnectionAddress message (cccaster flavor) — client side.
-///
-/// Wire format: [u8 type 'T'|'U']["ip:port" ASCII, NO null terminator]
-///
-/// `addr` is the host's public IP:port string (e.g., "203.0.113.10:46318").
-/// The client learns this out-of-band (the host shared it via Discord etc.)
-/// or via the lobby server.
-///
-/// CCCaster's server.py reads 10-22 bytes for this — it matches on
-/// string equality against the host's "T<host_ip>:<port>" entry.
-pub fn encodeTypedConnectionAddress(buf: []u8, t: u8, addr: []const u8) []u8 {
-    std.debug.assert(buf.len >= 1 + addr.len);
-    std.debug.assert(t == TYPE_TCP or t == TYPE_UDP);
-    std.debug.assert(addr.len >= 9 and addr.len <= 21); // "1.1.1.1:0" to "255.255.255.255:65535"
-
-    buf[0] = t;
-    @memcpy(buf[1 .. 1 + addr.len], addr);
-    return buf[0 .. 1 + addr.len];
-}
-
 // ============================================================================
 // Outgoing message encoders — UDP (client → server, post-MatchInfo)
 // ============================================================================
 
-/// Encode a UdpData packet (5 bytes, identical for both flavors).
+/// Encode a UdpData packet (5 bytes).
 ///
 /// Wire format: [u8 isClient][u32 le matchId]
 ///
@@ -227,10 +151,10 @@ pub fn decodeStunReply(data: []const u8) ?StunReply {
 /// Kind of message the server can send over TCP.
 pub const ServerMsgKind = enum {
     unknown,
-    match_info, // both flavors
-    tun_info, // both flavors
-    hosted, // zzcaster only
-    err, // zzcaster only
+    match_info,
+    tun_info,
+    hosted,
+    err,
 };
 
 /// Decoded server message. Only the field matching `kind` is valid.
@@ -286,7 +210,7 @@ pub fn decodeServerMsg(data: []const u8) ServerMsg {
         };
     }
 
-    // Hosted: "Hosted" + 4-byte code (zzcaster only)
+    // Hosted: "Hosted" + 4-byte code
     if (data.len >= 6 + ROOM_CODE_LEN and std.mem.eql(u8, data[0..6], HOSTED_HEADER)) {
         return .{
             .hosted = .{
@@ -295,7 +219,7 @@ pub fn decodeServerMsg(data: []const u8) ServerMsg {
         };
     }
 
-    // Error: "Error" + u8 code + msg bytes (zzcaster only)
+    // Error: "Error" + u8 code + msg bytes
     if (data.len >= 5 + 1 and std.mem.eql(u8, data[0..5], ERROR_HEADER)) {
         return .{
             .err = .{
@@ -376,24 +300,6 @@ test "encodeClientJoin produces correct bytes" {
     try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
     try std.testing.expectEqual(@as(u8, 4), encoded[1]);
     try std.testing.expectEqualStrings("ABCD", encoded[2..6]);
-}
-
-test "encodeTypedHostingPort produces correct 3 bytes (cccaster flavor)" {
-    var buf: [64]u8 = undefined;
-    const encoded = encodeTypedHostingPort(&buf, TYPE_UDP, 46318);
-    try std.testing.expectEqual(@as(usize, 3), encoded.len);
-    try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
-    // 46318 = 0xB4EE → little-endian: 0xEE 0xB4
-    try std.testing.expectEqual(@as(u8, 0xEE), encoded[1]);
-    try std.testing.expectEqual(@as(u8, 0xB4), encoded[2]);
-}
-
-test "encodeTypedConnectionAddress produces correct bytes (cccaster flavor)" {
-    var buf: [64]u8 = undefined;
-    const encoded = encodeTypedConnectionAddress(&buf, TYPE_UDP, "203.0.113.10:46318");
-    try std.testing.expectEqual(@as(usize, 1 + 18), encoded.len);
-    try std.testing.expectEqual(@as(u8, 'U'), encoded[0]);
-    try std.testing.expectEqualStrings("203.0.113.10:46318", encoded[1..]);
 }
 
 test "encodeUdpData produces correct 5 bytes" {
@@ -546,12 +452,4 @@ test "generateRoomCode produces valid codes" {
         const code = generateRoomCode(rand);
         try std.testing.expect(isValidRoomCode(&code));
     }
-}
-
-test "RelayFlavor label round-trips" {
-    try std.testing.expectEqualStrings("zzcaster", RelayFlavor.zzcaster.label());
-    try std.testing.expectEqualStrings("cccaster", RelayFlavor.cccaster.label());
-    try std.testing.expectEqual(RelayFlavor.zzcaster, RelayFlavor.fromLabel("zzcaster").?);
-    try std.testing.expectEqual(RelayFlavor.cccaster, RelayFlavor.fromLabel("cccaster").?);
-    try std.testing.expect(RelayFlavor.fromLabel("unknown") == null);
 }

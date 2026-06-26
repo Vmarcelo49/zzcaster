@@ -349,37 +349,28 @@ Same timeouts as host side.
 
 ---
 
-## 7. Compatibility with CCCaster
+## 7. Historical note on CCCaster compatibility
 
-zzcaster's protocol is **wire-compatible with CCCaster's** for the
-following messages:
+zzcaster's protocol was originally designed to be wire-compatible with
+CCCaster's `MatchInfo`, `TunInfo`, and `UdpData` formats, and the client
+supported a "cccaster flavor" that used IP-based matching instead of
+room codes. This dual-protocol support was removed after testing showed
+the public CCCaster relay servers (`melty.argoneus.com`,
+`104.238.130.23`) don't have working UDP — they can pair peers via TCP
+but cannot help with hole-punching, making them useless for NAT
+traversal.
 
-- `MatchInfo` — identical format ("MatchInfo" + u32 LE matchId)
-- `TunInfo` — identical format ("TunInfo" + u32 LE matchId + "ip:port\0")
-- `UdpData` — identical format (u8 isClient + u32 LE matchId, 5 bytes)
+zzcaster now ships with `zzcaster.duckdns.org:3939` as the only
+hardcoded relay. Users who want to use a different relay can override
+via `config.ini`:
 
-The differences are:
+```ini
+relayServers=nat.example.com:3939
+```
 
-| Aspect | CCCaster | zzcaster |
-|--------|----------|----------|
-| Host's initial TCP message | `TypedHostingPort` = `'T'/'U' + u16 port` (3 bytes, no code) | `HostRegister` = `'T'/'U' + u16 port + u8 code_len + code` (4-8 bytes) |
-| Client's initial TCP message | `TypedConnectionAddress` = `'T'/'U' + "ip:port"` (10-22 bytes) | `ClientJoin` = `'T'/'U' + u8 code_len + code` (6 bytes) |
-| Match key | string-equal on host's public IP:port | string-equal on 4-letter room code |
-| Hosted reply | (none) | `Hosted` + 4-byte code |
-| Error reply | (none — server just closes TCP) | `Error` + u8 code + msg |
-| STUN probe | (not in original) | Any non-UdpData UDP packet triggers an 8-byte reply |
-
-A zzcaster client cannot talk to a CCCaster relay (different initial
-message format). A CCCaster client cannot talk to a zzcaster relay
-(same reason). This is intentional — the protocols diverge on the most
-fundamental design point (IP-based matching vs. room codes), so
-interoperability at the wire level wouldn't help.
-
-If you ever want to support CCCaster clients on a zzcaster relay, you'd
-need to detect the initial-message format on the server side (3 bytes =
-CCCaster host, 10-22 bytes = CCCaster client, 4-8 bytes = zzcaster
-host, 6 bytes = zzcaster client) and dispatch accordingly. Not
-recommended for the first release.
+The wire format remains compatible with CCCaster's `MatchInfo` /
+`TunInfo` / `UdpData` for historical reasons, but the initial TCP
+handshake is zzcaster-only (room codes).
 
 ---
 

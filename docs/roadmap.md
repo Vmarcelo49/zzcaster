@@ -52,7 +52,7 @@ Conexão direta por IP fica como fallback (a comunidade inteira usa).
   - TCP signaling + UDP hole-punch, state machine passo-a-passo
   - step()-based (mesmo padrão do `NetplaySession` existente)
   - Devolve peer_addr para o caller handoff ao ENet
-  - Suporta tanto flavor zzcaster quanto cccaster (decidido pelo RelayEntry)
+  - Suporta o protocolo zzcaster (room codes, decided by RelayEntry)
 
 - [ ] **Slice 4 — Client: integração com NetplaySession**
   - Novos SessionState: `relay_hosting`, `relay_joining`, `relay_hole_punching`

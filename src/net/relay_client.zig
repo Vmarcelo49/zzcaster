@@ -4,16 +4,12 @@
 //
 // Drives the full relay-assisted hole-punch flow:
 //   1. TCP connect to relay
-//   2. Send initial message (HostRegister / ClientJoin / TypedHostingPort /
-//      TypedConnectionAddress — depends on flavor + role)
+//   2. Send initial message (HostRegister for host, ClientJoin for client)
 //   3. Receive MatchInfo (matchId)
 //   4. Open UDP socket, send UdpData to relay every 50ms
 //   5. Receive TunInfo (peer's public UDP endpoint)
 //   6. Send NullMsg hole-punch probes to peer every 50ms (same UDP socket)
 //   7. First UDP packet from peer → SUCCESS, hand off peer_addr to ENet
-//
-// Dual-protocol: speaks both zzcaster (room codes) and cccaster (IP:port)
-// relay protocols. The flavor is determined by the RelayEntry passed to init().
 //
 // Step-based, non-blocking, main-thread — same pattern as NetplaySession.
 // No background threads, no mutexes. The caller drives step() once per frame.
@@ -153,14 +149,12 @@ const INVALID_SOCKET: c_int = -1;
 pub const RelayError = enum {
     tcp_connect_failed, // relay unreachable (connection refused or timeout)
     tcp_timeout, // relay didn't respond to our initial message in time
-    relay_error, // relay sent an Error message (zzcaster flavor only)
+    relay_error, // relay sent an Error message
     relay_disconnected, // TCP closed by relay before match completed
-    no_match, // (cccaster client) no matching host found at that IP:port
     match_info_timeout, // waited too long for MatchInfo (relay TTL expired?)
     tun_info_timeout, // relay didn't forward TunInfo in time
     hole_punch_failed, // couldn't reach peer via UDP (symmetric NAT?)
-    invalid_room_code, // (zzcaster client) bad room code format
-    invalid_peer_address, // (cccaster client) bad ip:port format
+    invalid_room_code, // (client) bad room code format
     socket_error, // ws2_32 call failed unexpectedly
 
     pub fn label(self: RelayError) []const u8 {
@@ -169,12 +163,10 @@ pub const RelayError = enum {
             .tcp_timeout => "Relay server did not respond",
             .relay_error => "Relay server rejected the request",
             .relay_disconnected => "Relay server disconnected",
-            .no_match => "No matching host found at that address",
             .match_info_timeout => "Timed out waiting for a match",
             .tun_info_timeout => "Timed out waiting for peer endpoint",
             .hole_punch_failed => "Could not reach peer (NAT too restrictive)",
             .invalid_room_code => "Invalid room code (must be 4 letters)",
-            .invalid_peer_address => "Invalid address (expected ip:port)",
             .socket_error => "Network socket error",
         };
     }
@@ -184,12 +176,10 @@ pub const RelayError = enum {
         return switch (self) {
             .tcp_connect_failed, .tcp_timeout => "Try direct IP mode, or check if the relay server is online.",
             .relay_error, .relay_disconnected => "Try a different relay server, or use direct IP mode.",
-            .no_match => "Make sure the host has started hosting and shared their address.",
             .match_info_timeout => "No opponent connected in time. Try again or use direct IP.",
             .tun_info_timeout => "Peer may have disconnected. Try again.",
             .hole_punch_failed => "Your NAT type may be too restrictive. Try port-forwarding port 46318, or use a VPN.",
             .invalid_room_code => "Room codes must be exactly 4 letters (A-Z, 2-9, no I/O/0/1).",
-            .invalid_peer_address => "Enter the host's address as ip:port (e.g., 203.0.113.10:46318).",
             .socket_error => "Restart the application. If the problem persists, report this bug.",
         };
     }
@@ -214,7 +204,7 @@ pub const ClientRole = enum { host, client };
 
 /// Configuration for initializing a RelayClient.
 pub const RelayClientInit = struct {
-    /// Which relay server to use (flavor + address).
+    /// Which relay server to use (host + port).
     relay: relay_config.RelayEntry,
     /// Host or client role.
     role: ClientRole,
@@ -222,9 +212,8 @@ pub const RelayClientInit = struct {
     /// Host: the port to host on (e.g., 46318).
     /// Client: 0 = let OS pick any available port.
     local_port: u16,
-    /// For zzcaster client: the 4-letter room code.
-    /// For cccaster client: the host's "ip:port" string.
-    /// Ignored for host role (host generates room code internally for zzcaster).
+    /// For client: the 4-letter room code.
+    /// Ignored for host role (host generates room code internally).
     peer_identifier: []const u8 = "",
 };
 
@@ -232,7 +221,7 @@ pub const RelayClientInit = struct {
 pub const RelayState = enum {
     idle,
     tcp_connecting, // TCP connect() in progress (non-blocking)
-    waiting_for_hosted, // (zzcaster host) waiting for Hosted reply
+    waiting_for_hosted, // (host) waiting for Hosted reply
     waiting_for_match_info, // waiting for MatchInfo from relay
     waiting_for_tun_info, // got MatchInfo, sending UdpData, waiting for TunInfo
     hole_punching, // got TunInfo, sending NullMsg to peer, waiting for first packet
@@ -257,17 +246,10 @@ pub const RelayClient = struct {
     role: ClientRole,
     local_port: u16,
 
-    // For zzcaster host: the generated room code.
-    // For zzcaster client: a copy of the provided room code.
-    // For cccaster: empty.
+    // For host: the generated room code.
+    // For client: a copy of the provided room code.
     room_code: [4]u8 = [_]u8{0} ** 4,
     room_code_set: bool = false,
-
-    // For cccaster client: the host's "ip:port" string (copied at init
-    // time since the caller's slice may not outlive the RelayClient).
-    // For all other cases: empty.
-    peer_identifier_buf: [32]u8 = [_]u8{0} ** 32,
-    peer_identifier_len: usize = 0,
 
     // --- Sockets ---
     tcp_sock: c_int = INVALID_SOCKET,
@@ -307,8 +289,8 @@ pub const RelayClient = struct {
             .local_port = cfg.local_port,
         };
 
-        // For zzcaster client, validate and store the room code.
-        if (cfg.relay.flavor == .zzcaster and cfg.role == .client) {
+        // For client, validate and store the room code.
+        if (cfg.role == .client) {
             if (cfg.peer_identifier.len != protocol.ROOM_CODE_LEN or
                 !protocol.isValidRoomCode(cfg.peer_identifier))
             {
@@ -320,26 +302,8 @@ pub const RelayClient = struct {
             rc.room_code_set = true;
         }
 
-        // For cccaster client, validate the ip:port format and store it.
-        if (cfg.relay.flavor == .cccaster and cfg.role == .client) {
-            if (cfg.peer_identifier.len < 9 or cfg.peer_identifier.len > 21) {
-                rc.state = .failed;
-                rc.error_val = .invalid_peer_address;
-                return rc;
-            }
-            // Must contain a colon (ip:port)
-            if (std.mem.indexOfScalar(u8, cfg.peer_identifier, ':') == null) {
-                rc.state = .failed;
-                rc.error_val = .invalid_peer_address;
-                return rc;
-            }
-            // Copy into our buffer (caller's slice may not outlive us)
-            @memcpy(rc.peer_identifier_buf[0..cfg.peer_identifier.len], cfg.peer_identifier);
-            rc.peer_identifier_len = cfg.peer_identifier.len;
-        }
-
-        // For zzcaster host, generate a room code.
-        if (cfg.relay.flavor == .zzcaster and cfg.role == .host) {
+        // For host, generate a room code.
+        if (cfg.role == .host) {
             const seed: u64 = @intCast(std.Io.Clock.now(.real, io).toMilliseconds());
             var prng = std.Random.DefaultPrng.init(seed);
             rc.room_code = protocol.generateRoomCode(prng.random());
@@ -433,9 +397,8 @@ pub const RelayClient = struct {
         return null;
     }
 
-    /// For zzcaster host: returns the generated room code.
-    /// For zzcaster client: returns the provided room code.
-    /// For cccaster: returns null (no room code concept).
+    /// For host: returns the generated room code.
+    /// For client: returns the provided room code.
     pub fn getRoomCode(self: *const RelayClient) ?[4]u8 {
         if (!self.room_code_set) return null;
         return self.room_code;
@@ -546,10 +509,7 @@ pub const RelayClient = struct {
             },
             .err => |e| {
                 _ = e;
-                // For cccaster flavor, the relay just closes the TCP
-                // connection if no matching host is found. That's handled
-                // by tryReadTCP returning false on EOF. If we get an
-                // explicit Error message (zzcaster flavor), report it.
+                // Relay sent an Error message. Report it.
                 self.fail(.relay_error);
             },
             else => {
@@ -660,46 +620,21 @@ pub const RelayClient = struct {
 
         switch (self.role) {
             .host => {
-                switch (self.relay.flavor) {
-                    .zzcaster => {
-                        // HostRegister: 'U' + u16 port + u8 code_len + code
-                        msg = protocol.encodeHostRegister(
-                            &buf,
-                            protocol.TYPE_UDP,
-                            self.local_port,
-                            &self.room_code,
-                        );
-                    },
-                    .cccaster => {
-                        // TypedHostingPort: 'U' + u16 port
-                        msg = protocol.encodeTypedHostingPort(
-                            &buf,
-                            protocol.TYPE_UDP,
-                            self.local_port,
-                        );
-                    },
-                }
+                // HostRegister: 'U' + u16 port + u8 code_len + code
+                msg = protocol.encodeHostRegister(
+                    &buf,
+                    protocol.TYPE_UDP,
+                    self.local_port,
+                    &self.room_code,
+                );
             },
             .client => {
-                switch (self.relay.flavor) {
-                    .zzcaster => {
-                        // ClientJoin: 'U' + u8 code_len + code
-                        msg = protocol.encodeClientJoin(
-                            &buf,
-                            protocol.TYPE_UDP,
-                            &self.room_code,
-                        );
-                    },
-                    .cccaster => {
-                        // TypedConnectionAddress: 'U' + "ip:port"
-                        const peer_id = self.peer_identifier_buf[0..self.peer_identifier_len];
-                        msg = protocol.encodeTypedConnectionAddress(
-                            &buf,
-                            protocol.TYPE_UDP,
-                            peer_id,
-                        );
-                    },
-                }
+                // ClientJoin: 'U' + u8 code_len + code
+                msg = protocol.encodeClientJoin(
+                    &buf,
+                    protocol.TYPE_UDP,
+                    &self.room_code,
+                );
             },
         }
 
@@ -709,17 +644,10 @@ pub const RelayClient = struct {
             return;
         }
 
-        // Transition to next state based on flavor + role
+        // Transition to next state based on role
         switch (self.role) {
-            .host => {
-                switch (self.relay.flavor) {
-                    .zzcaster => self.state = .waiting_for_hosted,
-                    .cccaster => self.state = .waiting_for_match_info,
-                }
-            },
-            .client => {
-                self.state = .waiting_for_match_info;
-            },
+            .host => self.state = .waiting_for_hosted,
+            .client => self.state = .waiting_for_match_info,
         }
         self.phase_start_ms = now_ms;
     }

@@ -558,6 +558,20 @@ pub const NetplayManager = struct {
 
     last_packet_ms: i64 = 0,
 
+    // Retry-menu sync gate: true quando entramos em .retry_menu mas o peer
+    // remoto ainda não confirmou (via TransitionIndex) que também chegou lá.
+    // Enquanto true, getNetplayInput suprime TODOS os inputs locais — o
+    // player mais rápido não pode skipar a animação de vitória nem apertar
+    // rematch antes do player mais lento chegar no menu. Impede a dessincronia
+    // onde o player rápido avança para .loading enquanto o lento ainda vê a
+    // tela de vitória.
+    retry_menu_waiting_for_peer: bool = false,
+    // Wall-clock ms de quando o retry-menu wait começou (0 = ainda não
+    // iniciado). Usado para o timeout de segurança de 10s — se o peer
+    // crashar ou o TransitionIndex se perder, os inputs são liberados
+    // para não travar o jogo indefinidamente.
+    retry_menu_wait_start_ms: i64 = 0,
+
     local_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
     remote_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
     local_sync_count: u8 = 0, // entries valid from index 0
@@ -1096,6 +1110,30 @@ pub const NetplayManager = struct {
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits
             },
             .in_game, .retry_menu => {
+                // Retry-menu sync gate: se estamos em .retry_menu esperando
+                // o peer remoto alcançar nosso transition index, suprime
+                // TODOS os inputs locais. Impede que o player mais rápido
+                // skip a animação de vitória e aperte rematch antes do
+                // player mais lento chegar no menu — o que causaria
+                // dessincronia (.retry_menu → .loading de um lado enquanto
+                // o outro ainda vê a vitória).
+                //
+                // Timeout de segurança de 10s: se o peer crashar ou o
+                // TransitionIndex se perder, libera os inputs para não
+                // travar o jogo indefinidamente.
+                if (self.state == .retry_menu and self.retry_menu_waiting_for_peer) {
+                    const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
+                    if (self.retry_menu_wait_start_ms == 0) {
+                        self.retry_menu_wait_start_ms = now;
+                    }
+                    if (now - self.retry_menu_wait_start_ms > 10_000) {
+                        self.retry_menu_waiting_for_peer = false;
+                        self.retry_menu_wait_start_ms = 0;
+                        self.log.warn("Retry menu peer wait timed out (10s) — unblocking inputs", .{});
+                    } else {
+                        return 0; // suprime input
+                    }
+                }
                 // Real input — game logic handles filtering.
                 return raw_input;
             },
@@ -1192,8 +1230,16 @@ pub const NetplayManager = struct {
         // and sends its own RNG, and naturally blocks on remote input
         // because the client can't send inputs while it's waiting for
         // RNG).
+        //
+        // This gate only applies during .chara_intro and .in_game — NOT
+        // during .chara_select. The host never sends RNG during chara_select
+        // (intro_rng_enabled is false), so gating during chara_select would
+        // deadlock the client until the 10s timeout force-exits the game.
+        // RNG sync is only meaningful for gameplay (chara_intro/in_game).
         // ----------------------------------------------------------------
-        if (self.should_sync_rng and !self.config.is_host and !self.rng_synced) {
+        if (self.state != .chara_select and
+            self.should_sync_rng and !self.config.is_host and !self.rng_synced)
+        {
             return false;
         }
 
@@ -1916,6 +1962,25 @@ pub const NetplayManager = struct {
             self.intro_rng_enabled = false;
         }
 
+        // Retry-menu sync gate: quando entramos em .retry_menu, verifica se
+        // o peer remoto já chegou no nosso transition index. Se não, ativa
+        // a flag que suprime inputs locais até o peer alcançar (confirmado
+        // via setRemoteIndex). Impede que o player mais rápido skip a
+        // animação de vitória e aperte rematch antes do lento chegar no menu.
+        if (new == .retry_menu and self.config.is_netplay and !self.config.is_spectator) {
+            const remote_end_index = if (self.remote_inputs.getEndIndex() > 0)
+                self.remote_inputs.getEndIndex() - 1
+            else
+                0;
+            if (remote_end_index < self.indexed_frame.index) {
+                self.retry_menu_waiting_for_peer = true;
+                self.retry_menu_wait_start_ms = 0; // será setado no primeiro getNetplayInput
+                self.log.info("Retry menu: blocking inputs until peer catches up (remote_end_index={d}, our_index={d})", .{
+                    remote_end_index, self.indexed_frame.index,
+                });
+            }
+        }
+
         if (self.enet_connected and !self.config.is_spectator and self.config.is_netplay) {
             var buf: [5]u8 = undefined;
             buf[0] = 0x03; // TransitionIndex
@@ -1957,6 +2022,13 @@ pub const NetplayManager = struct {
     pub fn setRemoteIndex(self: *NetplayManager, remote_idx: u32) void {
         self.remote_index = remote_idx;
         self.remote_inputs.resizeOuter(remote_idx);
+        // Desbloqueia os inputs do retry menu se estávamos esperando o peer
+        // alcançar nosso transition index e ele acabou de chegar.
+        if (self.retry_menu_waiting_for_peer and remote_idx >= self.indexed_frame.index) {
+            self.retry_menu_waiting_for_peer = false;
+            self.retry_menu_wait_start_ms = 0;
+            self.log.info("Peer reached retry_menu (index {d}) — inputs unblocked", .{remote_idx});
+        }
         self.log.info("Remote transition index: {d} (remote_inputs.end_index now {d})", .{
             remote_idx, self.remote_inputs.getEndIndex(),
         });
@@ -2145,6 +2217,27 @@ pub const NetplayManager = struct {
     fn onEnterInGame(self: *NetplayManager) void {
         self.local_inputs.reset();
         self.remote_inputs.reset();
+
+        // Reset defensivo do retry-menu sync gate — garante que a flag não
+        // vaze para a próxima match caso o peer tenha chegado ao retry_menu
+        // mas não tenha transicionado a tempo.
+        self.retry_menu_waiting_for_peer = false;
+        self.retry_menu_wait_start_ms = 0;
+
+        // Clear sync-hash desync detection queues and the desync flag.
+        // Without this, leftover entries from a previous match cause a
+        // false desync on the first .in_game frame of the new match —
+        // checkSyncHashDesync compares old local/remote hashes that were
+        // never matched/consumed when the previous match ended, flags a
+        // mismatch, and force-exits the game.
+        // Also reset fast_fwd_stop_frame in case a rollback rerun was
+        // in-flight when the previous match ended.
+        self.local_sync_count = 0;
+        self.remote_sync_count = 0;
+        self.desync_detected = false;
+        self.desync_local = null;
+        self.desync_remote = null;
+        self.fast_fwd_stop_frame = 0;
 
         if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
             if (self.state_pool.pool.len == 0) {

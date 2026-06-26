@@ -352,6 +352,20 @@ pub fn build(b: *std.Build) void {
     });
     const run_net_config_tests = b.addRunArtifact(net_config_tests);
 
+    // Integration tests for the full relay stack (protocol + config +
+    // client non-network logic). Imports relay_client.zig for RelayError,
+    // but only tests non-ws2_32 parts (room codes, wire format, parsing).
+    const net_integration_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/net/relay_integration_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const net_integration_tests = b.addTest(.{
+        .root_module = net_integration_test_mod,
+    });
+    const run_net_integration_tests = b.addRunArtifact(net_integration_tests);
+
     // air_dash_macro.zig is pure std (no Win32/SDL/game-memory deps), so like
     // the common module it host-tests cleanly. Build a fresh test module
     // rather than reusing the cross-compiled dll module.
@@ -383,6 +397,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_common_tests.step);
     test_step.dependOn(&run_net_protocol_tests.step);
     test_step.dependOn(&run_net_config_tests.step);
+    test_step.dependOn(&run_net_integration_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
     test_step.dependOn(&run_simulation_tests.step);
 

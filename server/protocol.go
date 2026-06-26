@@ -37,12 +37,21 @@ var (
 )
 
 // Error codes — sent as a single byte after the "Error" header.
-const (
-        ErrRoomNotFound  byte = 1
-        ErrRoomExpired   byte = 2
-        ErrProtocolError byte = 3
-        ErrRoomTaken     byte = 4
-)
+//
+// These are the wire-format values. The *RoomError instances in room.go
+// (ErrRoomNotFound, ErrRoomExpired, etc.) implement the error interface
+// and carry both the code (in .Code) and a human-readable message (in
+// .Msg). Use those for return values; use their .Code field when calling
+// EncodeError.
+//
+// DO NOT redeclare these as standalone constants here — that would
+// conflict with the *RoomError vars in room.go (same names, different
+// types). The codes are documented here for reference only.
+//
+//   1 = ErrRoomNotFound  — ClientJoin referenced a code that doesn't exist
+//   2 = ErrRoomExpired   — Room existed but TTL elapsed
+//   3 = ErrProtocolError — Malformed message or unexpected state
+//   4 = ErrRoomTaken     — HostRegister with a code that already exists
 
 // Room code configuration.
 const (

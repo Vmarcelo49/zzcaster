@@ -1,4 +1,4 @@
-// Package protocol defines the binary wire format for the zzcaster relay.
+// Package main — protocol wire format for the zzcaster relay.
 //
 // This is a CCCaster-compatible protocol with one extension: room codes.
 // The original CCCaster protocol matches host and client purely on the
@@ -10,7 +10,7 @@
 // All integers are LITTLE-ENDIAN (matching CCCaster).
 //
 // See docs/nat-traversal-protocol.md for the full spec.
-package protocol
+package main
 
 import (
         "encoding/binary"

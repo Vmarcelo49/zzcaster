@@ -398,7 +398,17 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         }
     }
 
-    if (n.checkRollback()) {
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] calling checkRollback...", .{});
+    }
+    const rollback_triggered = n.checkRollback();
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] checkRollback returned {} fast_fwd_stop_frame={d}", .{
+            rollback_triggered, n.fast_fwd_stop_frame,
+        });
+    }
+
+    if (rollback_triggered) {
         state.skip_frames_addr.* = 1;
         return;
     }
@@ -438,6 +448,12 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             }
             return;
         }
+    }
+
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] after rerun check: isRerunning={} rollback_timer={d}", .{
+            n.isRerunning(), n.rollback_timer,
+        });
     }
 
     if (n.rollback_timer < n.min_rollback_spacing) {

@@ -2904,6 +2904,11 @@ pub const NetplayManager = struct {
         const lcf = self.remote_inputs.last_changed_frame;
         if (lcf == null) return false;
 
+        // DIAG: log that we have a misprediction, before processing it
+        self.log.info("[DIAG checkRollback] lcf={?x} indexed_frame={d}:{d}", .{
+            lcf, self.indexed_frame.index, self.indexed_frame.frame,
+        });
+
         const lcf_frame = @as(u32, @intCast(lcf.? & 0xFFFFFFFF));
         const lcf_index = @as(u32, @intCast(lcf.? >> 32));
         if (lcf_index != self.indexed_frame.index) {
@@ -2918,17 +2923,30 @@ pub const NetplayManager = struct {
             // stale-index keys from being stored in the first place. Together
             // they ensure last_changed_frame only ever tracks the CURRENT
             // index's earliest misprediction.
+            self.log.info("[DIAG checkRollback] stale lcf_index={d} != current={d}, clearing", .{
+                lcf_index, self.indexed_frame.index,
+            });
             self.remote_inputs.clearLastChanged();
             return false;
         }
-        if (lcf_frame >= self.indexed_frame.frame) return false;
+        if (lcf_frame >= self.indexed_frame.frame) {
+            self.log.info("[DIAG checkRollback] lcf_frame={d} >= current={d}, no rollback", .{
+                lcf_frame, self.indexed_frame.frame,
+            });
+            return false;
+        }
 
+        self.log.info("[DIAG checkRollback] attempting loadStateForFrame({d}, {d})", .{
+            lcf_frame, lcf_index,
+        });
         const loaded_frame = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
         if (loaded_frame == null) {
             self.remote_inputs.clearLastChanged();
             self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
             return false;
         }
+
+        self.log.info("[DIAG checkRollback] loadStateForFrame returned {d}, boosting priority", .{loaded_frame.?});
 
         // Strategy 2B (docs/dll-optimization-plan.md): raise the calling
         // thread to TIME_CRITICAL priority for the duration of the rerun.

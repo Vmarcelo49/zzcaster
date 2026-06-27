@@ -2322,7 +2322,21 @@ pub const NetplayManager = struct {
 
         const lcf_frame = @as(u32, @intCast(lcf.? & 0xFFFFFFFF));
         const lcf_index = @as(u32, @intCast(lcf.? >> 32));
-        if (lcf_index != self.indexed_frame.index) return false;
+        if (lcf_index != self.indexed_frame.index) {
+            // Stale lcf from a previous transition index. Clear it so it
+            // doesn't block future current-index changes from being detected.
+            // Without this, a stale lcf (with a smaller key than any
+            // current-index key) would persist indefinitely — setRemote's
+            // `key < last_changed_frame` check would always be false for the
+            // current index, and rollback would never fire.
+            //
+            // This pairs with the fix in InputBuffer.setRemote which prevents
+            // stale-index keys from being stored in the first place. Together
+            // they ensure last_changed_frame only ever tracks the CURRENT
+            // index's earliest misprediction.
+            self.remote_inputs.clearLastChanged();
+            return false;
+        }
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
         const loaded_frame = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);

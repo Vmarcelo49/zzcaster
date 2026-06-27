@@ -1178,3 +1178,6 @@ test "Mock Rollback Out-of-Bounds Canceled" {
     try expectEqual(@as(u32, 18), peer.frame);
     try expect(peer.last_changed_frame == null);
 }
+
+// Import the desync tests so they run as part of the same test binary.
+pub const desync_tests = @import("rollback_desync_tests.zig");

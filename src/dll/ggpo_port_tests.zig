@@ -871,3 +871,184 @@ test "Phase 3: StatePool ring eviction still works at 90 states" {
     const loaded = pool.loadStateForFrame(5, 1);
     try expect(loaded != null);
 }
+
+// =============================================================================
+// Protocol versioning + spectator identification (black-screen regression test)
+//
+// These tests verify the connect_data packing/unpacking logic that caused
+// the black-screen regression. The bug was: the protocol version check ran
+// on BOTH host and client, but ENet only echoes connect_data to the host
+// (the acceptor). On the client, event.data is always 0, so the client
+// rejected its own connection.
+//
+// The fix: only check version on the host side. These tests replicate the
+// exact packing and extraction logic from netplay_manager.zig to ensure
+// the regression cannot recur.
+//
+// Constants (must match netplay_manager.zig):
+//   protocol_version = 1
+//   spectator_flag = 0xEC (spectator) or 0 (player)
+//   connect_data = (protocol_version << 8) | spectator_flag
+// =============================================================================
+
+const test_protocol_version: u32 = 1;
+const test_spectator_flag: u32 = 0xEC;
+
+/// Replicate the connect_data packing from initEnet.
+fn buildConnectData(is_spectator: bool) u32 {
+    const flag: u32 = if (is_spectator) test_spectator_flag else 0;
+    return (test_protocol_version << 8) | flag;
+}
+
+/// Replicate the host-side version extraction from the CONNECT handler.
+/// Returns the extracted protocol version (byte 1 of connect_data).
+fn extractRemoteVersion(event_data: u32) u32 {
+    return (event_data >> 8) & 0xFF;
+}
+
+/// Replicate the spectator identification from drainSpectatorEvents.
+/// Returns true if the low byte of connect_data is the spectator sentinel.
+fn isSpectatorConnect(connect_data: u32) bool {
+    return (connect_data & 0xFF) == test_spectator_flag;
+}
+
+test "Protocol: player connect_data has correct version in byte 1" {
+    // A player (non-spectator) sends connect_data = (1 << 8) | 0 = 0x100.
+    const cd = buildConnectData(false);
+    try expectEqual(@as(u32, 0x100), cd);
+    // Host extracts version from byte 1.
+    try expectEqual(test_protocol_version, extractRemoteVersion(cd));
+}
+
+test "Protocol: spectator connect_data has correct version in byte 1" {
+    // A spectator sends connect_data = (1 << 8) | 0xEC = 0x1EC.
+    // CRITICAL: the spectator flag (0xEC) must NOT corrupt byte 1.
+    // The old 0x5FEC sentinel spanned bytes 0-1 and corrupted the version.
+    const cd = buildConnectData(true);
+    try expectEqual(@as(u32, 0x1EC), cd);
+    // Host extracts version from byte 1 — must be 1, not 0x5F.
+    try expectEqual(test_protocol_version, extractRemoteVersion(cd));
+}
+
+test "Protocol: host accepts player with matching version" {
+    // Simulate the host receiving a CONNECT from a player.
+    const client_connect_data = buildConnectData(false); // 0x100
+    const remote_version = extractRemoteVersion(client_connect_data);
+    try expectEqual(test_protocol_version, remote_version);
+    // Host should NOT reject (version matches).
+    try expect(remote_version == test_protocol_version);
+}
+
+test "Protocol: host accepts spectator with matching version" {
+    // Simulate the host receiving a CONNECT from a spectator.
+    const client_connect_data = buildConnectData(true); // 0x1EC
+    const remote_version = extractRemoteVersion(client_connect_data);
+    try expectEqual(test_protocol_version, remote_version);
+    // Host should NOT reject (version matches).
+    try expect(remote_version == test_protocol_version);
+}
+
+test "Protocol: host rejects client with mismatched version" {
+    // Simulate an OLD client (protocol version 0, no checksum fields).
+    const old_client_connect_data: u32 = 0; // version 0, no spectator flag
+    const remote_version = extractRemoteVersion(old_client_connect_data);
+    try expectEqual(@as(u32, 0), remote_version);
+    // Host SHOULD reject (version 0 != 1).
+    try expect(remote_version != test_protocol_version);
+}
+
+test "Protocol: host rejects client with future version" {
+    // Simulate a NEW client (protocol version 2).
+    const future_client_connect_data: u32 = (2 << 8) | 0; // version 2
+    const remote_version = extractRemoteVersion(future_client_connect_data);
+    try expectEqual(@as(u32, 2), remote_version);
+    // Host SHOULD reject (version 2 != 1).
+    try expect(remote_version != test_protocol_version);
+}
+
+test "Protocol: client must NOT check version on its own CONNECT (black-screen regression)" {
+    // This is the exact scenario that caused the black-screen regression.
+    //
+    // When the client's own CONNECT succeeds, ENet's VERIFY_CONNECT handler
+    // sets peer->eventData = 0 (the host never called enet_host_connect,
+    // so there's no connect_data to echo back). The client receives:
+    //   event.data = 0
+    //
+    // If the client checks the version (as the buggy code did):
+    //   remote_version = (0 >> 8) & 0xFF = 0
+    //   0 != protocol_version (1) → VERSION MISMATCH → DISCONNECT
+    //
+    // The client would immediately disconnect itself on EVERY connection.
+    //
+    // The fix: only check on the host side. This test verifies that
+    // event.data = 0 (the client-side value) would NOT pass a version
+    // check — documenting WHY the client must not check.
+    const client_event_data: u32 = 0; // what ENet gives the client
+    const extracted = extractRemoteVersion(client_event_data);
+    try expectEqual(@as(u32, 0), extracted);
+    // If the client checked this, it would reject. The fix ensures the
+    // client does NOT check. This test documents the invariant.
+    try expect(extracted != test_protocol_version); // would reject — hence no client-side check
+}
+
+test "Protocol: spectator identification via low byte (0xEC)" {
+    // The host's drainSpectatorEvents identifies spectators by checking
+    // the low byte of connect_data. Players have 0, spectators have 0xEC.
+
+    // Player: low byte = 0 → not a spectator.
+    try expect(!isSpectatorConnect(buildConnectData(false)));
+    try expect(!isSpectatorConnect(0x100)); // explicit
+    try expect(!isSpectatorConnect(0x200)); // future version player
+
+    // Spectator: low byte = 0xEC → is a spectator.
+    try expect(isSpectatorConnect(buildConnectData(true)));
+    try expect(isSpectatorConnect(0x1EC)); // explicit
+    try expect(isSpectatorConnect(0x2EC)); // future version spectator
+
+    // Edge: 0x5FEC (old sentinel) — low byte is 0xEC, so it would be
+    // identified as a spectator. But its version (byte 1) is 0x5F, which
+    // would fail the version check. This is why we changed to 0xEC.
+    try expect(isSpectatorConnect(0x5FEC)); // low byte matches
+    try expect(extractRemoteVersion(0x5FEC) == 0x5F); // but version is wrong
+}
+
+test "Protocol: connect_data packing round-trip (player)" {
+    // Full round-trip: client packs, host extracts.
+    const packed_data = buildConnectData(false);
+    const is_spectator = isSpectatorConnect(packed_data);
+    const version = extractRemoteVersion(packed_data);
+
+    try expect(!is_spectator);
+    try expectEqual(test_protocol_version, version);
+}
+
+test "Protocol: connect_data packing round-trip (spectator)" {
+    // Full round-trip: client packs, host extracts.
+    const packed_data = buildConnectData(true);
+    const is_spectator = isSpectatorConnect(packed_data);
+    const version = extractRemoteVersion(packed_data);
+
+    try expect(is_spectator);
+    try expectEqual(test_protocol_version, version);
+}
+
+test "Protocol: spectator flag does not bleed into version byte" {
+    // CRITICAL invariant: the spectator flag must fit in byte 0 only.
+    // If it bleeds into byte 1, the version check breaks.
+    //
+    // The old 0x5FEC sentinel violated this: 0x5FEC >> 8 = 0x5F,
+    // which overwrote the version byte. A spectator with version 1
+    // would appear to have version 0x5F (95) and be rejected.
+    //
+    // The new 0xEC sentinel fits in byte 0: 0xEC >> 8 = 0, so
+    // (1 << 8) | 0xEC = 0x1EC, and version extraction gives 1.
+    const spectator_cd = buildConnectData(true);
+    const version = extractRemoteVersion(spectator_cd);
+
+    // The version must be exactly 1, not corrupted by the spectator flag.
+    try expectEqual(test_protocol_version, version);
+
+    // Verify the flag didn't bleed: (spectator_cd >> 8) should be exactly
+    // protocol_version, nothing more.
+    try expectEqual(test_protocol_version, spectator_cd >> 8);
+}

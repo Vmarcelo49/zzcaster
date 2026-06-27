@@ -555,3 +555,97 @@ test "Phase 2: full scenario — we're ahead, recommend sleep" {
     const result = computeRecommendFrameWaitMs(advantage);
     try expectEqual(@as(i32, 137), result);
 }
+
+// =============================================================================
+// Phase 2: Per-frame sleep (cooperative time-sync)
+//
+// recommendPerFrameSleepMs returns a small, safe per-frame sleep (capped at
+// 4ms) that can be applied EVERY frame without missing vsync. This is the
+// ACTUAL time-sync mechanism — sleeping in frameStepNetplay slows the game,
+// which slows world_timer, which aligns us with the remote peer.
+//
+// Formula (matching netplay_manager.zig):
+//   if RTT not initialized: return 0
+//   if advantage >= -min_frame_advantage (not significantly ahead): return 0
+//   ahead = -advantage
+//   sleep_ms = min(ahead * 1.0, max_per_frame_sleep_ms=4.0)
+//   if sleep_ms < 1.0: return 0 (sub-1ms unreliable on Windows)
+//   return @intFromFloat(sleep_ms)
+// =============================================================================
+
+fn computePerFrameSleepMs(advantage: f32, rtt_initialized: bool) u32 {
+    if (!rtt_initialized) return 0;
+    const min_frame_advantage: f32 = 3.0;
+    const max_per_frame_sleep_ms: f32 = 4.0;
+    if (advantage >= -min_frame_advantage) return 0;
+    const ahead = -advantage;
+    const sleep_ms = @min(ahead * 1.0, max_per_frame_sleep_ms);
+    if (sleep_ms < 1.0) return 0;
+    return @intFromFloat(sleep_ms);
+}
+
+test "Phase 2: per-frame sleep returns 0 when RTT not initialized" {
+    // First few frames — RTT EMA hasn't been seeded yet.
+    try expectEqual(@as(u32, 0), computePerFrameSleepMs(-10.0, false));
+}
+
+test "Phase 2: per-frame sleep returns 0 when behind or aligned" {
+    // Behind (advantage > 0) — can't speed up.
+    try expectEqual(@as(u32, 0), computePerFrameSleepMs(10.0, true));
+    // Aligned (advantage = 0).
+    try expectEqual(@as(u32, 0), computePerFrameSleepMs(0.0, true));
+    // Slightly ahead but below threshold (advantage = -2.5, threshold = -3.0).
+    try expectEqual(@as(u32, 0), computePerFrameSleepMs(-2.5, true));
+}
+
+test "Phase 2: per-frame sleep returns 0 at exact threshold boundary" {
+    // advantage = -3.0 → advantage >= -min(3.0) is TRUE → return 0.
+    try expectEqual(@as(u32, 0), computePerFrameSleepMs(-3.0, true));
+}
+
+test "Phase 2: per-frame sleep returns 3ms just past threshold" {
+    // The formula is sleep_ms = ahead (1ms per frame of advantage), capped at 4ms.
+    // min_frame_advantage = 3.0, so the threshold is advantage < -3.0.
+    // Just past threshold: advantage = -3.5 → ahead = 3.5 → sleep = 3ms
+    // (3.5 truncates to 3 via @intFromFloat).
+    try expectEqual(@as(u32, 3), computePerFrameSleepMs(-3.5, true));
+}
+
+test "Phase 2: per-frame sleep caps at 4ms for large advantage" {
+    // advantage = -10 → ahead = 10 → sleep = min(10, 4) = 4ms.
+    try expectEqual(@as(u32, 4), computePerFrameSleepMs(-10.0, true));
+    // advantage = -50 → ahead = 50 → sleep = min(50, 4) = 4ms.
+    try expectEqual(@as(u32, 4), computePerFrameSleepMs(-50.0, true));
+    // advantage = -100 → ahead = 100 → sleep = min(100, 4) = 4ms.
+    try expectEqual(@as(u32, 4), computePerFrameSleepMs(-100.0, true));
+}
+
+test "Phase 2: per-frame sleep is proportional for small advantages" {
+    // advantage = -3.5 → ahead = 3.5 → sleep = 3ms (not capped).
+    try expectEqual(@as(u32, 3), computePerFrameSleepMs(-3.5, true));
+    // advantage = -4.0 → ahead = 4.0 → sleep = 4ms (at cap).
+    try expectEqual(@as(u32, 4), computePerFrameSleepMs(-4.0, true));
+    // No values between 3 and 4 because: below 3 → 0, at 3 → 0 (boundary),
+    // 3.01-3.99 → 3, 4.0+ → 4 (capped).
+}
+
+test "Phase 2: per-frame sleep correction timing" {
+    // Verify the correction timing claim in the doc comment:
+    // "At 4ms/frame, a 10-frame advantage corrects in ~42 frames (~0.7s)"
+    //
+    // If we're 10 frames ahead and sleep 4ms per frame:
+    //   Each frame takes 16.67 + 4 = 20.67ms (us) vs 16.67ms (remote)
+    //   Remote gains 4ms per frame = 4/16.67 ≈ 0.24 frames per frame
+    //   To catch up 10 frames: 10 / 0.24 ≈ 42 frames
+    //   At 60fps: 42 / 60 ≈ 0.7s
+    const advantage = @as(f32, -10.0);
+    const sleep_ms = computePerFrameSleepMs(advantage, true);
+    try expectEqual(@as(u32, 4), sleep_ms);
+
+    // Remote gains (sleep_ms / 16.67) frames per frame we simulate.
+    const gain_per_frame = @as(f32, @floatFromInt(sleep_ms)) / 16.67;
+    // Frames to correct 10-frame advantage.
+    const frames_to_correct = 10.0 / gain_per_frame;
+    // Should be ~42 frames.
+    try expect(frames_to_correct > 35.0 and frames_to_correct < 50.0);
+}

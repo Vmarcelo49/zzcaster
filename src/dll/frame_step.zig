@@ -108,13 +108,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // Feeds the time-sync recommendation below.
     n.updateRttEma();
 
-    // Time-sync recommendation (ported from ggpo-x, Phase 2).
-    // Every `recommendation_interval` (120) frames, log a sleep
-    // recommendation. CAVEAT: zzcaster can't actually slow down MBAACC's
-    // frame loop (the game owns the timer), so this is diagnostic only.
-    // A future hook into the game's frame timer could honor the sleep;
-    // for now, the log lets us observe peer drift in playtesting.
-    // See docs/ggpo-port-plan.md Phase 2 "Caveat" for details.
+    // Diagnostic: log time-sync state every 120 frames.
     if (n.indexed_frame.frame > 0 and n.indexed_frame.frame % 120 == 0) {
         const wait_ms = n.recommendFrameWaitMs();
         const advantage = n.localFrameAdvantage();
@@ -317,6 +311,35 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
                 state.alive_flag_addr.* = 0;
                 return;
             }
+        }
+    }
+
+    // Cooperative time-sync: if we're ahead of the remote peer, sleep a
+    // small amount to slow the game down. This lets the remote catch up.
+    //
+    // The game's frame loop is synchronous — frameStepNetplay is called once
+    // per frame and the game waits for it to return. Sleeping here delays
+    // the game's frame, which slows world_timer (the game's internal frame
+    // counter at 0x55D1D4), which slows our indexed_frame.frame. The remote
+    // peer (running at full 60fps) simulates faster, catches up, and the
+    // advantage decreases.
+    //
+    // The sleep is capped at 4ms/frame (~24% of the 16.6ms budget) to stay
+    // safely within vsync. We only sleep when:
+    //   - We're in-game (not during loading/menus)
+    //   - Not during a rollback re-run (we're catching up, not slowing down)
+    //   - RTT is initialized (advantage is meaningful)
+    //   - We're significantly ahead (advantage < -min_frame_advantage)
+    //
+    // This is the same mechanism as the lockstep wait above — both block the
+    // game thread. The difference: lockstep waits for a specific remote input,
+    // time-sync sleeps a small fixed amount to drift toward alignment.
+    if (n.state == .in_game and !n.isRerunning()) {
+        const sleep_ms = n.recommendPerFrameSleepMs();
+        if (sleep_ms > 0) {
+            std.Io.sleep(state.app_io_backend.io(), .{
+                .nanoseconds = sleep_ms * std.time.ns_per_ms,
+            }, .real) catch {};
         }
     }
 

@@ -451,6 +451,12 @@ const max_frame_advantage: f32 = 30.0;
 // Avoids oscillating sleep recommendations when peers are nearly aligned.
 const min_frame_advantage: f32 = 3.0;
 
+// Max per-frame sleep for cooperative time-sync (ms). Capped at 4ms to stay
+// safely within the 16.6ms frame budget (~24%). Sleeping more than ~6ms
+// risks missing vsync and dropping to 30fps, which would feel like stutter.
+// At 4ms/frame, a 10-frame advantage corrects in ~42 frames (~0.7s).
+const max_per_frame_sleep_ms: f32 = 4.0;
+
 // Round-over: extra frames to wait before committing the InGame→Skippable
 // transition when rollback is enabled. Matches ROLLBACK_ROUND_OVER_DELAY in
 // DllMain.cpp:38.
@@ -2642,6 +2648,41 @@ pub const NetplayManager = struct {
         // (we can't speed up the game's frame loop).
         if (clamped <= 0) return 0;
         return @intFromFloat(clamped * (1000.0 / 60.0));
+    }
+
+    /// Per-frame sleep recommendation for cooperative time-sync.
+    ///
+    /// Unlike recommendFrameWaitMs (which returns the TOTAL sleep needed),
+    /// this returns a small, safe per-frame sleep that can be applied EVERY
+    /// frame without causing the game to miss vsync.
+    ///
+    /// The game's frame loop is synchronous: frameStepNetplay is called once
+    /// per frame, and the game waits for it to return. Sleeping here delays
+    /// the game's frame, which slows world_timer (the game's internal frame
+    /// counter), which slows our indexed_frame.frame. This lets the remote
+    /// peer catch up — true cooperative time-sync.
+    ///
+    /// The sleep is proportional to how far ahead we are, capped at
+    /// max_per_frame_sleep_ms (4ms) to stay safely within the 16.6ms frame
+    /// budget. At 4ms/frame, a 10-frame advantage corrects in ~42 frames
+    /// (~0.7s). The cap prevents stutter even under extreme drift.
+    ///
+    /// Returns 0 when:
+    ///   - We're behind or aligned (no need to slow down)
+    ///   - Drift is below min_frame_advantage (avoids micro-stutter)
+    ///   - RTT is not yet initialized (first few frames)
+    pub fn recommendPerFrameSleepMs(self: *const NetplayManager) u32 {
+        if (!self.rtt_ema_initialized) return 0;
+        const advantage = self.localFrameAdvantage();
+        // Only sleep when we're AHEAD (advantage < 0).
+        // Behind = remote is ahead = we need to speed up (can't) = 0.
+        if (advantage >= -min_frame_advantage) return 0;
+        const ahead = -advantage; // positive = frames ahead
+        // 1ms per frame of advantage, capped at 4ms.
+        // At 60fps, 4ms is ~24% of the frame budget — safe even with jitter.
+        const sleep_ms = @min(ahead * 1.0, max_per_frame_sleep_ms);
+        if (sleep_ms < 1.0) return 0; // sub-1ms sleeps are unreliable on Windows
+        return @intFromFloat(sleep_ms);
     }
 
     fn onEnterInGame(self: *NetplayManager) void {

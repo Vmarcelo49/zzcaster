@@ -435,7 +435,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         } else {
             // Rerun still in progress. Save state for this re-simulated frame so we have
             // correct intermediate checkpoints.
-            const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+            const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, n.start_world_time);
             // Record the re-simulated frame's checksum ONLY if the save succeeded.
             // saveState returns null on overflow/OOM; in that case saved_states[len-1]
             // is the PREVIOUS state (wrong frame), and recording its checksum would
@@ -467,7 +467,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         });
     }
 
-    const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+    const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, n.start_world_time);
 
     if (is_first_frame_of_in_game) {
         state.log.?.info("[DIAG] after saveState: save_ok={} saved_states_len={d}", .{

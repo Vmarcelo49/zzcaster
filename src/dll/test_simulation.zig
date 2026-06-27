@@ -1129,7 +1129,7 @@ test "Real StatePool Save, Load, and Reset" {
     try pool.allocate(5, 0);
 
     // 4. Save state at frame 10
-    const slot0 = pool.saveState(10, 1).?;
+    const slot0 = pool.saveState(10, 1, 0).?;
     try expectEqual(@as(usize, 0), slot0);
     try expectEqual(@as(usize, 1), pool.saved_states.items.len);
 
@@ -1141,7 +1141,7 @@ test "Real StatePool Save, Load, and Reset" {
     // 6. Load state for frame 10 (should restore the old values!)
     const loaded_frame = pool.loadStateForFrame(10, 1);
     try expect(loaded_frame != null);
-    try expectEqual(@as(u32, 10), loaded_frame.?);
+    try expectEqual(@as(u32, 10), loaded_frame.?.frame);
 
     try expectEqual(@as(u32, 100), dummy_val0);
     try expectEqual(@as(u32, 200), dummy_val1);

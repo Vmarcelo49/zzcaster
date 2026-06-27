@@ -29,7 +29,7 @@ test "Phase 1a: saveState computes a non-zero checksum" {
     try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
     try pool.allocate(5, 0);
 
-    _ = pool.saveState(0, 0);
+    _ = pool.saveState(0, 0, 0);
     try expect(pool.saved_states.items.len > 0);
 
     const state = pool.saved_states.items[0];
@@ -47,11 +47,11 @@ test "Phase 1a: checksum is deterministic (same state → same checksum)" {
     try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
     try pool.allocate(5, 0);
 
-    _ = pool.saveState(10, 1);
+    _ = pool.saveState(10, 1, 0);
     const cksum1 = pool.saved_states.items[0].checksum;
 
     // Save again with the same state — should produce the same checksum.
-    _ = pool.saveState(11, 1);
+    _ = pool.saveState(11, 1, 0);
     const cksum2 = pool.saved_states.items[1].checksum;
 
     try expectEqual(cksum1, cksum2);
@@ -71,13 +71,13 @@ test "Phase 1a: checksum is invariant to non-RNG state changes" {
     try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
     try pool.allocate(5, 0);
 
-    _ = pool.saveState(10, 1);
+    _ = pool.saveState(10, 1, 0);
     const cksum1 = pool.saved_states.items[0].checksum;
 
     // Modify the state — this is a non-RNG region (stack address), so the
     // checksum should NOT change.
     dummy = 0xBBBB;
-    _ = pool.saveState(11, 1);
+    _ = pool.saveState(11, 1, 0);
     const cksum2 = pool.saved_states.items[1].checksum;
 
     try expectEqual(cksum1, cksum2);
@@ -93,11 +93,11 @@ test "Phase 1a: getChecksumForFrame returns the correct checksum" {
     try pool.allocate(10, 0);
 
     dummy = 100;
-    _ = pool.saveState(10, 1);
+    _ = pool.saveState(10, 1, 0);
     const expected_cksum_10 = pool.saved_states.items[0].checksum;
 
     dummy = 200;
-    _ = pool.saveState(20, 1);
+    _ = pool.saveState(20, 1, 0);
     const expected_cksum_20 = pool.saved_states.items[1].checksum;
 
     // Look up checksums.
@@ -287,7 +287,7 @@ test "Phase 1e: checksum mismatch is detected as a desync" {
     try pool.allocate(10, 0);
 
     // Save a state — this is the "local" state at frame 10.
-    _ = pool.saveState(10, 1);
+    _ = pool.saveState(10, 1, 0);
     const local_checksum = pool.getChecksumForFrame(10, 1).?;
 
     // Simulate a remote checksum that DIFFERS from local.
@@ -308,7 +308,7 @@ test "Phase 1e: matching checksums do not flag a desync" {
     try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
     try pool.allocate(10, 0);
 
-    _ = pool.saveState(20, 1);
+    _ = pool.saveState(20, 1, 0);
     const local_checksum = pool.getChecksumForFrame(20, 1).?;
 
     // Remote reports the same checksum.
@@ -334,7 +334,7 @@ test "REGRESSION: StatePool save/load round-trip with checksum field" {
     try pool.addRegion(@intFromPtr(&b), @sizeOf(u32));
     try pool.allocate(5, 0);
 
-    _ = pool.saveState(10, 1);
+    _ = pool.saveState(10, 1, 0);
     const saved_checksum = pool.saved_states.items[0].checksum;
 
     // Modify and load.
@@ -364,7 +364,7 @@ test "REGRESSION: StatePool ring eviction with checksum field" {
     var i: u32 = 0;
     while (i < 5) : (i += 1) {
         dummy = i;
-        _ = pool.saveState(i, 1);
+        _ = pool.saveState(i, 1, 0);
     }
 
     // Only 3 states should be saved.
@@ -816,7 +816,7 @@ test "Phase 3: StatePool 90 states survives 1.5s rollback" {
     var f: u32 = 0;
     while (f < 90) : (f += 1) {
         dummy = f;
-        _ = pool.saveState(f, 1);
+        _ = pool.saveState(f, 1, 0);
     }
     try expectEqual(@as(usize, 90), pool.saved_states.items.len);
 
@@ -825,7 +825,7 @@ test "Phase 3: StatePool 90 states survives 1.5s rollback" {
     // With 90 states, frame 0 is still in the pool.
     const loaded = pool.loadStateForFrame(0, 1);
     try expect(loaded != null);
-    try expectEqual(@as(u32, 0), loaded.?);
+    try expectEqual(@as(u32, 0), loaded.?.frame);
     try expectEqual(@as(u32, 0), dummy); // restored to the frame-0 value
 }
 
@@ -840,9 +840,9 @@ test "Phase 3: StatePool 90 states survives 89-frame rollback" {
 
     // Save states at frames 0 and 89 (the extremes).
     dummy = 100;
-    _ = pool.saveState(0, 1);
+    _ = pool.saveState(0, 1, 0);
     dummy = 200;
-    _ = pool.saveState(89, 1);
+    _ = pool.saveState(89, 1, 0);
 
     // Load frame 0 — should succeed (within the 90-state window).
     const loaded = pool.loadStateForFrame(0, 1);
@@ -863,7 +863,7 @@ test "Phase 3: StatePool ring eviction still works at 90 states" {
     var f: u32 = 0;
     while (f < 95) : (f += 1) {
         dummy = f;
-        _ = pool.saveState(f, 1);
+        _ = pool.saveState(f, 1, 0);
     }
 
     // Only 90 states should be saved (ring capacity).

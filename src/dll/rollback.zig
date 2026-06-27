@@ -278,6 +278,13 @@ pub const SavedState = struct {
     // frames via the periodic SyncHash. Defaults to 0 (uncomputed) for backwards
     // compatibility with tests that construct SavedState directly.
     checksum: u16 = 0,
+    // The world_timer value at the start of this transition index. MUST be
+    // restored during rollback so that updateFrame() computes the correct
+    // indexed_frame.frame after the game's world_timer is restored from the
+    // saved state. Without this, indexed_frame.frame = world_timer - start_world_time
+    // uses the WRONG start_world_time, causing the frame counter to be off.
+    // Mirrors CCCaster's GameState.startWorldTime (DllRollbackManager.cpp:109).
+    start_world_time: u32 = 0,
 };
 
 pub const StatePool = struct {
@@ -517,7 +524,7 @@ pub const StatePool = struct {
     /// If no free slots are available, the OLDEST saved state is overwritten
     /// (ring-buffer semantics). This prevents rollback from silently dying
     /// after `num_states` saves (e.g. 60 frames at 60 FPS = 1 second of play).
-    pub fn saveState(self: *StatePool, frame: u32, index: u32) ?usize {
+    pub fn saveState(self: *StatePool, frame: u32, index: u32, start_world_time: u32) ?usize {
         if (self.state_size == 0) return null;
 
         var slot: usize = undefined;
@@ -611,6 +618,7 @@ pub const StatePool = struct {
             .fpu_env = fpu_env,
             .data = dst,
             .checksum = checksum,
+            .start_world_time = start_world_time,
         }) catch return null;
 
         return slot;
@@ -793,23 +801,34 @@ pub const StatePool = struct {
     }
 
     /// Find and load the latest state with frame <= target_frame
-    /// Returns the frame that was loaded, or null if no match
-    pub fn loadStateForFrame(self: *StatePool, target_frame: u32, target_index: u32) ?u32 {
+    /// Result of loadStateForFrame: the frame that was loaded, plus the
+    /// start_world_time that was saved with that state (needed to restore
+    /// the NetplayManager's frame counter after rollback).
+    pub const LoadResult = struct {
+        frame: u32,
+        start_world_time: u32,
+    };
+
+    /// Find and load the latest state with frame <= target_frame.
+    /// Returns the frame + start_world_time that was loaded, or null if no match.
+    pub fn loadStateForFrame(self: *StatePool, target_frame: u32, target_index: u32) ?LoadResult {
         var best_slot: ?usize = null;
         var best_frame: u32 = 0;
+        var best_swt: u32 = 0;
 
         for (self.saved_states.items, 0..) |state, i| {
             if (state.index == target_index and state.frame <= target_frame) {
                 if (best_slot == null or state.frame > best_frame) {
                     best_slot = i;
                     best_frame = state.frame;
+                    best_swt = state.start_world_time;
                 }
             }
         }
 
         if (best_slot) |slot| {
             self.loadState(slot);
-            return best_frame;
+            return .{ .frame = best_frame, .start_world_time = best_swt };
         }
         return null;
     }
@@ -903,11 +922,8 @@ fn saveFpu(out: *SavedFpu) void {
 fn restoreFpuSplit(env: *const SavedFpu, logger: ?*logging.Logger) void {
     if (builtin.cpu.arch != .x86) return;
 
-    // Use static (global) buffers with known fixed addresses. This avoids
-    // any stack-relative addressing issues entirely. The buffers are
-    // written before each restore, so there's no stale-data concern.
     var cw_buf: u16 = env.cw;
-    var mxcsr_buf: u32 = env.mxcsr & 0xFFC0; // mask status bits + reserved
+    var mxcsr_buf: u32 = env.mxcsr & 0xFFC0;
 
     const cw_ptr: *const u16 = &cw_buf;
     const mxcsr_ptr: *const u32 = &mxcsr_buf;
@@ -916,7 +932,6 @@ fn restoreFpuSplit(env: *const SavedFpu, logger: ?*logging.Logger) void {
         lg.info("restoreFpu: about to fldcw (cw=0x{x:0>4})", .{env.cw});
         lg.sync();
     }
-    // fldcw (%reg) — load x87 control word from the address in the register
     asm volatile ("fldcw (%[ptr])"
         :
         : [ptr] "r" (cw_ptr),
@@ -925,13 +940,25 @@ fn restoreFpuSplit(env: *const SavedFpu, logger: ?*logging.Logger) void {
         lg.info("restoreFpu: fldcw done, about to ldmxcsr (mxcsr=0x{x:0>8})", .{mxcsr_buf});
         lg.sync();
     }
-    // ldmxcsr (%reg) — load SSE control/status from the address in the register
     asm volatile ("ldmxcsr (%[ptr])"
         :
         : [ptr] "r" (mxcsr_ptr),
     );
+
+    // VERIFY: read back the FPU state to confirm the restore actually worked.
+    // If the read-back values don't match what we tried to restore, the asm
+    // is broken and we need a different approach (e.g., C FFI to fesetenv).
+    var cw_verify: u16 = 0;
+    var mxcsr_verify: u32 = 0;
+    asm volatile ("fnstcw %[cw]\n\tstmxcsr %[mxcsr]"
+        : [cw] "=m" (cw_verify),
+          [mxcsr] "=m" (mxcsr_verify),
+    );
     if (logger) |lg| {
-        lg.info("restoreFpu: ldmxcsr done", .{});
+        lg.info("restoreFpu: VERIFY after restore — cw=0x{x:0>4} (expected 0x{x:0>4} {s}), mxcsr=0x{x:0>8} (expected 0x{x:0>8} {s})", .{
+            cw_verify, env.cw, if (cw_verify == env.cw) @as([]const u8, "OK") else @as([]const u8, "MISMATCH"),
+            mxcsr_verify, mxcsr_buf, if (mxcsr_verify == mxcsr_buf) @as([]const u8, "OK") else @as([]const u8, "MISMATCH"),
+        });
         lg.sync();
     }
 }

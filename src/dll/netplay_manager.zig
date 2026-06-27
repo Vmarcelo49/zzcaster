@@ -2942,14 +2942,25 @@ pub const NetplayManager = struct {
         self.log.info("[DIAG checkRollback] attempting loadStateForFrame({d}, {d})", .{
             lcf_frame, lcf_index,
         });
-        const loaded_frame = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
-        if (loaded_frame == null) {
+        const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
+        if (loaded == null) {
             self.remote_inputs.clearLastChanged();
             self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
             return false;
         }
 
-        self.log.info("[DIAG checkRollback] loadStateForFrame returned {d}, boosting priority", .{loaded_frame.?});
+        // CRITICAL: Restore start_world_time so updateFrame() computes the
+        // correct indexed_frame.frame after the game's world_timer is restored.
+        // CCCaster does this in DllRollbackManager.cpp:148:
+        //   netMan._startWorldTime = it->startWorldTime;
+        // Without this, indexed_frame.frame = world_timer - start_world_time
+        // uses the WRONG start_world_time, causing frame counter drift and
+        // cascading desyncs after rollback.
+        self.start_world_time = loaded.?.start_world_time;
+
+        self.log.info("[DIAG checkRollback] loadStateForFrame returned frame={d} start_world_time={d}, boosting priority", .{
+            loaded.?.frame, loaded.?.start_world_time,
+        });
 
         // Strategy 2B (docs/dll-optimization-plan.md): raise the calling
         // thread to TIME_CRITICAL priority for the duration of the rerun.
@@ -2974,11 +2985,11 @@ pub const NetplayManager = struct {
         // current frame, then mark with 0x80 sentinel so the play-hook
         // knows to suppress them.
         if (self.sfx_dedup) |*sd| {
-            sd.applyRollbackFilter(loaded_frame.?, current_frame);
+            sd.applyRollbackFilter(loaded.?.frame, current_frame);
         }
 
-        self.indexed_frame.frame = loaded_frame.?;
-        self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded_frame.?, current_frame });
+        self.indexed_frame.frame = loaded.?.frame;
+        self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded.?.frame, current_frame });
 
         self.remote_inputs.clearLastChanged();
         self.rollback_timer = 0;

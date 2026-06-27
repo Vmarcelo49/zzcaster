@@ -177,7 +177,7 @@ test "FIX 2a: saveState succeeds when all regions fit" {
     try pool.allocate(3, 0);
 
     // Save should succeed.
-    const result = pool.saveState(0, 0);
+    const result = pool.saveState(0, 0, 0);
     try expect(result != null);
 
     // Modify and load — all regions should be restored.
@@ -204,7 +204,7 @@ test "FIX 2b: saveState returns null on region overflow (no silent corruption)" 
     pool.state_size = 4; // only 4 bytes, but regions need 8
 
     // Save should FAIL (return null) instead of silently saving partial data.
-    const result = pool.saveState(0, 0);
+    const result = pool.saveState(0, 0, 0);
     try expect(result == null); // FIXED: no partial save
 
     // The dummy values should be unchanged (no partial save occurred).
@@ -335,7 +335,7 @@ test "REGRESSION: StatePool coalesce + save + load round-trip" {
     try pool.allocate(5, 0);
 
     // Save.
-    _ = pool.saveState(10, 1);
+    _ = pool.saveState(10, 1, 0);
 
     // Modify.
     a = 999;
@@ -345,7 +345,7 @@ test "REGRESSION: StatePool coalesce + save + load round-trip" {
     // Load.
     const loaded = pool.loadStateForFrame(10, 1);
     try expect(loaded != null);
-    try expectEqual(@as(u32, 10), loaded.?);
+    try expectEqual(@as(u32, 10), loaded.?.frame);
 
     // All values should be restored.
     try expectEqual(@as(u32, 100), a);
@@ -366,7 +366,7 @@ test "REGRESSION: StatePool ring-buffer eviction (oldest recycled when full)" {
     var i: u32 = 0;
     while (i < 5) : (i += 1) {
         dummy = i;
-        _ = pool.saveState(i, 1);
+        _ = pool.saveState(i, 1, 0);
     }
 
     // Only 3 states should be saved (slots were recycled).

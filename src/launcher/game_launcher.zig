@@ -118,7 +118,9 @@ pub fn launchGameImpl(
     config_buf[3] = cfg.versus_win_count;
     config_buf[4] = 1;
     std.mem.writeInt(u16, config_buf[5..7], port, .little);
-    const msg_len = 7;
+    // local_udp_port = 0 (offline mode, no relay handoff).
+    std.mem.writeInt(u16, config_buf[7..9], 0, .little);
+    const msg_len = 9;
 
     if (ipc_server.*) |*srv| {
         if (srv.send(config_buf[0..msg_len])) {
@@ -214,9 +216,13 @@ pub fn launchNetplayImpl(
     config_buf[3] = cfg.versus_win_count;
     config_buf[4] = 1;
     std.mem.writeInt(u16, config_buf[5..7], port, .little);
-    const addr_copy_len = @min(peer_addr.len, 248);
-    @memcpy(config_buf[7 .. 7 + addr_copy_len], peer_addr[0..addr_copy_len]);
-    const msg_len = 7 + addr_copy_len;
+    // local_udp_port = 0 (direct connection, no relay handoff for spectator
+    // join via direct IP). The DLL reads this field and treats 0 as
+    // "bind to any port".
+    std.mem.writeInt(u16, config_buf[7..9], 0, .little);
+    const addr_copy_len = @min(peer_addr.len, 247);
+    @memcpy(config_buf[9 .. 9 + addr_copy_len], peer_addr[0..addr_copy_len]);
+    const msg_len = 9 + addr_copy_len;
 
     if (ipc_server.*) |*srv| {
         if (srv.send(config_buf[0..msg_len])) {
@@ -346,8 +352,14 @@ pub fn launchGameAfterHandshake(
     // Build the config buffer using the SAME layout the DLL parses in
     // dllmain.zig:waitForConfig():
     //   [1 byte flags] [1 byte delay] [1 byte rollback] [1 byte win_count]
-    //   [1 byte host_player] [2 bytes peer_port] [N bytes peer_addr]
+    //   [1 byte host_player] [2 bytes peer_port] [2 bytes local_udp_port]
+    //   [N bytes peer_addr]
     // flags bit0=training, bit1=netplay, bit2=host, bit3=spectator.
+    //
+    // local_udp_port (NEW): the local UDP port used for NAT-traversal
+    // hole-punching. 0 = direct connection (DLL binds to any port).
+    // Non-zero = relay connection (DLL must bind its ENet host to this
+    // exact port to preserve the NAT mapping).
     var config_buf: [256]u8 = undefined;
     config_buf[0] = 0x02 | (if (is_host) @as(u8, 0x04) else 0);
     config_buf[1] = delay;
@@ -355,21 +367,22 @@ pub fn launchGameAfterHandshake(
     config_buf[3] = win_count;
     config_buf[4] = host_player;
     std.mem.writeInt(u16, config_buf[5..7], peer_port, .little);
+    std.mem.writeInt(u16, config_buf[7..9], snap.local_udp_port, .little);
 
     // Host does NOT send a peer address (it listens); client sends the host's
     // address so the DLL can connect outbound.
-    var msg_len: usize = 7;
+    var msg_len: usize = 9;
     if (!is_host) {
         const addr_slice = std.mem.sliceTo(&peer_addr, 0);
-        const addr_copy_len = @min(addr_slice.len, 248);
-        @memcpy(config_buf[7 .. 7 + addr_copy_len], addr_slice[0..addr_copy_len]);
-        msg_len = 7 + addr_copy_len;
+        const addr_copy_len = @min(addr_slice.len, 247);
+        @memcpy(config_buf[9 .. 9 + addr_copy_len], addr_slice[0..addr_copy_len]);
+        msg_len = 9 + addr_copy_len;
     }
 
     if (ipc_server.*) |*srv| {
         if (srv.send(config_buf[0..msg_len])) {
-            log.info("Config sent to DLL (host={} delay={d} rollback={d} port={d})", .{
-                is_host, delay, rollback, peer_port,
+            log.info("Config sent to DLL (host={} delay={d} rollback={d} port={d} local_udp_port={d})", .{
+                is_host, delay, rollback, peer_port, snap.local_udp_port,
             });
         } else {
             log.err("Config send FAILED (gle={d}) — DLL will not start netplay correctly", .{srv.last_send_error});

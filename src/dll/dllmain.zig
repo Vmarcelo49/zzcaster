@@ -309,14 +309,14 @@ fn waitForConfig() void {
     const read: usize = ipc_reader.msg_len;
     const payload = ipc_reader.payload_buf[0..read];
 
-    // [flags][delay][rollback][win_count][host_player][2 peer_port][N peer_addr]
+    // [flags][delay][rollback][win_count][host_player][2 peer_port][2 local_udp_port][N peer_addr]
     if (read >= 5) {
         const flags = payload[0];
         is_training = (flags & 0x01) != 0;
         is_netplay = (flags & 0x02) != 0;
         is_spectator = (flags & 0x08) != 0;
 
-        if (is_netplay and read >= 7) {
+        if (is_netplay and read >= 9) {
             // Initialize NetplayManager with config
             state.nm = netman.NetplayManager.init(std.heap.page_allocator, app_io_backend.io(), state.log.?) catch {
                 state.log.?.err("NetplayManager init failed", .{});
@@ -338,17 +338,18 @@ fn waitForConfig() void {
             cfg.local_player = if (cfg.is_host) cfg.host_player else (3 - cfg.host_player);
             cfg.remote_player = 3 - cfg.local_player;
             cfg.peer_port = std.mem.readInt(u16, payload[5..7], .little);
+            cfg.local_udp_port = std.mem.readInt(u16, payload[7..9], .little);
 
-            const addr_len = @min(read - 7, cfg.peer_addr.len);
-            @memcpy(cfg.peer_addr[0..addr_len], payload[7 .. 7 + addr_len]);
+            const addr_len = @min(read - 9, cfg.peer_addr.len);
+            @memcpy(cfg.peer_addr[0..addr_len], payload[9 .. 9 + addr_len]);
 
             state.nm.?.configure(cfg);
             // `config_received.store(release)` publishes `is_netplay/is_training/...`
             // and `state.nm` to readers that observe the store with .acquire.
             config_received.store(true, .release);
-            state.log.?.info("Config: netplay={} host={} training={} spectator={} delay={d} rollback={d} port={d}", .{
+            state.log.?.info("Config: netplay={} host={} training={} spectator={} delay={d} rollback={d} port={d} local_udp_port={d}", .{
                 is_netplay, cfg.is_host,  is_training,   is_spectator,
-                cfg.delay,  cfg.rollback, cfg.peer_port,
+                cfg.delay,  cfg.rollback, cfg.peer_port, cfg.local_udp_port,
             });
         } else {
             is_training = (flags & 0x01) != 0;

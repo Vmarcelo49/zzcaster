@@ -204,6 +204,11 @@ pub const NetplayConfig = struct {
     peer_port: u16 = 0,
     is_netplay: bool = false,
     spectator_listen_port: u16 = 0, // host: port to also-listen on for spectators (== peer_port)
+    // Relay handoff: local UDP port used for NAT-traversal hole-punching.
+    // 0 = direct connection (bind to any port, or to peer_port for host).
+    // Non-zero = relay connection (bind ENet host to this exact port to
+    // preserve the NAT mapping opened during hole-punching).
+    local_udp_port: u16 = 0,
 };
 
 const md5_digest_size: usize = 16;
@@ -620,6 +625,17 @@ pub const NetplayManager = struct {
         }
 
         if (self.config.is_host) {
+            // HOST: listen for inbound ENet CONNECT.
+            //
+            // For direct connections, peer_port is the host's listen port
+            // (e.g., 46318) — enet_host_create binds to it.
+            //
+            // For relay connections, the launcher set peer_port =
+            // local_udp_port (the port used for hole-punching) so the DLL
+            // binds its ENet host to the SAME port, preserving the NAT
+            // mapping. Without this, the peer's ENet CONNECT packets
+            // would arrive at the (now-closed) launcher port and never
+            // reach the DLL.
             var addr: enet.ENetAddress = undefined;
             addr.host = enet.ENET_HOST_ANY;
             addr.port = self.config.peer_port;
@@ -638,10 +654,30 @@ pub const NetplayManager = struct {
             if (self.spectators) |*sm| sm.setEnetHost(self.enet_host);
             self.log.info("ENet listening on port {d} (1 player + up to 15 spectators)", .{self.config.peer_port});
         } else {
-            // Spectator OR player-2 client — both connect outbound.
-            self.enet_host = enet.enet_host_create(null, 1, 3, 0, 0);
-            // Stage-0 diag: log the client host_create return too.
-            self.log.info("DIAG: client host_create returned {x}", .{@intFromPtr(self.enet_host)});
+            // CLIENT (spectator OR player-2): connect outbound.
+            //
+            // For direct connections, local_udp_port is 0 — enet_host_create(null, ...)
+            // binds to a random local port. This is fine because there's no
+            // NAT mapping to preserve.
+            //
+            // For relay connections, local_udp_port is the port used for
+            // hole-punching. We MUST bind the ENet host to this exact port
+            // so the peer's return packets reach us (the NAT mapping
+            // forwards traffic to this port). enet_host_create with a bind
+            // address (instead of null) achieves this — it's the DLL-side
+            // equivalent of the launcher's connectBound().
+            if (self.config.local_udp_port != 0) {
+                var bind_addr: enet.ENetAddress = undefined;
+                bind_addr.host = enet.ENET_HOST_ANY;
+                bind_addr.port = self.config.local_udp_port;
+                self.enet_host = enet.enet_host_create(&bind_addr, 1, 3, 0, 0);
+                self.log.info("DIAG: client host_create (bound to port {d}) returned {x}", .{
+                    self.config.local_udp_port, @intFromPtr(self.enet_host),
+                });
+            } else {
+                self.enet_host = enet.enet_host_create(null, 1, 3, 0, 0);
+                self.log.info("DIAG: client host_create returned {x}", .{@intFromPtr(self.enet_host)});
+            }
             if (self.enet_host == null) return error.HostCreateFailed;
 
             var addr: enet.ENetAddress = undefined;

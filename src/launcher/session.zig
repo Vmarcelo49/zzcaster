@@ -28,6 +28,13 @@ pub const NetplayConfig = struct {
     // the handshake and displayed on the confirmation screen.
     local_connection_type: [16]u8 = [_]u8{0} ** 16,
     remote_connection_type: [16]u8 = [_]u8{0} ** 16,
+    // Relay handoff: the local UDP port that was used for NAT-traversal
+    // hole-punching. Set by stepRelay()/stepParallelRelay() when the
+    // relay handshake succeeds. The DLL uses this to bind its ENet host
+    // to the SAME port, preserving the NAT mapping opened during
+    // hole-punching. 0 = direct connection (no relay, bind to any port
+    // or to peer_port).
+    local_udp_port: u16 = 0,
 };
 
 pub const SessionState = enum {
@@ -670,6 +677,14 @@ pub const NetplaySession = struct {
                     r.peer_port, r.local_udp_port,
                 });
 
+                // CRITICAL: Write the relay result back into self.config so
+                // launchGameAfterHandshake() snapshots the correct
+                // local_udp_port for the DLL via IPC. The host DLL needs
+                // this to bind its ENet host to the hole-punch port.
+                // (See stepRelay's success handler for the full rationale.)
+                self.config.local_udp_port = r.local_udp_port;
+                self.config.peer_port = r.local_udp_port;
+
                 // Tear down the relay sockets FIRST (frees local_udp_port).
                 rc.deinit();
                 self.relay_client = null;
@@ -801,6 +816,36 @@ pub const NetplaySession = struct {
                     self.state = .failed;
                     return;
                 };
+
+                // CRITICAL: Write the relay result back into self.config so
+                // launchGameAfterHandshake() snapshots the correct peer
+                // endpoint and local_udp_port for the DLL via IPC.
+                //
+                // Without this, the DLL receives peer_port=0 and an empty
+                // peer_addr (the values from startRelayJoin, which never
+                // set them), and ENet connects to peer_ip:0 → instant
+                // failure. This was the root cause of "all remote
+                // connections fail with a black screen + crash".
+                //
+                // Host: peer_port is set to local_udp_port so the DLL's
+                //   enet_host_create binds to the same port the relay's
+                //   hole-punch used (preserves the NAT mapping). The host
+                //   doesn't need a peer_addr (it listens, not connects).
+                // Client: peer_addr is set to the relay-discovered peer IP,
+                //   peer_port to the relay-discovered peer port, and
+                //   local_udp_port is preserved so the DLL can bind its
+                //   ENet host to the hole-punch port (connectBound).
+                self.config.local_udp_port = r.local_udp_port;
+                if (self.config.is_host) {
+                    self.config.peer_port = r.local_udp_port;
+                } else {
+                    // Copy the peer IP string into config.peer_addr (the
+                    // non-null-terminated version for the DLL).
+                    const ip_len = @min(peer_ip_z.len, self.config.peer_addr.len - 1);
+                    @memcpy(self.config.peer_addr[0..ip_len], peer_ip_z[0..ip_len]);
+                    self.config.peer_addr[ip_len] = 0;
+                    self.config.peer_port = r.peer_port;
+                }
 
                 // Tear down relay sockets BEFORE creating ENet host.
                 // ENet creates its own UDP socket and binds it to

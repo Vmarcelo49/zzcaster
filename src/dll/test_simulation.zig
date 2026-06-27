@@ -1181,3 +1181,7 @@ test "Mock Rollback Out-of-Bounds Canceled" {
 
 // Import the desync tests so they run as part of the same test binary.
 pub const desync_tests = @import("rollback_desync_tests.zig");
+
+// Import the ggpo-x port tests (Phase 1: per-frame checksums + RTT EMA +
+// NetworkError tracking).
+pub const ggpo_port_tests = @import("ggpo_port_tests.zig");

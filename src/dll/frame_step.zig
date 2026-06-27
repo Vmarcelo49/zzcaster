@@ -104,12 +104,31 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     n.pollAndDispatch(3);
 
+    // Update RTT EMA every frame (reads ENet's peer.roundTripTime).
+    // Feeds the time-sync recommendation in Phase 2.
+    n.updateRttEma();
+
     n.maybeSendSyncHash();
     n.checkSyncHashDesync();
-    if (n.desync_detected) {
-        state.log.?.err("Desync detected — force-exiting match", .{});
+    // Per-frame checksum desync check (ported from ggpo-x). Runs every
+    // frame, catches divergences in ~16 frames vs the 300-frame SyncHash.
+    // Either detector can force-exit; both are checked here.
+    n.checkChecksumDesync();
+    if (n.desync_detected or n.checksum_desync_detected) {
+        state.log.?.err("Desync detected (synchash={} checksum={}) — force-exiting match", .{
+            n.desync_detected, n.checksum_desync_detected,
+        });
         state.alive_flag_addr.* = 0;
         return;
+    }
+
+    // Surface network errors (10+ consecutive send failures). Don't
+    // force-exit — ENet will recover if the connection is just congested.
+    // The heartbeat timeout (120s) handles true disconnects.
+    if (n.network_error) {
+        state.log.?.warn("Network send failures detected ({d} consecutive) — connection may be degraded", .{
+            n.consecutive_send_failures,
+        });
     }
 
     if (n.was_connected and !n.enet_connected and n.config.is_netplay) {
@@ -312,6 +331,16 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             // Rerun still in progress. Save state for this re-simulated frame so we have
             // correct intermediate checkpoints.
             _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+            // Record the re-simulated frame's checksum. This OVERWRITES the
+            // wrong (pre-rollback) checksum in pending_checksums for this
+            // frame — the re-run produces the authoritative state, so its
+            // checksum is the one we want to send and compare. Without this,
+            // a rollback that corrects a misprediction would still report
+            // the old (wrong) checksum, causing a false desync.
+            if (n.state_pool.saved_states.items.len > 0) {
+                const last_state = n.state_pool.saved_states.items[n.state_pool.saved_states.items.len - 1];
+                n.recordLocalChecksum(n.indexed_frame.frame, last_state.checksum);
+            }
             return;
         }
     }
@@ -322,8 +351,22 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     }
 
     _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+    // Record the per-frame checksum for the state we just saved.
+    // The checksum is computed inside StatePool.saveState and stored on
+    // the SavedState; we index it here in pending_checksums so sendLocalInputs
+    // can look it up by frame number when building the next input packet.
+    // (ported from ggpo-x's per-frame checksum approach)
+    if (n.state_pool.saved_states.items.len > 0) {
+        const last_state = n.state_pool.saved_states.items[n.state_pool.saved_states.items.len - 1];
+        n.recordLocalChecksum(n.indexed_frame.frame, last_state.checksum);
+    }
     // Snapshot SFX filter into history ring (for future rollback dedup).
     if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
+
+    // Garbage-collect old checksums every 30 frames to bound memory.
+    if (n.indexed_frame.frame % 30 == 0) {
+        n.discardOldChecksums();
+    }
 
     n.writeGameInputs();
 

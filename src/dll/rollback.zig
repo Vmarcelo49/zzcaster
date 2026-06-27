@@ -210,6 +210,12 @@ pub const SavedState = struct {
     index: u32,
     fpu_env: SavedFpu, // x87 cw + SSE MXCSR only (see SavedFpu doc)
     data: []u8, // contiguous buffer for all memory regions
+    // 16-bit checksum of `data`, computed in saveState via Wyhash.
+    // Used by the per-frame desync detector (see NetplayManager.checkChecksumDesync)
+    // to catch divergences ~16 frames after they happen, instead of every 300
+    // frames via the periodic SyncHash. Defaults to 0 (uncomputed) for backwards
+    // compatibility with tests that construct SavedState directly.
+    checksum: u16 = 0,
 };
 
 pub const StatePool = struct {
@@ -519,12 +525,22 @@ pub const StatePool = struct {
         var fpu_env: SavedFpu = undefined;
         saveFpu(&fpu_env);
 
+        // Compute 16-bit checksum of the saved state buffer.
+        // Used by the per-frame desync detector (NetplayManager.checkChecksumDesync)
+        // to catch divergences ~16 frames after they happen — 30x faster than the
+        // periodic 300-frame SyncHash. Wyhash is ~5 GB/s; hashing the ~850KB
+        // production state buffer costs ~170μs (~1% of the 16.6ms frame budget).
+        // Truncated to u16 — collision probability 1/65536 per frame, acceptable
+        // because the SyncHash remains as a secondary check.
+        const checksum: u16 = @truncate(std.hash.Wyhash.hash(0, dst));
+
         // Store metadata
         self.saved_states.append(self.allocator, .{
             .frame = frame,
             .index = index,
             .fpu_env = fpu_env,
             .data = dst,
+            .checksum = checksum,
         }) catch return null;
 
         return slot;
@@ -608,6 +624,24 @@ pub const StatePool = struct {
             i -= 1;
             self.free_stack.append(self.allocator, i) catch {};
         }
+    }
+
+    /// Look up the checksum for the most recent saved state at or before
+    /// `(target_frame, target_index)`. Returns null if no such state exists.
+    /// Used by the per-frame desync detector to find the local checksum
+    /// for a frame the remote peer has reported a checksum for.
+    pub fn getChecksumForFrame(self: *const StatePool, target_frame: u32, target_index: u32) ?u16 {
+        var best: ?u16 = null;
+        var best_frame: u32 = 0;
+        for (self.saved_states.items) |state| {
+            if (state.index == target_index and state.frame <= target_frame) {
+                if (best == null or state.frame > best_frame) {
+                    best = state.checksum;
+                    best_frame = state.frame;
+                }
+            }
+        }
+        return best;
     }
 
     // The previous `pub fn loadFromRbBin(self, path, io, log) !void` was

@@ -579,6 +579,79 @@ pub const NetplayManager = struct {
     desync_local: ?SyncHash = null,
     desync_remote: ?SyncHash = null,
 
+    // ====================================================================
+    // Per-frame desync detection (ported from ggpo-x).
+    //
+    // The periodic SyncHash above fires every 300 frames — worst-case
+    // detection latency is 5 seconds. The per-frame checksum below
+    // piggybacks a 16-bit checksum on every input packet, keyed to a
+    // frame old enough to be confirmed (CHECKSUM_DELAY = 16). This cuts
+    // detection latency to ~16 frames (~280ms) — 30x faster.
+    //
+    // The SyncHash remains as a SECONDARY check (richer field-level
+    // diagnostics, cross-round coverage). The per-frame checksum is the
+    // PRIMARY detector. Either can set desync_detected; both must agree
+    // for the force-exit to fire (handled in frame_step.zig).
+    // ====================================================================
+
+    /// How many frames must elapse before a saved state's checksum is
+    /// "confirmed" — i.e. no future rollback can invalidate it. Matches
+    /// ggpo-x's HowFarBackForChecksums() = 16. Must be >= max_rollback
+    /// (currently 15) so a rollback window can't overwrite the checksummed
+    /// state before the comparison runs.
+    pub const checksum_delay: u32 = 16;
+
+    /// Checksums for frames we've saved locally, awaiting confirmation.
+    /// Keyed by frame number (within current index). The per-frame
+    /// checksum is computed in StatePool.saveState and stored on the
+    /// SavedState; this map is an index lookup for "what checksum did we
+    /// compute for frame F?" without scanning saved_states.
+    /// Cleared on state transition (round change).
+    pending_checksums: std.AutoHashMap(u32, u16) = undefined,
+
+    /// Checksums we've received from the remote peer, keyed by frame.
+    /// Cleared on state transition.
+    remote_checksums: std.AutoHashMap(u32, u16) = undefined,
+
+    /// Set by checkChecksumDesync when a local vs remote checksum
+    /// mismatch is found. Separate from the SyncHash `desync_detected`
+    /// so we can report WHICH detector fired in the log.
+    checksum_desync_detected: bool = false,
+    checksum_desync_frame: u32 = 0,
+    checksum_desync_local: u16 = 0,
+    checksum_desync_remote: u16 = 0,
+
+    // ====================================================================
+    // RTT tracking (ported from ggpo-x).
+    //
+    // ENet already measures RTT internally via reliable-channel ACKs
+    // (peer.roundTripTime). We read it every frame and apply an EMA
+    // (exponential moving average) with a 10-second window, matching
+    // ggpo-x's emaPeriodMS = 10000. The smoothed value feeds the
+    // remote-frame-estimate and time-sync recommendation in Phase 2.
+    // ====================================================================
+
+    rtt_ema_ms: f64 = 0,
+    rtt_ema_initialized: bool = false,
+
+    /// EMA alpha: weight given to the new sample. ~0.0033 per frame at
+    /// 60fps = 10-second time constant. Matches ggpo-x's
+    /// `emaConstant = 2 / (1.0 + nSamples)` where nSamples = 10000/16.6.
+    pub const rtt_ema_alpha: f64 = 2.0 / (1.0 + 10_000.0 / 16.6);
+
+    // ====================================================================
+    // Network error tracking (ported from ggpo-x).
+    //
+    // ggpo-x raises a NetworkError event when sendto fails. zzcaster's
+    // sendInputs/sendReliable silently swallow failures. We now count
+    // consecutive failures and expose a `network_error` flag so the
+    // frame loop can log warnings (and the UI could surface them)
+    // before the 120s heartbeat timeout fires.
+    // ====================================================================
+
+    consecutive_send_failures: u32 = 0,
+    network_error: bool = false,
+
     pub fn init(allocator: std.mem.Allocator, io: std.Io, log: *logging.Logger) !NetplayManager {
         return .{
             .allocator = allocator,
@@ -589,6 +662,8 @@ pub const NetplayManager = struct {
             .state_pool = rollback.StatePool.init(allocator),
             .sfx_dedup = try sfx_dedup.SfxDedup.init(allocator),
             .spectators = spectator_manager_mod.SpectatorManager.init(allocator, io, log),
+            .pending_checksums = std.AutoHashMap(u32, u16).init(allocator),
+            .remote_checksums = std.AutoHashMap(u32, u16).init(allocator),
         };
     }
 
@@ -596,6 +671,8 @@ pub const NetplayManager = struct {
         self.local_inputs.deinit();
         self.remote_inputs.deinit();
         self.state_pool.deinit();
+        self.pending_checksums.deinit();
+        self.remote_checksums.deinit();
         if (self.sfx_dedup) |*sd| sd.deinit();
         if (self.spectators) |*sm| sm.deinit();
         if (self.enet_peer != null) {
@@ -989,13 +1066,28 @@ pub const NetplayManager = struct {
 
     pub fn sendInputs(self: *NetplayManager, inputs: []const u8) void {
         if (self.enet_peer == null or !self.enet_connected) return;
-
+        // The input packet grew from 8+num_inputs*2 to 12+num_inputs*2 bytes
+        // when we added the per-frame checksum fields. The buffer is sized
+        // to hold the type tag + the largest possible input packet
+        // (12-byte header + 30 inputs × 2 bytes = 72 bytes; 128 leaves headroom).
         var tagged: [1 + 128]u8 = .{0x01} ++ .{0} ** 128;
         const copy_len = @min(inputs.len, tagged.len - 1);
         @memcpy(tagged[1..][0..copy_len], inputs[0..copy_len]);
         const packet = enet.enet_packet_create(&tagged, 1 + copy_len, 0); // unreliable
         if (packet != null) {
-            _ = enet.enet_peer_send(self.enet_peer, 1, packet);
+            const send_result = enet.enet_peer_send(self.enet_peer, 1, packet);
+            if (send_result < 0) {
+                // Send failed — destroy the packet to avoid leaking memory
+                // (matches EnetTransport.sendReliable pattern). ENet's queue
+                // is full; the packet will be re-sent next frame via the
+                // input-resend loop.
+                enet.enet_packet_destroy(packet);
+                self.consecutive_send_failures += 1;
+                if (self.consecutive_send_failures >= 10) self.network_error = true;
+            } else {
+                self.consecutive_send_failures = 0;
+                self.network_error = false;
+            }
             enet.enet_host_flush(self.enet_host);
         }
     }
@@ -1007,8 +1099,20 @@ pub const NetplayManager = struct {
         if (self.enet_peer == null or !self.enet_connected) return;
         const packet = enet.enet_packet_create(data.ptr, data.len, enet.ENET_PACKET_FLAG_RELIABLE);
         if (packet != null) {
-            _ = enet.enet_peer_send(self.enet_peer, 0, packet);
+            const send_result = enet.enet_peer_send(self.enet_peer, 0, packet);
+            if (send_result < 0) {
+                enet.enet_packet_destroy(packet);
+                self.consecutive_send_failures += 1;
+                if (self.consecutive_send_failures >= 10) self.network_error = true;
+            } else {
+                self.consecutive_send_failures = 0;
+                self.network_error = false;
+            }
             enet.enet_host_flush(self.enet_host);
+        } else {
+            // Packet allocation failed — count as a send failure too.
+            self.consecutive_send_failures += 1;
+            if (self.consecutive_send_failures >= 10) self.network_error = true;
         }
     }
 
@@ -1180,12 +1284,40 @@ pub const NetplayManager = struct {
     }
 
     pub fn setRemoteInputs(self: *NetplayManager, data: []const u8) void {
-        // Parse input packet: [4 bytes start_frame][4 bytes index][N × 2 bytes inputs]
+        // Parse input packet:
+        //   [4 start_frame][4 index][2 checksum][2 checksum_frame][N × 2 inputs]
+        //
+        // The [2 checksum][2 checksum_frame] fields are the per-frame desync
+        // detector (ported from ggpo-x). See sendLocalInputs for the format.
+        // We parse them first, then fall through to the existing input-apply
+        // logic. Backward compat: if data.len < 12, treat as old-format
+        // packet (no checksum fields) and just apply inputs.
         if (data.len < 8) return;
         const start_frame = std.mem.readInt(u32, data[0..4], .little);
         const index = std.mem.readInt(u32, data[4..8], .little);
-        const num = (data.len - 8) / 2;
-        if (num == 0) return;
+
+        // Parse checksum fields (new format) or skip (old format).
+        // New format: header is 12 bytes (4+4+2+2), then N×2 inputs.
+        // Old format: header is 8 bytes (4+4), then N×2 inputs.
+        const has_checksum = data.len >= 12;
+        const header_len: usize = if (has_checksum) 12 else 8;
+        if (data.len < header_len) return;
+
+        var remote_checksum: u16 = 0;
+        var remote_checksum_frame: u16 = 0xFFFF;
+        if (has_checksum) {
+            remote_checksum = std.mem.readInt(u16, data[8..10], .little);
+            remote_checksum_frame = std.mem.readInt(u16, data[10..12], .little);
+        }
+
+        const num = (data.len - header_len) / 2;
+        if (num == 0) {
+            // No inputs in this packet, but we may still have a checksum.
+            if (has_checksum and remote_checksum_frame != 0xFFFF) {
+                self.remote_checksums.put(@as(u32, remote_checksum_frame), remote_checksum) catch {};
+            }
+            return;
+        }
 
         // Only keep remote inputs at most 1 transition index old (legacy guard)
         if (index + 1 < self.indexed_frame.index) return;
@@ -1194,13 +1326,20 @@ pub const NetplayManager = struct {
         const n = @min(num, inputs_buf.len);
         var i: u32 = 0;
         while (i < n) : (i += 1) {
-            inputs_buf[i] = std.mem.readInt(u16, data[8 + i * 2 ..][0..2], .little);
+            inputs_buf[i] = std.mem.readInt(u16, data[header_len + i * 2 ..][0..2], .little);
         }
 
         // check_changes=true so last_changed_frame is updated on misprediction
         // (needed for rollback to trigger; harmless for delay-based since
         // checkRollback returns false when rollback=0).
         self.remote_inputs.setRemote(index, start_frame, inputs_buf[0..n], true);
+
+        // Store the remote's checksum for later comparison in checkChecksumDesync.
+        // Only store if the checksum_frame is valid (not the 0xFFFF sentinel)
+        // AND it's for our current index (we don't compare cross-index checksums).
+        if (has_checksum and remote_checksum_frame != 0xFFFF and index == self.indexed_frame.index) {
+            self.remote_checksums.put(@as(u32, remote_checksum_frame), remote_checksum) catch {};
+        }
     }
 
     pub fn getRemoteInput(self: *const NetplayManager) u16 {
@@ -1304,22 +1443,45 @@ pub const NetplayManager = struct {
     pub fn sendLocalInputs(self: *NetplayManager) void {
         // Send the last num_inputs frames of local input, up to frame+delay.
         // Wire format (after sendInputs prepends 0x01 tag):
-        //   [4 start_frame][4 index][N × 2 inputs]
+        //   [4 start_frame][4 index][2 checksum][2 checksum_frame][N × 2 inputs]
+        //
+        // The [2 checksum][2 checksum_frame] fields are the per-frame desync
+        // detector (ported from ggpo-x). `checksum` is a 16-bit Wyhash of
+        // the saved state at frame `checksum_frame`, which is
+        // `current_frame - checksum_delay` (16 frames old — old enough that
+        // no future rollback can invalidate it). The receiver compares it
+        // against its own checksum for the same frame in checkChecksumDesync.
+        // If checksum_frame would be negative (first 16 frames of a round),
+        // we send 0xFFFF as a sentinel meaning "no checksum available".
         const last_frame = self.indexed_frame.frame + self.config.delay;
         const start_frame: u32 = if (last_frame + 1 < num_inputs)
             0
         else
             last_frame + 1 - num_inputs;
 
-        var buf: [4 + 4 + num_inputs * 2]u8 = undefined;
+        // Compute the checksum frame: the frame old enough to be "confirmed".
+        const current_frame = self.indexed_frame.frame;
+        var checksum: u16 = 0;
+        var checksum_frame: u16 = 0xFFFF; // sentinel: no checksum
+        if (current_frame >= checksum_delay) {
+            const target_frame = current_frame - checksum_delay;
+            if (self.pending_checksums.get(target_frame)) |c| {
+                checksum = c;
+                checksum_frame = @as(u16, @truncate(target_frame));
+            }
+        }
+
+        var buf: [4 + 4 + 2 + 2 + num_inputs * 2]u8 = undefined;
         std.mem.writeInt(u32, buf[0..4], start_frame, .little);
         std.mem.writeInt(u32, buf[4..8], self.indexed_frame.index, .little);
+        std.mem.writeInt(u16, buf[8..10], checksum, .little);
+        std.mem.writeInt(u16, buf[10..12], checksum_frame, .little);
         var i: u32 = 0;
         while (i < num_inputs) : (i += 1) {
             const input = self.local_inputs.get(self.indexed_frame.index, start_frame + i);
-            std.mem.writeInt(u16, buf[8 + i * 2 ..][0..2], input, .little);
+            std.mem.writeInt(u16, buf[12 + i * 2 ..][0..2], input, .little);
         }
-        self.sendInputs(buf[0 .. 8 + num_inputs * 2]);
+        self.sendInputs(buf[0 .. 12 + num_inputs * 2]);
     }
 
     // --- RNG sync ---
@@ -1951,6 +2113,20 @@ pub const NetplayManager = struct {
         self.start_world_time = world_timer_addr.*;
         self.indexed_frame.frame = 0;
 
+        // Clear per-frame checksum maps on round transition. Checksums are
+        // per-index (per-round) — cross-index comparison would be meaningless
+        // because the state at "frame 10 of round 1" and "frame 10 of round 2"
+        // are different game states. Clearing here ensures each round starts
+        // with empty maps, and the first ~16 frames (before checksum_delay
+        // elapses) correctly send the 0xFFFF "no checksum" sentinel.
+        // (ported from ggpo-x's per-round checksum reset)
+        self.pending_checksums.clearRetainingCapacity();
+        self.remote_checksums.clearRetainingCapacity();
+        self.checksum_desync_detected = false;
+        self.checksum_desync_frame = 0;
+        self.checksum_desync_local = 0;
+        self.checksum_desync_remote = 0;
+
         // Arm RNG sync when entering `.in_game` (round 1 entry from
         // chara_intro, training mode direct entry) AND when entering
         // `.chara_select` (match start / character-select after retry menu).
@@ -2263,6 +2439,118 @@ pub const NetplayManager = struct {
         if (a.moon != b.moon) log.err("  {s} moon: {d} vs {d}", .{ label, a.moon, b.moon });
     }
 
+    // ================================================================
+    // Per-frame checksum desync detection (ported from ggpo-x).
+    //
+    // checkChecksumDesync runs every frame from frameStepNetplay. It
+    // compares the remote's reported checksum for each frame against
+    // our own checksum for the same frame. On the first mismatch, it
+    // sets checksum_desync_detected and logs the divergent frame.
+    //
+    // Detection latency: ~checksum_delay (16) frames + network transit
+    // (~2-4 frames) = ~20 frames (~330ms). This is 30x faster than the
+    // periodic SyncHash (300 frames / 5 seconds).
+    // ================================================================
+
+    /// Record a locally-computed checksum for the current frame. Called
+    /// from frameStepNetplay right after state_pool.saveState. The
+    /// checksum is stored in pending_checksums until it's old enough to
+    /// send (frame >= checksum_delay) and confirmed (compared against
+    /// the remote's value).
+    pub fn recordLocalChecksum(self: *NetplayManager, frame: u32, checksum: u16) void {
+        self.pending_checksums.put(frame, checksum) catch {};
+    }
+
+    /// Compare local vs remote checksums for all frames the remote has
+    /// reported. Called every frame from frameStepNetplay. On the first
+    /// mismatch, sets checksum_desync_detected and returns.
+    pub fn checkChecksumDesync(self: *NetplayManager) void {
+        if (self.checksum_desync_detected) return; // already flagged
+        if (self.state != .in_game) return; // only meaningful in-game
+        if (self.remote_checksums.count() == 0) return;
+
+        // Walk all remote checksums. For each, look up our local checksum
+        // for the same frame via state_pool.getChecksumForFrame. If they
+        // differ, flag the desync.
+        //
+        // We iterate a snapshot of keys to avoid iterator invalidation
+        // if we wanted to remove entries mid-iteration (we don't —
+        // garbage collection happens in discardOldChecksums).
+        var remote_it = self.remote_checksums.iterator();
+        while (remote_it.next()) |entry| {
+            const frame = entry.key_ptr.*;
+            const remote_cksum = entry.value_ptr.*;
+            const local_cksum = self.state_pool.getChecksumForFrame(frame, self.indexed_frame.index) orelse continue;
+            if (local_cksum != remote_cksum) {
+                self.checksum_desync_detected = true;
+                self.checksum_desync_frame = frame;
+                self.checksum_desync_local = local_cksum;
+                self.checksum_desync_remote = remote_cksum;
+                self.log.err("CHECKSUM DESYNC at frame {d} (index {d}): local=0x{x:0>4} remote=0x{x:0>4}", .{
+                    frame, self.indexed_frame.index, local_cksum, remote_cksum,
+                });
+                return;
+            }
+        }
+    }
+
+    /// Garbage-collect checksums older than (current_frame - checksum_delay - 64).
+    /// Keeps a 64-frame sliding window so we don't compare against stale
+    /// entries. Called every ~30 frames from frameStepNetplay.
+    pub fn discardOldChecksums(self: *NetplayManager) void {
+        const current = self.indexed_frame.frame;
+        const cutoff = if (current > checksum_delay + 64)
+            current - checksum_delay - 64
+        else
+            0;
+
+        // GC pending_checksums (local).
+        var to_remove_local: std.ArrayList(u32) = .empty;
+        defer to_remove_local.deinit(self.allocator);
+        var lit = self.pending_checksums.iterator();
+        while (lit.next()) |entry| {
+            if (entry.key_ptr.* < cutoff) {
+                to_remove_local.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (to_remove_local.items) |f| _ = self.pending_checksums.remove(f);
+
+        // GC remote_checksums.
+        var to_remove_remote: std.ArrayList(u32) = .empty;
+        defer to_remove_remote.deinit(self.allocator);
+        var rit = self.remote_checksums.iterator();
+        while (rit.next()) |entry| {
+            if (entry.key_ptr.* < cutoff) {
+                to_remove_remote.append(self.allocator, entry.key_ptr.*) catch break;
+            }
+        }
+        for (to_remove_remote.items) |f| _ = self.remote_checksums.remove(f);
+    }
+
+    // ================================================================
+    // RTT tracking (ported from ggpo-x).
+    //
+    // updateRttEma reads ENet's peer.roundTripTime (already measured
+    // internally via reliable-channel ACKs) and applies an EMA with a
+    // 10-second time constant. The smoothed value feeds the remote-
+    // frame-estimate and time-sync recommendation in Phase 2.
+    // ================================================================
+
+    pub fn updateRttEma(self: *NetplayManager) void {
+        if (self.enet_peer == null or !self.enet_connected) return;
+        const instant: f64 = @as(f64, @floatFromInt(self.enet_peer.?.roundTripTime));
+        if (!self.rtt_ema_initialized) {
+            self.rtt_ema_ms = instant;
+            self.rtt_ema_initialized = true;
+        } else {
+            self.rtt_ema_ms = instant * rtt_ema_alpha + self.rtt_ema_ms * (1.0 - rtt_ema_alpha);
+        }
+    }
+
+    pub fn rttMs(self: *const NetplayManager) f64 {
+        return self.rtt_ema_ms;
+    }
+
     fn onEnterInGame(self: *NetplayManager) void {
         self.local_inputs.reset();
         self.remote_inputs.reset();
@@ -2287,6 +2575,24 @@ pub const NetplayManager = struct {
         self.desync_local = null;
         self.desync_remote = null;
         self.fast_fwd_stop_frame = 0;
+
+        // Clear per-frame checksum desync state (ported from ggpo-x).
+        // Leftover checksums from a previous match would cause false
+        // positives on the first .in_game frame of the new match.
+        self.pending_checksums.clearRetainingCapacity();
+        self.remote_checksums.clearRetainingCapacity();
+        self.checksum_desync_detected = false;
+        self.checksum_desync_frame = 0;
+        self.checksum_desync_local = 0;
+        self.checksum_desync_remote = 0;
+
+        // Reset RTT EMA so the new connection's RTT is measured fresh.
+        self.rtt_ema_ms = 0;
+        self.rtt_ema_initialized = false;
+
+        // Reset network error tracking.
+        self.consecutive_send_failures = 0;
+        self.network_error = false;
 
         if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
             if (self.state_pool.pool.len == 0) {

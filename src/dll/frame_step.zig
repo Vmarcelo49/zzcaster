@@ -136,7 +136,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // Surface network errors (10+ consecutive send failures). Don't
     // force-exit — ENet will recover if the connection is just congested.
     // The heartbeat timeout (120s) handles true disconnects.
-    if (n.network_error) {
+    //
+    // Throttle to once per 60 frames (1/sec) to avoid log flooding (M2 fix).
+    // Without throttling, a degraded connection would log 60 warnings/sec.
+    if (n.network_error and n.indexed_frame.frame % 60 == 0) {
         state.log.?.warn("Network send failures detected ({d} consecutive) — connection may be degraded", .{
             n.consecutive_send_failures,
         });
@@ -370,14 +373,14 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         } else {
             // Rerun still in progress. Save state for this re-simulated frame so we have
             // correct intermediate checkpoints.
-            _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
-            // Record the re-simulated frame's checksum. This OVERWRITES the
-            // wrong (pre-rollback) checksum in pending_checksums for this
-            // frame — the re-run produces the authoritative state, so its
-            // checksum is the one we want to send and compare. Without this,
-            // a rollback that corrects a misprediction would still report
-            // the old (wrong) checksum, causing a false desync.
-            if (n.state_pool.saved_states.items.len > 0) {
+            const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+            // Record the re-simulated frame's checksum ONLY if the save succeeded.
+            // saveState returns null on overflow/OOM; in that case saved_states[len-1]
+            // is the PREVIOUS state (wrong frame), and recording its checksum would
+            // cause a false desync. This OVERWRITES the wrong (pre-rollback) checksum
+            // in pending_checksums for this frame — the re-run produces the authoritative
+            // state, so its checksum is the one we want to send and compare.
+            if (save_ok != null and n.state_pool.saved_states.items.len > 0) {
                 const last_state = n.state_pool.saved_states.items[n.state_pool.saved_states.items.len - 1];
                 n.recordLocalChecksum(n.indexed_frame.frame, last_state.checksum);
             }
@@ -390,13 +393,12 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         if (n.rollback_timer == 0) n.rollback_timer = n.min_rollback_spacing;
     }
 
-    _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
-    // Record the per-frame checksum for the state we just saved.
-    // The checksum is computed inside StatePool.saveState and stored on
-    // the SavedState; we index it here in pending_checksums so sendLocalInputs
-    // can look it up by frame number when building the next input packet.
-    // (ported from ggpo-x's per-frame checksum approach)
-    if (n.state_pool.saved_states.items.len > 0) {
+    const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+    // Record the per-frame checksum ONLY if the save succeeded (H2 fix).
+    // saveState returns null on overflow/OOM; reading saved_states[len-1]
+    // in that case would give us the PREVIOUS frame's checksum, causing a
+    // false desync when the remote compares against it.
+    if (save_ok != null and n.state_pool.saved_states.items.len > 0) {
         const last_state = n.state_pool.saved_states.items[n.state_pool.saved_states.items.len - 1];
         n.recordLocalChecksum(n.indexed_frame.frame, last_state.checksum);
     }

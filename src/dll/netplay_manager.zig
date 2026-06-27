@@ -423,10 +423,18 @@ const rng_resend_period: u32 = 30;
 
 // Per-frame desync detection (ported from ggpo-x). How many frames must
 // elapse before a saved state's checksum is "confirmed" — i.e. no future
-// rollback can invalidate it. Matches ggpo-x's HowFarBackForChecksums() = 16.
-// Must be >= max_rollback (currently 15) so a rollback window can't
-// overwrite the checksummed state before the comparison runs.
-const checksum_delay: u32 = 16;
+// rollback can invalidate it.
+//
+// Must be >= the actual rollback window. The rollback window is bounded by
+// num_inputs (30) — each input packet carries 30 frames of history, so a
+// misprediction can be at most ~30 frames old. We use 32 (num_inputs + 2
+// margin) to be safe. This is larger than ggpo-x's 16, but ggpo-x clamps
+// its rollback window to MAX_PREDICTION_FRAMES=8 while zzcaster's rollback
+// distance is unclamped (bounded only by num_inputs).
+//
+// Detection latency at 32 frames: ~530ms (vs 16 frames = ~280ms for
+// ggpo-x). Still 18x faster than the 300-frame SyncHash (5s).
+const checksum_delay: u32 = 32;
 
 // RTT EMA alpha (ported from ggpo-x). Weight given to the new RTT sample
 // each frame. ~0.0033 per frame at 60fps = 10-second time constant.
@@ -456,6 +464,12 @@ const min_frame_advantage: f32 = 3.0;
 // risks missing vsync and dropping to 30fps, which would feel like stutter.
 // At 4ms/frame, a 10-frame advantage corrects in ~42 frames (~0.7s).
 const max_per_frame_sleep_ms: f32 = 4.0;
+
+// Protocol version for the wire format. Packed into ENet connect_data byte 1.
+// The CONNECT handler rejects peers with a different version.
+//   Version 1 = per-frame checksums in input packets (Phase 1 of ggpo-x port).
+// Bump this when the wire format changes again.
+const protocol_version: u32 = 1;
 
 // Round-over: extra frames to wait before committing the InGame→Skippable
 // transition when rollback is enabled. Matches ROLLBACK_ROUND_OVER_DELAY in
@@ -807,7 +821,14 @@ pub const NetplayManager = struct {
             // distinguishes spectators by connection context, not a
             // connect-data field). The value is arbitrary; it just needs
             // to be non-zero and distinct from the main peer's connect_data (0).
-            const connect_data: u32 = if (self.config.is_spectator) 0x5FEC else 0;
+            //
+            // Protocol versioning: byte 0 = flags (spectator/player), byte 1 = protocol version.
+            // The CONNECT handler rejects mismatched versions. This prevents old clients
+            // (which send the old input packet format without checksum fields) from silently
+            // corrupting inputs when connecting to new clients.
+            //   Protocol version 1 = per-frame checksums (Phase 1 of ggpo-x port)
+            const flags: u32 = if (self.config.is_spectator) 0x5FEC else 0;
+            const connect_data: u32 = (protocol_version << 8) | flags;
             self.enet_peer = enet.enet_host_connect(self.enet_host, &addr, 3, connect_data);
             // Stage-0 diag: log the host_connect return — a null here means
             // the connect call itself failed (not the same as a timeout).
@@ -985,6 +1006,21 @@ pub const NetplayManager = struct {
                 return null;
             },
             enet.ENET_EVENT_TYPE_CONNECT => {
+                // Protocol version check: reject peers with a mismatched wire format.
+                // connect_data is packed as (protocol_version << 8) | flags. We check
+                // byte 1 (the version) and disconnect if it doesn't match. This prevents
+                // old clients (which send the pre-Phase-1 input format without checksum
+                // fields) from silently corrupting inputs.
+                const remote_version: u32 = (event.data >> 8) & 0xFF;
+                if (remote_version != protocol_version) {
+                    self.log.err("Protocol version mismatch: local={d} remote={d} — disconnecting. Both peers must run the same zzcaster version.", .{
+                        protocol_version, remote_version,
+                    });
+                    if (peer_opt) |peer| {
+                        enet.enet_peer_disconnect(peer, 0);
+                    }
+                    return null;
+                }
                 if (peer_opt) |peer| {
                     enet.enet_peer_timeout(peer, 0, 10000, 120000);
                 }
@@ -1113,6 +1149,11 @@ pub const NetplayManager = struct {
                 self.network_error = false;
             }
             enet.enet_host_flush(self.enet_host);
+        } else {
+            // Packet allocation failed — count as a send failure (M1 fix).
+            // Matches sendReliable's handling of the same case.
+            self.consecutive_send_failures += 1;
+            if (self.consecutive_send_failures >= 10) self.network_error = true;
         }
     }
 
@@ -1313,31 +1354,28 @@ pub const NetplayManager = struct {
         //
         // The [2 checksum][2 checksum_frame] fields are the per-frame desync
         // detector (ported from ggpo-x). See sendLocalInputs for the format.
-        // We parse them first, then fall through to the existing input-apply
-        // logic. Backward compat: if data.len < 12, treat as old-format
-        // packet (no checksum fields) and just apply inputs.
-        if (data.len < 8) return;
+        //
+        // Protocol version 1 (enforced at ENet CONNECT) guarantees both peers
+        // use this 12-byte-header format. We still validate the length: if
+        // data.len < 12, the packet is malformed (old format or corrupt) —
+        // log and bail rather than risk misparsing.
+        if (data.len < 12) return;
         const start_frame = std.mem.readInt(u32, data[0..4], .little);
         const index = std.mem.readInt(u32, data[4..8], .little);
 
-        // Parse checksum fields (new format) or skip (old format).
-        // New format: header is 12 bytes (4+4+2+2), then N×2 inputs.
-        // Old format: header is 8 bytes (4+4), then N×2 inputs.
-        const has_checksum = data.len >= 12;
-        const header_len: usize = if (has_checksum) 12 else 8;
-        if (data.len < header_len) return;
-
-        var remote_checksum: u16 = 0;
-        var remote_checksum_frame: u16 = 0xFFFF;
-        if (has_checksum) {
-            remote_checksum = std.mem.readInt(u16, data[8..10], .little);
-            remote_checksum_frame = std.mem.readInt(u16, data[10..12], .little);
-        }
+        // Parse the per-frame checksum fields (always present in protocol v1).
+        const remote_checksum = std.mem.readInt(u16, data[8..10], .little);
+        const remote_checksum_frame = std.mem.readInt(u16, data[10..12], .little);
+        const header_len: usize = 12;
 
         const num = (data.len - header_len) / 2;
         if (num == 0) {
             // No inputs in this packet, but we may still have a checksum.
-            if (has_checksum and remote_checksum_frame != 0xFFFF) {
+            // Guard with index check (H1 fix): only store if the checksum is
+            // for our current index, otherwise a stale-index packet would
+            // store a checksum that checkChecksumDesync would compare against
+            // the wrong round's state → false desync.
+            if (remote_checksum_frame != 0xFFFF and index == self.indexed_frame.index) {
                 self.remote_checksums.put(@as(u32, remote_checksum_frame), remote_checksum) catch {};
             }
             return;
@@ -1361,25 +1399,27 @@ pub const NetplayManager = struct {
         // Store the remote's checksum for later comparison in checkChecksumDesync.
         // Only store if the checksum_frame is valid (not the 0xFFFF sentinel)
         // AND it's for our current index (we don't compare cross-index checksums).
-        if (has_checksum and remote_checksum_frame != 0xFFFF and index == self.indexed_frame.index) {
+        if (remote_checksum_frame != 0xFFFF and index == self.indexed_frame.index) {
             self.remote_checksums.put(@as(u32, remote_checksum_frame), remote_checksum) catch {};
         }
 
         // Bounded input history (ported from ggpo-x, Phase 3).
         // The remote is at `start_frame`, so they've processed our inputs up to
         // `start_frame - 1` (lockstep assumption). Discard our LOCAL inputs older
-        // than `start_frame - 16` — keep a 16-frame safety margin so we don't
-        // discard inputs that might still be needed for a rollback re-send.
+        // than `start_frame - checksum_delay` — keep a checksum_delay-frame safety
+        // margin so we don't discard inputs that might still be needed for a
+        // rollback re-send.
         //
         // zzcaster's protocol doesn't have an explicit input-ack (unlike GGPO's
         // InputAck packet), so we approximate using the remote's start_frame.
-        // The safety margin (16) equals checksum_delay, which is >= max_rollback
-        // (15), guaranteeing no rollback window can reach the discarded range.
+        // The safety margin (checksum_delay = 32) is >= the actual rollback window
+        // (bounded by num_inputs = 30), guaranteeing no rollback window can reach
+        // the discarded range.
         //
         // This bounds InputBuffer memory: instead of growing ~5940 entries for
-        // a 99-second round (~285KB), it stays at ~30 entries (~1.4KB).
+        // a 99-second round (~285KB), it stays at ~62 entries (~3KB).
         if (index == self.indexed_frame.index) {
-            const discard_before: u32 = if (start_frame >= 16) start_frame - 16 else 0;
+            const discard_before: u32 = if (start_frame >= checksum_delay) start_frame - checksum_delay else 0;
             if (discard_before > 0) {
                 self.local_inputs.discardConfirmedFrames(self.indexed_frame.index, discard_before);
             }
@@ -2541,6 +2581,9 @@ pub const NetplayManager = struct {
     /// Garbage-collect checksums older than (current_frame - checksum_delay - 64).
     /// Keeps a 64-frame sliding window so we don't compare against stale
     /// entries. Called every ~30 frames from frameStepNetplay.
+    ///
+    /// Uses stack-allocated buffers for the common case (≤64 old entries),
+    /// matching InputBuffer.discardConfirmedFrames's pattern (M5 fix).
     pub fn discardOldChecksums(self: *NetplayManager) void {
         const current = self.indexed_frame.frame;
         const cutoff = if (current > checksum_delay + 64)
@@ -2549,26 +2592,32 @@ pub const NetplayManager = struct {
             0;
 
         // GC pending_checksums (local).
-        var to_remove_local: std.ArrayList(u32) = .empty;
-        defer to_remove_local.deinit(self.allocator);
-        var lit = self.pending_checksums.iterator();
-        while (lit.next()) |entry| {
-            if (entry.key_ptr.* < cutoff) {
-                to_remove_local.append(self.allocator, entry.key_ptr.*) catch break;
-            }
-        }
-        for (to_remove_local.items) |f| _ = self.pending_checksums.remove(f);
-
+        gcChecksumMap(self.allocator, &self.pending_checksums, cutoff);
         // GC remote_checksums.
-        var to_remove_remote: std.ArrayList(u32) = .empty;
-        defer to_remove_remote.deinit(self.allocator);
-        var rit = self.remote_checksums.iterator();
-        while (rit.next()) |entry| {
+        gcChecksumMap(self.allocator, &self.remote_checksums, cutoff);
+    }
+
+    /// Helper: remove all entries with key < cutoff from a checksum map.
+    /// Uses a 64-entry stack buffer with heap fallback (M5 fix).
+    fn gcChecksumMap(allocator: std.mem.Allocator, map: *std.AutoHashMap(u32, u16), cutoff: u32) void {
+        var stack_buf: [64]u32 = undefined;
+        var heap_buf: std.ArrayList(u32) = .empty;
+        defer heap_buf.deinit(allocator);
+
+        var count: usize = 0;
+        var it = map.iterator();
+        while (it.next()) |entry| {
             if (entry.key_ptr.* < cutoff) {
-                to_remove_remote.append(self.allocator, entry.key_ptr.*) catch break;
+                if (count < stack_buf.len) {
+                    stack_buf[count] = entry.key_ptr.*;
+                } else {
+                    heap_buf.append(allocator, entry.key_ptr.*) catch break;
+                }
+                count += 1;
             }
         }
-        for (to_remove_remote.items) |f| _ = self.remote_checksums.remove(f);
+        for (stack_buf[0..@min(count, stack_buf.len)]) |f| _ = map.remove(f);
+        for (heap_buf.items) |f| _ = map.remove(f);
     }
 
     // ================================================================
@@ -2582,7 +2631,12 @@ pub const NetplayManager = struct {
 
     pub fn updateRttEma(self: *NetplayManager) void {
         if (self.enet_peer == null or !self.enet_connected) return;
+        // ENet's roundTripTime is 0 until the first reliable packet is ACKed.
+        // Initializing the EMA to 0 would take ~10 seconds to converge to the
+        // real RTT (alpha ≈ 0.003). Skip the update until we have a real sample
+        // (M3 fix) — recommendPerFrameSleepMs guards on rtt_ema_initialized.
         const instant: f64 = @as(f64, @floatFromInt(self.enet_peer.?.roundTripTime));
+        if (instant == 0) return;
         if (!self.rtt_ema_initialized) {
             self.rtt_ema_ms = instant;
             self.rtt_ema_initialized = true;

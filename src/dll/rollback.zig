@@ -698,12 +698,17 @@ pub const StatePool = struct {
     /// `(target_frame, target_index)`. Returns null if no such state exists.
     /// Used by the per-frame desync detector to find the local checksum
     /// for a frame the remote peer has reported a checksum for.
+    ///
+    /// Uses `>=` (last-encountered wins) so that if two entries share the same
+    /// frame (shouldn't happen in normal flow, but could after a partial
+    /// rollback), the LATER entry — which is the re-simulated, authoritative
+    /// state — is returned. This is the safer default for an append-only list.
     pub fn getChecksumForFrame(self: *const StatePool, target_frame: u32, target_index: u32) ?u16 {
         var best: ?u16 = null;
         var best_frame: u32 = 0;
         for (self.saved_states.items) |state| {
             if (state.index == target_index and state.frame <= target_frame) {
-                if (best == null or state.frame > best_frame) {
+                if (best == null or state.frame >= best_frame) {
                     best = state.checksum;
                     best_frame = state.frame;
                 }

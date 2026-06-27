@@ -2557,6 +2557,39 @@ pub const NetplayManager = struct {
         self.remote_sync_count = keep;
     }
 
+    /// Dump the current RNG state + player positions for diagnostic comparison.
+    /// Call this at key rollback points to see if both peers have the same state.
+    /// The `label` appears in the log line so we can match corresponding entries
+    /// between host and client logs.
+    pub fn dumpState(self: *NetplayManager, label: []const u8) void {
+        // RNG state: 4 words (rng0, rng1, rng2, rng3[0..8] for brevity)
+        const r0 = rng_state0_addr.*;
+        const r1 = rng_state1_addr.*;
+        const r2 = rng_state2_addr.*;
+        // First 8 bytes of rng3 (220 bytes total — too much to log every time)
+        const r3_first: u64 = @bitCast(rng_state3_addr[0..8].*);
+
+        // Player positions — read from the player structs.
+        // P1 struct base = 0x555130, P2 struct base = 0x555130 + 0xAFC = 0x555C2C.
+        // X position offset = 0x2D4 (CC_P1_X_POSITION_ADDR 0x555404 - 0x555130).
+        const p1_struct: [*]u8 = @ptrFromInt(0x555130);
+        const p2_struct: [*]u8 = @ptrFromInt(0x555C2C);
+        const p1_x_ptr: *i32 = @ptrCast(@alignCast(p1_struct + 0x2D4));
+        const p2_x_ptr: *i32 = @ptrCast(@alignCast(p2_struct + 0x2D4));
+        const p1_x = p1_x_ptr.*;
+        const p2_x = p2_x_ptr.*;
+
+        // Camera position
+        const camera_x_ptr: *i32 = @ptrFromInt(0x555124);
+        const camera_x = camera_x_ptr.*;
+
+        self.log.info("[STATE DUMP {s}] frame={d} index={d} rng=0x{x:0>8} 0x{x:0>8} 0x{x:0>8} 0x{x:0>16} | p1_x={d} p2_x={d} cam_x={d}", .{
+            label, self.indexed_frame.frame, self.indexed_frame.index,
+            r0, r1, r2, r3_first,
+            p1_x, p2_x, camera_x,
+        });
+    }
+
     fn logDesync(self: *NetplayManager, l: SyncHash, r: SyncHash) void {
         self.log.err("DESYNC detected at indexed_frame=0x{x:0>16}", .{l.indexed_frame});
         // Identify which field diverged — this is the diagnostic payoff.
@@ -2990,6 +3023,11 @@ pub const NetplayManager = struct {
 
         self.indexed_frame.frame = loaded.?.frame;
         self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded.?.frame, current_frame });
+
+        // Dump the state RIGHT AFTER loadState — this shows what was restored.
+        // Both peers should have IDENTICAL values here. If they don't, the
+        // saved state itself was different (pre-rollback desync).
+        self.dumpState("after-loadState");
 
         self.remote_inputs.clearLastChanged();
         self.rollback_timer = 0;

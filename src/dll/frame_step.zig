@@ -467,6 +467,13 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         });
     }
 
+    // Dump state before every saveState during re-runs (fast_fwd_stop_frame != 0)
+    // and for the first few frames after a rollback completes. This lets us
+    // compare the exact state being saved between host and client.
+    if (n.isRerunning() or (n.indexed_frame.frame < 80 and n.indexed_frame.frame > 50)) {
+        n.dumpState(if (n.isRerunning()) "before-saveState-rerun" else "before-saveState");
+    }
+
     const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, n.start_world_time);
 
     if (is_first_frame_of_in_game) {

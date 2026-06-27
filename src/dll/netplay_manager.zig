@@ -568,6 +568,14 @@ pub const NetplayManager = struct {
 
     intro_rng_enabled: bool = false,
 
+    // Track whether we've completed the first in_game entry. Used to gate
+    // intro_done RNG sync: only sync at intro_done for rounds 2+ (after
+    // skippable), not for round 1 (chara_intro -> in_game). Without this,
+    // the host sends RNG at intro_done after waiting many frames in
+    // chara_intro for the slow peer, but the client applies it early,
+    // causing a ~750 frame RNG advancement mismatch.
+    first_in_game_completed: bool = false,
+
     // Host-side cache of the RNG state captured for each transition index.
     // Populated by `syncRngState` when the host captures+sends RNG to the
     // client. Looked up by `getCachedRngState` so the SpectatorManager can
@@ -1052,11 +1060,33 @@ pub const NetplayManager = struct {
                     self.enet_connected = true;
                     self.was_connected = true;
                     self.log.info("Main peer connected", .{});
+                    // Send current TransitionIndex now that we're connected.
+                    // State transitions during lazy reconnect (chara_select -> loading -> chara_intro -> in_game)
+                    // increment indexed_frame.index but couldn't send TransitionIndex because ENet wasn't connected yet.
+                    // The client waits in isRemoteInputReady for remote_end_index >= our_index, which requires
+                    // receiving TransitionIndex via setRemoteIndex -> resizeOuter. Without this, the client
+                    // waits indefinitely after character select.
+                    if (!self.config.is_spectator and self.config.is_netplay) {
+                        var buf: [5]u8 = undefined;
+                        buf[0] = 0x03; // TransitionIndex
+                        std.mem.writeInt(u32, buf[1..5], self.indexed_frame.index, .little);
+                        self.sendReliable(&buf);
+                        self.log.info("Sent TransitionIndex on connect (index={d})", .{self.indexed_frame.index});
+                    }
                 } else if (!self.config.is_host) {
                     self.enet_peer = event.peer;
                     self.enet_connected = true;
                     self.was_connected = true;
                     self.log.info("ENet peer connected!", .{});
+                    // Client: send current TransitionIndex on connect.
+                    // The client may have transitioned states during the connection attempt.
+                    if (!self.config.is_spectator and self.config.is_netplay) {
+                        var buf: [5]u8 = undefined;
+                        buf[0] = 0x03; // TransitionIndex
+                        std.mem.writeInt(u32, buf[1..5], self.indexed_frame.index, .little);
+                        self.sendReliable(&buf);
+                        self.log.info("Sent TransitionIndex on connect (index={d})", .{self.indexed_frame.index});
+                    }
                 } else if (self.spectators != null) {
                     self.spectators.?.onNewPeer(peer_opt, std.Io.Clock.now(.real, self.io).toMilliseconds());
                 }
@@ -1981,14 +2011,21 @@ pub const NetplayManager = struct {
         // Track the intro-done edge so we enable RNG exactly once per round.
         // (game_state_addr isn't a simple monotonic flag — it cycles through
         // several values — so we watch for the 99 value with a one-shot.)
-        if (!self.intro_rng_enabled and game_state_addr.* == game_state_intro_done) {
+        //
+        // Only arm RNG sync at intro_done for rounds 2+ (after skippable).
+        // For round 1 (chara_intro -> in_game), RNG is already synced at
+        // chara_select entry and in_game entry. Arming at intro_done here
+        // causes desync because the host waits many frames in chara_intro
+        // for the slow peer, advancing RNG, then sends that advanced RNG
+        // which the client applies early — creating a ~750 frame mismatch.
+        if (!self.intro_rng_enabled and game_state_addr.* == game_state_intro_done and self.first_in_game_completed) {
             self.intro_rng_enabled = true;
             self.should_sync_rng = true;
             self.rng_synced = false;
             self.rng_acked = false;
             self.rng_send_cooldown = 0;
             self.rng_send_count = 0;
-            self.log.info("Intro done (game_state=99) — RNG sync enabled", .{});
+            self.log.info("Intro done (game_state=99) — RNG sync enabled (round 2+)", .{});
         }
 
         // chara_intro → in_game: requires BOTH signals to fire.
@@ -2263,6 +2300,12 @@ pub const NetplayManager = struct {
             // by checkIntroDone when game_state == 99.
             self.intro_rng_enabled = true;
 
+            // Mark first in_game as completed so that checkIntroDone knows
+            // to enable intro_done RNG sync for subsequent rounds (2+).
+            if (new == .in_game) {
+                self.first_in_game_completed = true;
+            }
+
             // Client/Spectator: apply the cached RNG state if we received and cached it early
             if (!self.config.is_host) {
                 var cached_body: [rng_body_size]u8 = undefined;
@@ -2284,6 +2327,12 @@ pub const NetplayManager = struct {
         // longer clears it because we WANT chara_select to be armed.
         if (new == .loading) {
             self.intro_rng_enabled = false;
+        }
+
+        // Reset first_in_game_completed when starting a new match at chara_select.
+        // This allows intro_done RNG sync to work for the new match's round 1.
+        if (new == .chara_select) {
+            self.first_in_game_completed = false;
         }
 
         // Retry-menu sync gate: quando entramos em .retry_menu, verifica se

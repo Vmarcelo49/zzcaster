@@ -887,34 +887,24 @@ fn saveFpu(out: *SavedFpu) void {
 
 // Restore the FPU control state (x87 control word + SSE MXCSR).
 //
-// DIAGNOSTIC SPLIT VERSION: logs between fldcw and ldmxcsr to identify
-// which instruction crashes. The previous combined asm made it impossible
-// to tell which instruction faulted.
+// CURRENTLY A NO-OP: The ldmxcsr instruction was crashing the process
+// with a #GP fault, even with a valid MXCSR value (0x1F80 — the standard
+// default). The crash is likely a codegen issue with Zig 0.16's inline
+// asm on x86-32 (the "m" constraint may be generating an invalid
+// addressing mode for ldmxcsr).
+//
+// Since MBAACC sets the FPU control words once at process startup and
+// never modifies them during gameplay, skipping the FPU restore is safe.
+// The saved cw/mxcsr values are still stored in SavedState for future use
+// once the codegen issue is resolved.
+//
+// The previous split-asm diagnostics confirmed:
+//   - fldcw succeeds (log shows "fldcw done")
+//   - ldmxcsr crashes (log ends at "about to ldmxcsr")
+//   - The mxcsr value (0x1F80) is the standard default and should NOT fault
 fn restoreFpuSplit(env: *const SavedFpu, logger: ?*logging.Logger) void {
-    if (builtin.cpu.arch != .x86) return;
-    const cw: u16 = env.cw;
-    // Keep only MXCSR control bits 6-15 (DAZ, exception masks, rounding, FTZ).
-    // Clear status bits 0-5 and reserved bits 16-31 — both cause #GP in ldmxcsr.
-    const mxcsr: u32 = env.mxcsr & 0xFFC0;
-
+    _ = env;
     if (logger) |lg| {
-        lg.info("restoreFpu: about to fldcw (cw=0x{x:0>4})", .{cw});
-        lg.sync();
-    }
-    asm volatile ("fldcw %[cw]"
-        :
-        : [cw] "m" (cw),
-    );
-    if (logger) |lg| {
-        lg.info("restoreFpu: fldcw done, about to ldmxcsr (mxcsr=0x{x:0>8})", .{mxcsr});
-        lg.sync();
-    }
-    asm volatile ("ldmxcsr %[mxcsr]"
-        :
-        : [mxcsr] "m" (mxcsr),
-    );
-    if (logger) |lg| {
-        lg.info("restoreFpu: ldmxcsr done", .{});
-        lg.sync();
+        lg.info("restoreFpu: SKIPPED (no-op) — ldmxcsr crash workaround", .{});
     }
 }

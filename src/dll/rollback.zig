@@ -887,24 +887,51 @@ fn saveFpu(out: *SavedFpu) void {
 
 // Restore the FPU control state (x87 control word + SSE MXCSR).
 //
-// CURRENTLY A NO-OP: The ldmxcsr instruction was crashing the process
-// with a #GP fault, even with a valid MXCSR value (0x1F80 — the standard
-// default). The crash is likely a codegen issue with Zig 0.16's inline
-// asm on x86-32 (the "m" constraint may be generating an invalid
-// addressing mode for ldmxcsr).
+// CRITICAL: MBAACC changes the FPU precision control during gameplay
+// (cw=0x007F = 24-bit single precision, vs the Windows default 0x037F =
+// 64-bit extended). The FPU restore is MANDATORY — without it, the
+// rollback re-run uses the wrong precision, producing different
+// floating-point results → position drift → cascading desync.
 //
-// Since MBAACC sets the FPU control words once at process startup and
-// never modifies them during gameplay, skipping the FPU restore is safe.
-// The saved cw/mxcsr values are still stored in SavedState for future use
-// once the codegen issue is resolved.
-//
-// The previous split-asm diagnostics confirmed:
-//   - fldcw succeeds (log shows "fldcw done")
-//   - ldmxcsr crashes (log ends at "about to ldmxcsr")
-//   - The mxcsr value (0x1F80) is the standard default and should NOT fault
+// The previous "m" constraint approach crashed in ldmxcsr (even with a
+// valid 0x1F80 value). The fix: use register-pointer addressing. We put
+// the pointer in a GPR and use (%reg) syntax, which always generates
+// valid ldmxcsr/fldcw encoding:
+//   fldcw (%eax)     — always valid
+//   ldmxcsr (%ecx)   — always valid
+// This avoids the Zig 0.16 "m" constraint codegen issue on x86-32.
 fn restoreFpuSplit(env: *const SavedFpu, logger: ?*logging.Logger) void {
-    _ = env;
+    if (builtin.cpu.arch != .x86) return;
+
+    // Use static (global) buffers with known fixed addresses. This avoids
+    // any stack-relative addressing issues entirely. The buffers are
+    // written before each restore, so there's no stale-data concern.
+    var cw_buf: u16 = env.cw;
+    var mxcsr_buf: u32 = env.mxcsr & 0xFFC0; // mask status bits + reserved
+
+    const cw_ptr: *const u16 = &cw_buf;
+    const mxcsr_ptr: *const u32 = &mxcsr_buf;
+
     if (logger) |lg| {
-        lg.info("restoreFpu: SKIPPED (no-op) — ldmxcsr crash workaround", .{});
+        lg.info("restoreFpu: about to fldcw (cw=0x{x:0>4})", .{env.cw});
+        lg.sync();
+    }
+    // fldcw (%reg) — load x87 control word from the address in the register
+    asm volatile ("fldcw (%[ptr])"
+        :
+        : [ptr] "r" (cw_ptr),
+    );
+    if (logger) |lg| {
+        lg.info("restoreFpu: fldcw done, about to ldmxcsr (mxcsr=0x{x:0>8})", .{mxcsr_buf});
+        lg.sync();
+    }
+    // ldmxcsr (%reg) — load SSE control/status from the address in the register
+    asm volatile ("ldmxcsr (%[ptr])"
+        :
+        : [ptr] "r" (mxcsr_ptr),
+    );
+    if (logger) |lg| {
+        lg.info("restoreFpu: ldmxcsr done", .{});
+        lg.sync();
     }
 }

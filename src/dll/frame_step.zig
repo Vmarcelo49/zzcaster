@@ -153,11 +153,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // detector fires, the RNG has genuinely diverged — NOT a false positive.
     n.checkChecksumDesync();
     if (n.desync_detected or n.checksum_desync_detected) {
-        // DIAGNOSTIC: Log the desync but do NOT force-close the game.
-        // The desync detector is firing after rollbacks, but the game may
-        // still be playable. We log the details and continue running so
-        // we can observe the actual gameplay behavior.
-        state.log.?.err("Desync detected (synchash={} checksum={}) at index={d} frame={d} — LOGGING ONLY (no force-exit)", .{
+        state.log.?.err("Desync detected (synchash={} checksum={}) at index={d} frame={d} — force-exiting match", .{
             n.desync_detected, n.checksum_desync_detected,
             n.indexed_frame.index, n.indexed_frame.frame,
         });
@@ -169,10 +165,8 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         if (n.desync_detected) {
             state.log.?.err("  -> SyncHash: see prior 'Desync between' log for MD5/timer/camera/chara details", .{});
         }
-        // Clear the desync flags so we don't log the same desync every frame.
-        n.desync_detected = false;
-        n.checksum_desync_detected = false;
-        // Do NOT set alive_flag_addr.* = 0 — keep the game running.
+        state.alive_flag_addr.* = 0;
+        return;
     }
 
     if (is_first_frame_of_in_game) {

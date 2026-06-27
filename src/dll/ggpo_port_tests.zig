@@ -649,3 +649,225 @@ test "Phase 2: per-frame sleep correction timing" {
     // Should be ~42 frames.
     try expect(frames_to_correct > 35.0 and frames_to_correct < 50.0);
 }
+
+// =============================================================================
+// Phase 3: Reliability — discardConfirmedFrames + StatePool sizing
+//
+// discardConfirmedFrames bounds the InputBuffer's memory usage by removing
+// inputs old enough that the remote has confirmed them. Without this, the
+// InputBuffer grows by 1 entry per frame for the entire round (~5940 entries
+// for a 99-second round = ~285KB). With it, the buffer stays at ~30 entries
+// (the resend window + safety margin = ~1.4KB).
+// =============================================================================
+
+test "Phase 3: discardConfirmedFrames removes old inputs" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Set inputs at frames 1-100 for index 5.
+    var f: u32 = 1;
+    while (f <= 100) : (f += 1) {
+        buf.set(5, f, @intCast(f));
+    }
+    try expectEqual(@as(u32, 100), buf.inputs.count());
+
+    // Discard inputs older than frame 50.
+    buf.discardConfirmedFrames(5, 50);
+
+    // Frames 1-49 should be removed (49 entries).
+    // Frames 50-100 should be retained (51 entries).
+    try expectEqual(@as(u32, 51), buf.inputs.count());
+
+    // Verify specific frames are retained.
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 50)));
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 100)));
+    // Verify old frames are gone.
+    try expect(!buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 1)));
+    try expect(!buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 49)));
+}
+
+test "Phase 3: discardConfirmedFrames preserves other indices" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Set inputs at index 5 frame 10, and index 6 frame 10.
+    buf.set(5, 10, 0xAA);
+    buf.set(6, 10, 0xBB);
+    try expectEqual(@as(u32, 2), buf.inputs.count());
+
+    // Discard index 5's inputs older than frame 20.
+    // Frame 10 < 20, so index 5 frame 10 should be removed.
+    // Index 6 frame 10 should be PRESERVED (different index).
+    buf.discardConfirmedFrames(5, 20);
+
+    try expectEqual(@as(u32, 1), buf.inputs.count());
+    try expect(!buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 10)));
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(6, 10)));
+}
+
+test "Phase 3: discardConfirmedFrames preserves inputs at exact boundary" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Set inputs at frames 49, 50, 51 for index 5.
+    buf.set(5, 49, 0x01);
+    buf.set(5, 50, 0x02);
+    buf.set(5, 51, 0x03);
+
+    // Discard inputs with frame < 50 (strictly less than).
+    // Frame 49 should be removed; frames 50 and 51 should be retained.
+    buf.discardConfirmedFrames(5, 50);
+
+    try expectEqual(@as(u32, 2), buf.inputs.count());
+    try expect(!buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 49)));
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 50)));
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 51)));
+}
+
+test "Phase 3: discardConfirmedFrames with empty buffer is no-op" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Discard from an empty buffer — should not crash.
+    buf.discardConfirmedFrames(5, 100);
+    try expectEqual(@as(u32, 0), buf.inputs.count());
+}
+
+test "Phase 3: discardConfirmedFrames with no matching index is no-op" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Set inputs at index 5.
+    buf.set(5, 10, 0xAA);
+    buf.set(5, 20, 0xBB);
+    try expectEqual(@as(u32, 2), buf.inputs.count());
+
+    // Discard index 99 (no inputs there) — should be a no-op.
+    buf.discardConfirmedFrames(99, 100);
+    try expectEqual(@as(u32, 2), buf.inputs.count());
+}
+
+test "Phase 3: InputBuffer memory bounded after discard" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Set 1000 inputs for index 5 (simulating ~16 seconds of gameplay).
+    var f: u32 = 1;
+    while (f <= 1000) : (f += 1) {
+        buf.set(5, f, @intCast(f & 0xFFFF));
+    }
+    try expectEqual(@as(u32, 1000), buf.inputs.count());
+
+    // Discard all but the last 16 frames (frame 985+).
+    buf.discardConfirmedFrames(5, 985);
+
+    // Should have ~16 entries remaining (frames 985-1000).
+    try expect(buf.inputs.count() <= 16);
+    try expect(buf.inputs.count() >= 15); // exact count depends on boundary
+}
+
+test "Phase 3: discardConfirmedFrames handles large batch (>64 stack buffer)" {
+    const allocator = std.testing.allocator;
+    var buf = rb.InputBuffer.init(allocator);
+    defer buf.deinit();
+
+    // Set 200 inputs — exceeds the 64-entry stack buffer in discardConfirmedFrames,
+    // forcing the heap fallback path.
+    var f: u32 = 1;
+    while (f <= 200) : (f += 1) {
+        buf.set(5, f, @intCast(f & 0xFFFF));
+    }
+    try expectEqual(@as(u32, 200), buf.inputs.count());
+
+    // Discard all but the last 10 frames.
+    buf.discardConfirmedFrames(5, 191);
+
+    // Should have ~10 entries remaining (frames 191-200).
+    try expect(buf.inputs.count() <= 10);
+    try expect(buf.inputs.count() >= 9);
+    // Verify the newest entries are retained.
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 200)));
+    try expect(buf.inputs.contains(rb.InputBuffer.makeKeyTest(5, 191)));
+}
+
+test "Phase 3: StatePool 90 states survives 1.5s rollback" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    var dummy: u32 = 0;
+    try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
+    // Allocate 90 states (1.5 seconds at 60fps).
+    try pool.allocate(90, 0);
+
+    // Save 90 states at frames 0-89.
+    var f: u32 = 0;
+    while (f < 90) : (f += 1) {
+        dummy = f;
+        _ = pool.saveState(f, 1);
+    }
+    try expectEqual(@as(usize, 90), pool.saved_states.items.len);
+
+    // Verify we can load the OLDEST state (frame 0).
+    // With 60 states, this would have failed (frame 0 evicted).
+    // With 90 states, frame 0 is still in the pool.
+    const loaded = pool.loadStateForFrame(0, 1);
+    try expect(loaded != null);
+    try expectEqual(@as(u32, 0), loaded.?);
+    try expectEqual(@as(u32, 0), dummy); // restored to the frame-0 value
+}
+
+test "Phase 3: StatePool 90 states survives 89-frame rollback" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    var dummy: u32 = 0;
+    try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
+    try pool.allocate(90, 0);
+
+    // Save states at frames 0 and 89 (the extremes).
+    dummy = 100;
+    _ = pool.saveState(0, 1);
+    dummy = 200;
+    _ = pool.saveState(89, 1);
+
+    // Load frame 0 — should succeed (within the 90-state window).
+    const loaded = pool.loadStateForFrame(0, 1);
+    try expect(loaded != null);
+    try expectEqual(@as(u32, 100), dummy); // restored to frame-0 value
+}
+
+test "Phase 3: StatePool ring eviction still works at 90 states" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    var dummy: u32 = 0;
+    try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
+    try pool.allocate(90, 0);
+
+    // Save 95 states — should evict the oldest 5.
+    var f: u32 = 0;
+    while (f < 95) : (f += 1) {
+        dummy = f;
+        _ = pool.saveState(f, 1);
+    }
+
+    // Only 90 states should be saved (ring capacity).
+    try expectEqual(@as(usize, 90), pool.saved_states.items.len);
+
+    // Frame 0-4 should have been evicted.
+    try expect(pool.loadStateForFrame(0, 1) == null);
+    try expect(pool.loadStateForFrame(4, 1) == null);
+
+    // Frame 5 should still be available.
+    const loaded = pool.loadStateForFrame(5, 1);
+    try expect(loaded != null);
+}

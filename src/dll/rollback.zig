@@ -123,6 +123,61 @@ pub const InputBuffer = struct {
         self.end_index = 0;
     }
 
+    /// Remove all inputs for `index` with frame < min_frame.
+    ///
+    /// Called when the remote confirms it has received and processed our inputs
+    /// up to `min_frame`. Inputs older than that can never be needed again:
+    ///   - Rollback only re-simulates frames that are in the rollback window
+    ///     (at most `max_rollback` = 15 frames back), and `min_frame` is set
+    ///     with a 16-frame safety margin beyond the remote's last-confirmed frame.
+    ///   - The remote's `get` fallback (`last_inputs[index]`) handles frames
+    ///     beyond what's stored, so removing old entries doesn't break prediction.
+    ///
+    /// This bounds the InputBuffer's memory usage: instead of growing by 1
+    /// entry per frame for the entire round (~5940 entries for a 99-second
+    /// round = ~285KB), the buffer stays at ~30 entries (the resend window +
+    /// safety margin) = ~1.4KB.
+    ///
+    /// Ported from ggpo-x's InputQueue::DiscardConfirmedFrames (which GGPO
+    /// calls when SetLastConfirmedFrame advances the confirmed boundary).
+    /// zzcaster's protocol doesn't have an explicit input-ack, so we
+    /// approximate: the remote's input packet's `start_frame` tells us
+    /// they've processed our inputs up to `start_frame - 1`.
+    pub fn discardConfirmedFrames(self: *InputBuffer, index: u32, min_frame: u32) void {
+        // Two-pass: collect keys to remove, then remove them. We can't remove
+        // while iterating (invalidates the iterator), so we buffer the keys.
+        // Use a stack-allocated array for the common case (≤64 old entries);
+        // fall back to heap if there are more (e.g. first discard after a long
+        // gap with no remote packets).
+        var stack_buf: [64]u64 = undefined;
+        var heap_buf: std.ArrayList(u64) = .empty;
+        defer heap_buf.deinit(self.allocator);
+
+        var count: usize = 0;
+        var it = self.inputs.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            const key_index = @as(u32, @intCast(key >> 32));
+            const key_frame = @as(u32, @intCast(key & 0xFFFFFFFF));
+            if (key_index == index and key_frame < min_frame) {
+                if (count < stack_buf.len) {
+                    stack_buf[count] = key;
+                } else {
+                    heap_buf.append(self.allocator, key) catch break;
+                }
+                count += 1;
+            }
+        }
+
+        // Remove the collected keys.
+        for (stack_buf[0..@min(count, stack_buf.len)]) |key| {
+            _ = self.inputs.remove(key);
+        }
+        for (heap_buf.items) |key| {
+            _ = self.inputs.remove(key);
+        }
+    }
+
     /// Grow the outer dimension so that `index` is considered "reached" by
     /// the remote peer, without populating any actual inputs for that index.
     /// Mirrors CCCaster's `InputsContainer::resize(index, 0, 0)` called from
@@ -162,6 +217,13 @@ pub const InputBuffer = struct {
 
     pub fn getEndIndex(self: *const InputBuffer) u32 {
         return self.end_index;
+    }
+
+    /// Public alias for makeKey, exposed so unit tests can construct keys
+    /// for `inputs.contains()` checks. Production code uses `set`/`get`/`setRemote`
+    /// which call makeKey internally.
+    pub fn makeKeyTest(index: u32, frame: u32) u64 {
+        return makeKey(index, frame);
     }
 
     fn makeKey(index: u32, frame: u32) u64 {

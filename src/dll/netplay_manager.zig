@@ -1364,6 +1364,26 @@ pub const NetplayManager = struct {
         if (has_checksum and remote_checksum_frame != 0xFFFF and index == self.indexed_frame.index) {
             self.remote_checksums.put(@as(u32, remote_checksum_frame), remote_checksum) catch {};
         }
+
+        // Bounded input history (ported from ggpo-x, Phase 3).
+        // The remote is at `start_frame`, so they've processed our inputs up to
+        // `start_frame - 1` (lockstep assumption). Discard our LOCAL inputs older
+        // than `start_frame - 16` — keep a 16-frame safety margin so we don't
+        // discard inputs that might still be needed for a rollback re-send.
+        //
+        // zzcaster's protocol doesn't have an explicit input-ack (unlike GGPO's
+        // InputAck packet), so we approximate using the remote's start_frame.
+        // The safety margin (16) equals checksum_delay, which is >= max_rollback
+        // (15), guaranteeing no rollback window can reach the discarded range.
+        //
+        // This bounds InputBuffer memory: instead of growing ~5940 entries for
+        // a 99-second round (~285KB), it stays at ~30 entries (~1.4KB).
+        if (index == self.indexed_frame.index) {
+            const discard_before: u32 = if (start_frame >= 16) start_frame - 16 else 0;
+            if (discard_before > 0) {
+                self.local_inputs.discardConfirmedFrames(self.indexed_frame.index, discard_before);
+            }
+        }
     }
 
     pub fn getRemoteInput(self: *const NetplayManager) u16 {
@@ -2735,7 +2755,13 @@ pub const NetplayManager = struct {
                 }
                 self.log.info("Loaded {d} rollback memory regions ({d} bytes per state)", .{ rollback_regions.all_regions.len, self.state_pool.totalRegionSize() });
 
-                self.state_pool.allocate(60, 0) catch {
+                // StatePool sizing: 90 states = 1.5 seconds at 60fps (ported
+                // from ggpo-x, Phase 3). The original 60 (1.0s) was tight for
+                // transcontinental play — network jitter > 1s would cause
+                // "no saved state for frame" rollback failures. 90 gives 50%
+                // more headroom. Memory cost: 90 × ~850KB ≈ 76MB, acceptable
+                // for a 32-bit Windows game (MBAACC's address space is 2-4GB).
+                self.state_pool.allocate(90, 0) catch {
                     self.log.warn("StatePool allocate failed — rollback disabled", .{});
                 };
             } else {

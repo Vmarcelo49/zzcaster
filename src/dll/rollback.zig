@@ -294,6 +294,9 @@ pub const StatePool = struct {
     /// what the docs/dll-optimization-plan.md calls "coalesced" regions.
     coalesced_regions: std.ArrayList(MemoryRegion) = .empty,
     saved_states: std.ArrayList(SavedState),
+    /// Optional DLL logger for diagnostics. When set, loadState/saveState
+    /// diagnostics go to the DLL log file (not stderr like std.log).
+    logger: ?*logging.Logger = null,
 
     pub fn init(allocator: std.mem.Allocator) StatePool {
         return .{
@@ -713,16 +716,19 @@ pub const StatePool = struct {
         const state = self.saved_states.items[slot];
         const src = state.data;
 
-        // DIAG: log entry to loadState
-        std.log.info("StatePool.loadState: slot={d} frame={d} index={d} src.len={d} regions={d}", .{
-            slot, state.frame, state.index, src.len, self.coalesced_regions.items.len,
-        });
+        // DIAG: log entry to loadState — use the DLL logger if available
+        // (std.log goes to stderr, which the DLL log file doesn't capture).
+        if (self.logger) |lg| {
+            lg.info("StatePool.loadState: slot={d} frame={d} index={d} src.len={d} regions={d}", .{
+                slot, state.frame, state.index, src.len, self.coalesced_regions.items.len,
+            });
+        }
 
         // Restore FPU control state FIRST (before any float ops).
         // restoreFpu() handles the arch guard internally.
-        std.log.info("StatePool.loadState: restoring FPU...", .{});
+        if (self.logger) |lg| lg.info("StatePool.loadState: restoring FPU...", .{});
         restoreFpu(&state.fpu_env);
-        std.log.info("StatePool.loadState: FPU restored", .{});
+        if (self.logger) |lg| lg.info("StatePool.loadState: FPU restored", .{});
 
         // Restore all (coalesced) memory regions. See `saveState` for why this
         // walks the coalesced list and not the raw region list.
@@ -741,22 +747,23 @@ pub const StatePool = struct {
                 region_overflow = true;
                 break;
             }
-            // DIAG: log each region before restoring (only for large regions
-            // or every 10th region to avoid log flooding)
-            if (r.size >= 1024 or region_idx % 10 == 0) {
-                std.log.info("StatePool.loadState: region[{d}] addr=0x{x:0>8} size={d} pos={d}", .{
-                    region_idx, r.addr, r.size, pos,
-                });
+            // DIAG: log each region before restoring (large regions or every 10th)
+            if (self.logger) |lg| {
+                if (r.size >= 1024 or region_idx % 10 == 0) {
+                    lg.info("StatePool.loadState: region[{d}] addr=0x{x:0>8} size={d} pos={d}", .{
+                        region_idx, r.addr, r.size, pos,
+                    });
+                }
             }
             const dst: [*]u8 = @ptrFromInt(r.addr);
             @memcpy(dst[0..r.size], src[pos .. pos + r.size]);
             pos += r.size;
             region_idx += 1;
         }
-        std.log.info("StatePool.loadState: all regions restored (pos={d})", .{pos});
+        if (self.logger) |lg| lg.info("StatePool.loadState: all regions restored (pos={d})", .{pos});
         if (region_overflow) {
             // Uses .warn (not .err) — see saveState's overflow comment.
-            std.log.warn("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{
+            if (self.logger) |lg| lg.warn("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{
                 pos, src.len, self.coalesced_regions.items.len,
             });
             // Don't free subsequent states — the restore was incomplete,

@@ -2882,6 +2882,9 @@ pub const NetplayManager = struct {
                 self.state_pool.allocate(90, 0) catch {
                     self.log.warn("StatePool allocate failed — rollback disabled", .{});
                 };
+                // Set the DLL logger on the state_pool so loadState/saveState
+                // diagnostics go to the DLL log file (not stderr like std.log).
+                self.state_pool.logger = self.log;
             } else {
                 self.state_pool.reset();
                 self.log.info("Resetting rollback StatePool for rematch", .{});

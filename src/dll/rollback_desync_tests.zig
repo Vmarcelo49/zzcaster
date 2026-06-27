@@ -381,3 +381,151 @@ test "REGRESSION: StatePool ring-buffer eviction (oldest recycled when full)" {
     const ok = pool.loadStateForFrame(2, 1);
     try expect(ok != null);
 }
+
+// =============================================================================
+// FIX 4: StatePool.saveState checksum excludes non-deterministic regions
+//         (CC_WORLD_TIMER_ADDR and effect struct pointers at offset 0x320)
+//         to prevent false-positive desyncs at in_game frame 0.
+//
+// Original bug:
+//   The per-frame checksum was computed over the ENTIRE saved state buffer,
+//   including CC_WORLD_TIMER_ADDR (the game's global frame counter). Because
+//   the loading state is not lockstepped (isRemoteInputReady returns true
+//   for .loading), host and client enter chara_intro — and subsequently
+//   in_game — at different absolute world_timer values. This constant offset
+//   persists through in_game and causes Wyhash's avalanche to produce
+//   completely different 16-bit checksums at in_game frame 0, even though
+//   the relative game state is identical. The desync detector then
+//   force-exits the match.
+//
+//   CCCaster's SyncHash (DllHacks.cpp:267-278) avoids this by hashing ONLY
+//   the RNG state + character selection (~236 bytes), not the full buffer.
+//   zzcaster's per-frame checksum (ported from ggpo-x) is more thorough but
+//   must mask non-deterministic regions to avoid false positives.
+//
+// Fix:
+//   computeDeterministicChecksum streams Wyhash over the coalesced regions
+//   and replaces CC_WORLD_TIMER_ADDR bytes + effect pointer bytes (offset
+//   0x320 in each of the 1000 effects) with zeros in the hash stream. The
+//   saved data still includes the original bytes (for rollback restore), but
+//   they don't contribute to the desync-detection checksum.
+//
+//   These tests verify computeDeterministicChecksum DIRECTLY (bypassing
+//   saveState, which would try to read from the real MBAACC addresses
+//   0x55D1D4 / 0x67BDE8 that are unmapped in the test environment).
+// =============================================================================
+
+test "FIX 4a: checksum is invariant to CC_WORLD_TIMER_ADDR changes" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    // Set up a coalesced region at CC_WORLD_TIMER_ADDR (0x55D1D4, 4 bytes).
+    // We test computeDeterministicChecksum directly — no saveState call,
+    // so no read from the unmapped MBAACC address space.
+    try pool.coalesced_regions.append(allocator, .{ .addr = 0x55D1D4, .size = 4 });
+    pool.state_size = 4;
+
+    // Two buffers: same except for the world_timer bytes.
+    var buf1: [4]u8 = .{ 100, 0, 0, 0 }; // world_timer = 100
+    var buf2: [4]u8 = .{ 200, 0, 0, 0 }; // world_timer = 200
+
+    const cksum1 = pool.computeDeterministicChecksum(&buf1);
+    const cksum2 = pool.computeDeterministicChecksum(&buf2);
+
+    // Checksums should be IDENTICAL because world_timer is masked out.
+    try expectEqual(cksum1, cksum2);
+}
+
+test "FIX 4b: world_timer masking works when timer is inside a larger coalesced region" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    // Simulate coalescing: a single region [0x55D1D0 .. 0x55D1DC) that
+    // contains CC_WORLD_TIMER_ADDR (0x55D1D4) at offset 4.
+    try pool.coalesced_regions.append(allocator, .{ .addr = 0x55D1D0, .size = 12 });
+    pool.state_size = 12;
+
+    // buf1: [AA AA AA AA] [100 0 0 0] [BB BB BB BB]
+    // buf2: [AA AA AA AA] [200 0 0 0] [BB BB BB BB]
+    // The world_timer bytes (offset 4..8) differ; everything else is same.
+    var buf1: [12]u8 = .{ 0xAA, 0xAA, 0xAA, 0xAA, 100, 0, 0, 0, 0xBB, 0xBB, 0xBB, 0xBB };
+    var buf2: [12]u8 = .{ 0xAA, 0xAA, 0xAA, 0xAA, 200, 0, 0, 0, 0xBB, 0xBB, 0xBB, 0xBB };
+
+    const cksum1 = pool.computeDeterministicChecksum(&buf1);
+    const cksum2 = pool.computeDeterministicChecksum(&buf2);
+
+    // Checksums should be IDENTICAL — only the masked timer bytes differ.
+    try expectEqual(cksum1, cksum2);
+
+    // And the checksum should differ from a buffer where the NON-masked
+    // bytes differ, to confirm the rest of the region is still hashed.
+    var buf3: [12]u8 = .{ 0xAA, 0xAA, 0xAA, 0xAA, 100, 0, 0, 0, 0xCC, 0xCC, 0xCC, 0xCC };
+    const cksum3 = pool.computeDeterministicChecksum(&buf3);
+    try expect(cksum1 != cksum3);
+}
+
+test "FIX 4c: checksum is invariant to effect pointer (offset 0x320) changes" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    // Set up a coalesced region matching the production effects array:
+    // 1000 effects × 0x33C bytes at 0x67BDE8.
+    const effects_total = 1000 * 0x33C;
+    try pool.coalesced_regions.append(allocator, .{
+        .addr = 0x67BDE8,
+        .size = effects_total,
+    });
+    pool.state_size = effects_total;
+
+    // Allocate two buffers. We can't fill 850KB with unique bytes in a
+    // test, so we use allocator.alloc and zero-fill, then poke specific
+    // bytes that should / shouldn't affect the checksum.
+    const buf1 = try allocator.alloc(u8, effects_total);
+    defer allocator.free(buf1);
+    const buf2 = try allocator.alloc(u8, effects_total);
+    defer allocator.free(buf2);
+    @memset(buf1, 0);
+    @memset(buf2, 0);
+
+    // In buf1, set effect[0]'s pointer at offset 0x320 to 0xDEADBEEF.
+    // In buf2, set the same byte range to 0xCAFEBABE.
+    // These are heap-address-like values that would differ between
+    // processes. The checksum should be invariant.
+    buf1[0x320] = 0xEF; buf1[0x321] = 0xBE; buf1[0x322] = 0xAD; buf1[0x323] = 0xDE;
+    buf2[0x320] = 0xBE; buf2[0x321] = 0xBA; buf2[0x322] = 0xFE; buf2[0x323] = 0xCA;
+
+    const cksum1 = pool.computeDeterministicChecksum(buf1);
+    const cksum2 = pool.computeDeterministicChecksum(buf2);
+
+    // Checksums should be IDENTICAL because the pointer field is masked.
+    try expectEqual(cksum1, cksum2);
+
+    // Now change a NON-masked byte in the effect struct (offset 0x100,
+    // well before the pointer at 0x320). The checksum should differ.
+    buf2[0x100] = 0x42;
+    const cksum3 = pool.computeDeterministicChecksum(buf2);
+    try expect(cksum1 != cksum3);
+}
+
+test "FIX 4d: deterministic regions (RNG, player structs) are still hashed normally" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    // A region that is NOT world_timer and NOT the effects array — should
+    // be hashed normally, so different bytes produce different checksums.
+    try pool.coalesced_regions.append(allocator, .{ .addr = 0x563778, .size = 8 }); // RNG state
+    pool.state_size = 8;
+
+    var buf1: [8]u8 = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
+    var buf2: [8]u8 = .{ 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x99 }; // last byte differs
+
+    const cksum1 = pool.computeDeterministicChecksum(&buf1);
+    const cksum2 = pool.computeDeterministicChecksum(&buf2);
+
+    // Different bytes → different checksum (deterministic region is hashed).
+    try expect(cksum1 != cksum2);
+}

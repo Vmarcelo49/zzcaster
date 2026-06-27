@@ -2958,7 +2958,9 @@ pub const NetplayManager = struct {
         // makes preemption ~10x less likely without permanently starving
         // other threads. We restore priority inside `checkRerunComplete`
         // once `fast_fwd_stop_frame == 0`.
+        self.log.info("[DIAG checkRollback] calling win32.boostForRerun()", .{});
         win32.boostForRerun();
+        self.log.info("[DIAG checkRollback] boostForRerun done", .{});
 
         // Trigger rollback!
         const current_frame = self.indexed_frame.frame;

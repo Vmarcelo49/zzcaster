@@ -713,9 +713,16 @@ pub const StatePool = struct {
         const state = self.saved_states.items[slot];
         const src = state.data;
 
+        // DIAG: log entry to loadState
+        std.log.info("StatePool.loadState: slot={d} frame={d} index={d} src.len={d} regions={d}", .{
+            slot, state.frame, state.index, src.len, self.coalesced_regions.items.len,
+        });
+
         // Restore FPU control state FIRST (before any float ops).
         // restoreFpu() handles the arch guard internally.
+        std.log.info("StatePool.loadState: restoring FPU...", .{});
         restoreFpu(&state.fpu_env);
+        std.log.info("StatePool.loadState: FPU restored", .{});
 
         // Restore all (coalesced) memory regions. See `saveState` for why this
         // walks the coalesced list and not the raw region list.
@@ -728,15 +735,25 @@ pub const StatePool = struct {
         // subsequent states) so the corruption is at least visible in logs.
         var pos: usize = 0;
         var region_overflow = false;
+        var region_idx: usize = 0;
         for (self.coalesced_regions.items) |r| {
             if (pos + r.size > src.len) {
                 region_overflow = true;
                 break;
             }
+            // DIAG: log each region before restoring (only for large regions
+            // or every 10th region to avoid log flooding)
+            if (r.size >= 1024 or region_idx % 10 == 0) {
+                std.log.info("StatePool.loadState: region[{d}] addr=0x{x:0>8} size={d} pos={d}", .{
+                    region_idx, r.addr, r.size, pos,
+                });
+            }
             const dst: [*]u8 = @ptrFromInt(r.addr);
             @memcpy(dst[0..r.size], src[pos .. pos + r.size]);
             pos += r.size;
+            region_idx += 1;
         }
+        std.log.info("StatePool.loadState: all regions restored (pos={d})", .{pos});
         if (region_overflow) {
             // Uses .warn (not .err) — see saveState's overflow comment.
             std.log.warn("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{

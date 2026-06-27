@@ -52,8 +52,44 @@ pub const InputBuffer = struct {
             if (check_changes) {
                 const used_input = self.get(index, frame);
                 if (used_input != input) {
-                    if (self.last_changed_frame == null or key < self.last_changed_frame.?) {
+                    // Update last_changed_frame, but ONLY for the current or
+                    // a LATER index. A stale input from a PREVIOUS index must
+                    // NOT poison last_changed_frame — if it did, the stale key
+                    // (which is smaller than any current-index key) would
+                    // block all future current-index changes from being
+                    // detected, because `key < last_changed_frame` would
+                    // always be false for the current index.
+                    //
+                    // The original code used:
+                    //   if (last_changed_frame == null or key < last_changed_frame.?)
+                    // This is correct WITHIN a single index (finds the
+                    // earliest changed frame), but ACROSS indices it breaks:
+                    // a stale index-4 key (4<<32|8) is smaller than a valid
+                    // index-5 key (5<<32|5), so the stale key wins and the
+                    // valid change is silently dropped.
+                    //
+                    // Fixed logic:
+                    //   - If no lcf is set, set it (always).
+                    //   - If the new key's index is GREATER than lcf's index,
+                    //     the old lcf is from a stale index — replace it.
+                    //   - If the new key's index EQUALS lcf's index, take the
+                    //     minimum frame (original behavior).
+                    //   - If the new key's index is LESS than lcf's index,
+                    //     the new key is stale — ignore it.
+                    const new_index_part = index;
+                    if (self.last_changed_frame == null) {
                         self.last_changed_frame = key;
+                    } else {
+                        const lcf = self.last_changed_frame.?;
+                        const lcf_index = @as(u32, @intCast(lcf >> 32));
+                        if (new_index_part > lcf_index) {
+                            // Newer index — replace stale lcf.
+                            self.last_changed_frame = key;
+                        } else if (new_index_part == lcf_index and key < lcf) {
+                            // Same index — take earliest frame.
+                            self.last_changed_frame = key;
+                        }
+                        // else: new_index < lcf_index → stale, ignore.
                     }
                 }
             }
@@ -435,13 +471,45 @@ pub const StatePool = struct {
         // regions into ~61 contiguous chunks, dramatically reducing
         // memcpy call overhead and letting the compiler emit wide
         // `rep movsb` / vector instructions for the larger blocks.
+        //
+        // SAFETY: if any region doesn't fit (pos + r.size > state_size),
+        // the previous implementation SILENTLY SKIPPED the copy but still
+        // advanced `pos`. This had two catastrophic effects:
+        //   1. The saved snapshot was missing data (silent corruption).
+        //   2. All subsequent regions were also skipped (pos was too large).
+        // On load, the missing regions were not restored, causing the game
+        // to continue with corrupted memory → desync.
+        //
+        // In production, state_size = totalRegionSize() after coalescing,
+        // so the check should never fail. But if coalesceRegions has an
+        // overlap-merge bug that miscalculates the total, this check fails.
+        // We now log an error and skip the SAVE entirely (return null) so
+        // the caller can detect the failure rather than silently corrupting
+        // the rollback state pool.
         var pos: usize = 0;
+        var region_overflow = false;
         for (self.coalesced_regions.items) |r| {
-            if (pos + r.size <= self.state_size) {
-                const src: [*]const u8 = @ptrFromInt(r.addr);
-                @memcpy(dst[pos .. pos + r.size], src[0..r.size]);
+            if (pos + r.size > self.state_size) {
+                // Region doesn't fit — coalesceRegions or allocate has a bug.
+                region_overflow = true;
+                break;
             }
+            const src: [*]const u8 = @ptrFromInt(r.addr);
+            @memcpy(dst[pos .. pos + r.size], src[0..r.size]);
             pos += r.size;
+        }
+        if (region_overflow) {
+            // Log and bail — don't save a partial snapshot. The caller
+            // (frameStepNetplay) discards the return value, so a null return
+            // just means "no state saved this frame". The next frame will
+            // retry; if the overflow persists, rollback will eventually fail
+            // with "no saved state for frame" (caught by checkRollback).
+            std.log.err("StatePool.saveState: region overflow (pos={d}, state_size={d}, regions={d}) — save skipped to prevent corruption", .{
+                pos, self.state_size, self.coalesced_regions.items.len,
+            });
+            // Return the slot to the free stack so it's not leaked.
+            self.free_stack.append(self.allocator, slot) catch {};
+            return null;
         }
 
         // Save FPU control state (cw + MXCSR only — see SavedFpu doc).
@@ -474,13 +542,31 @@ pub const StatePool = struct {
 
         // Restore all (coalesced) memory regions. See `saveState` for why this
         // walks the coalesced list and not the raw region list.
+        //
+        // SAFETY: same overflow check as saveState. If a region doesn't fit,
+        // the previous implementation silently skipped the restore, leaving
+        // the game's memory in a partially-restored state. This caused
+        // immediate desyncs after any rollback that hit the overflow path.
+        // We now log an error and abort the restore (return without freeing
+        // subsequent states) so the corruption is at least visible in logs.
         var pos: usize = 0;
+        var region_overflow = false;
         for (self.coalesced_regions.items) |r| {
-            if (pos + r.size <= src.len) {
-                const dst: [*]u8 = @ptrFromInt(r.addr);
-                @memcpy(dst[0..r.size], src[pos .. pos + r.size]);
+            if (pos + r.size > src.len) {
+                region_overflow = true;
+                break;
             }
+            const dst: [*]u8 = @ptrFromInt(r.addr);
+            @memcpy(dst[0..r.size], src[pos .. pos + r.size]);
             pos += r.size;
+        }
+        if (region_overflow) {
+            std.log.err("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{
+                pos, src.len, self.coalesced_regions.items.len,
+            });
+            // Don't free subsequent states — the restore was incomplete,
+            // and freeing would lose history we might need for diagnosis.
+            return;
         }
 
         // Free all states after this one (they're invalidated)

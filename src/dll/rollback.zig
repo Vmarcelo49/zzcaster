@@ -613,118 +613,92 @@ pub const StatePool = struct {
         return slot;
     }
 
-    /// Compute a deterministic checksum of the saved state buffer, EXCLUDING
-    /// regions that legitimately differ between peers and would cause
-    /// false-positive desync detections.
+    /// Compute a deterministic checksum of the saved state buffer by hashing
+    /// ONLY the RNG state regions.
     ///
-    /// ## Root cause this fixes
+    /// ## Why RNG-only
     ///
-    /// The per-frame desync detector (ported from ggpo-x) hashes the ENTIRE
-    /// ~850KB saved state buffer. CCCaster's SyncHash — by contrast — hashes
-    /// ONLY the RNG state + character selection (DllHacks.cpp:267-278, ~236
-    /// bytes). The discrepancy is that zzcaster's hash includes regions that
-    /// are non-deterministic across processes:
+    /// The previous approach (hashing the entire ~850KB buffer with a
+    /// blocklist of non-deterministic regions) still produced false-positive
+    /// desyncs at in_game frame 0 because the buffer contains many regions
+    /// that legitimately differ between peers:
     ///
-    /// 1. **CC_WORLD_TIMER_ADDR (0x55D1D4, 4 bytes)** — MBAACC's global frame
-    ///    counter, started at 0 on launch and incremented by 1 per game frame.
-    ///    The `loading` state is NOT lockstepped (`isRemoteInputReady` returns
-    ///    true for `.loading`), so host and client enter `chara_intro` — and
-    ///    subsequently `in_game` — at different absolute `world_timer` values.
-    ///    This constant offset persists through in_game (both peers advance
-    ///    `world_timer` by 1 per frame). Wyhash's avalanche effect turns a
-    ///    4-byte difference into completely different 16-bit checksums,
-    ///    triggering a false-positive "CHECKSUM DESYNC at frame 0" that
-    ///    force-exits the match even though the relative game state is
-    ///    identical.
+    /// - CC_WORLD_TIMER_ADDR (0x55D1D4) — absolute frame counter, differs
+    ///   because `loading` is not lockstepped.
+    /// - CC_GRAPHICS_ARRAY (0x61E170, 1.5MB) — rendering/animation data that
+    ///   may depend on absolute frame timing or contain heap-resident pointers.
+    /// - CC_GRAPHICS_COUNTER (0x67BD78) — absolute incrementing counter.
+    /// - CC_METER_ANIMATION_ADDR (0x7717D8) — UI animation counter.
+    /// - Intro/outro graphics (0x74D598+) — visual state from chara_intro
+    ///   that differs if intro ran for different frame counts.
+    /// - Effect struct pointers (offset 0x320 in each of 1000 effects) —
+    ///   heap-resident addresses that differ via ASLR.
     ///
-    /// 2. **Effect struct pointer fields (offset 0x320, 4 bytes each, ×1000)**
-    ///    — CCCaster saves a 3-level pointer-deref chain for each effect
-    ///    (`tools/Generator.cpp:291-297`); zzcaster saves only the flat
-    ///    `0x33C`-byte struct. The raw 4-byte pointer at offset `0x320` may
-    ///    be a heap-resident address that differs between processes (ASLR /
-    ///    heap layout). If chara_intro spawned visual effects whose pointers
-    ///    are still non-NULL at in_game frame 0, the flat region already
-    ///    captures those raw pointer values, and they will differ.
+    /// Maintaining a complete blocklist is fragile — any missed non-deterministic
+    /// region causes a false-positive force-close. CCCaster's proven approach
+    /// (DllHacks.cpp:267-278) avoids this entirely by hashing ONLY the RNG
+    /// state (4+4+4+220 = 232 bytes) for its SyncHash. We mirror that here.
     ///
-    /// ## What this function does
+    /// ## What we lose
     ///
-    /// Walks the coalesced regions with a streaming Wyhash. For regions that
-    /// contain a masked address, the masked bytes are replaced with zeros in
-    /// the hash stream (the actual `dst` buffer is NOT modified — the saved
-    /// data still includes the original bytes for rollback restore). This
-    /// preserves the thorough per-frame desync detection for all DETERMINISTIC
-    /// state (RNG, player structs, camera, timers that count down from a
-    /// fixed value, etc.) while ignoring the known non-deterministic regions.
+    /// Non-RNG gameplay divergence (e.g., from non-deterministic code) won't
+    /// be caught by the per-frame checksum. It will still be caught by:
+    /// - The periodic SyncHash (every 300 frames), which also hashes
+    ///   round_timer, camera, and chara data.
+    /// - Rollback (input buffer comparison), which catches input mismatches.
+    /// - Invalid state transition detection.
     ///
-    /// Performance: streaming Wyhash over ~850KB with 2 special-cased
-    /// regions costs the same ~170μs as the previous `Wyhash.hash(0, dst)`
-    /// call — the per-region `update` calls are inlined and the skip logic
-    /// only triggers for 2 of ~61 coalesced regions.
+    /// MBAACC is single-threaded with no wall-clock dependencies in gameplay,
+    /// so if RNG is synced and inputs are synced (via rollback), the game
+    /// state is deterministic. RNG divergence is the most common desync cause
+    /// and is caught immediately by this checksum.
+    ///
+    /// ## Performance
+    ///
+    /// Hashing only ~232 bytes (vs the previous ~850KB) is ~3700x faster,
+    /// reducing the per-frame checksum cost from ~170μs to negligible.
     pub fn computeDeterministicChecksum(self: *const StatePool, dst: []const u8) u64 {
-        // Non-deterministic region #1: CC_WORLD_TIMER_ADDR.
-        const world_timer_addr: usize = 0x55D1D4;
-        const world_timer_size: usize = 4;
-
-        // Non-deterministic region #2: effect struct pointers.
-        // The effects array is a single contiguous block of 1000 × 0x33C
-        // bytes at 0x67BDE8. Each effect struct has a pointer at offset
-        // 0x320 that may be a heap-resident address.
-        const effects_array_addr: usize = 0x67BDE8;
-        const effects_count: usize = 1000;
-        const effect_size: usize = 0x33C;
-        const effect_ptr_offset: usize = 0x320;
-        const effect_ptr_size: usize = 4;
-        const effects_total_size: usize = effects_count * effect_size;
+        // RNG state address ranges (from rollback_regions.zig / Constants.hpp).
+        // These are the ONLY regions that are both deterministic across peers
+        // and sufficient for desync detection (matching CCCaster's SyncHash).
+        const rng_ranges = [_]struct { addr: usize, size: usize }{
+            .{ .addr = 0x563778, .size = 4 }, // CC_RNG_STATE0_ADDR
+            .{ .addr = 0x56377C, .size = 4 }, // CC_RNG_STATE1_ADDR
+            .{ .addr = 0x564068, .size = 4 }, // CC_RNG_STATE2_ADDR
+            .{ .addr = 0x564070, .size = 220 }, // CC_RNG_STATE3_ADDR
+        };
 
         var hasher = std.hash.Wyhash.init(0);
         var pos: usize = 0;
 
+        // Walk coalesced regions. For each, find overlaps with RNG ranges
+        // and hash only those overlapping bytes.
         for (self.coalesced_regions.items) |r| {
             if (r.addr == 0 or r.size == 0) {
                 pos += r.size;
                 continue;
             }
 
-            // Check if this coalesced region contains CC_WORLD_TIMER_ADDR.
-            if (r.addr <= world_timer_addr and
-                world_timer_addr + world_timer_size <= r.addr + r.size)
-            {
-                const timer_off = world_timer_addr - r.addr;
-                // Hash bytes before the timer.
-                if (timer_off > 0) {
-                    hasher.update(dst[pos .. pos + timer_off]);
+            const r_start = r.addr;
+            const r_end = r.addr + r.size;
+
+            for (rng_ranges) |rng| {
+                const rng_start = rng.addr;
+                const rng_end = rng.addr + rng.size;
+
+                // Check for overlap.
+                if (rng_start >= r_end or rng_end <= r_start) {
+                    // No overlap — skip.
+                    continue;
                 }
-                // Hash zeros for the timer (don't let the absolute frame
-                // counter contribute to the desync checksum).
-                const zeros = [_]u8{0} ** world_timer_size;
-                hasher.update(&zeros);
-                // Hash bytes after the timer.
-                const after_off = timer_off + world_timer_size;
-                if (after_off < r.size) {
-                    hasher.update(dst[pos + after_off .. pos + r.size]);
-                }
-            } else if (r.addr == effects_array_addr and r.size >= effects_total_size) {
-                // Effects array: hash each effect struct but skip the
-                // pointer field at offset 0x320 (heap-resident, differs
-                // between processes).
-                var i: usize = 0;
-                while (i < effects_count) : (i += 1) {
-                    const es = pos + i * effect_size;
-                    // Hash [0, 0x320)
-                    hasher.update(dst[es .. es + effect_ptr_offset]);
-                    // Skip [0x320, 0x324) — the pointer
-                    // Hash [0x324, 0x33C)
-                    const after_ptr = es + effect_ptr_offset + effect_ptr_size;
-                    hasher.update(dst[after_ptr .. es + effect_size]);
-                }
-                // Hash any remaining bytes beyond the effects array (in
-                // case coalescing merged a following region into this one).
-                if (r.size > effects_total_size) {
-                    hasher.update(dst[pos + effects_total_size .. pos + r.size]);
-                }
-            } else {
-                // Deterministic region — hash normally.
-                hasher.update(dst[pos .. pos + r.size]);
+
+                // Compute the overlapping range within this coalesced region.
+                const overlap_start = @max(rng_start, r_start);
+                const overlap_end = @min(rng_end, r_end);
+                const buf_offset = pos + (overlap_start - r_start);
+                const overlap_len = overlap_end - overlap_start;
+
+                hasher.update(dst[buf_offset .. buf_offset + overlap_len]);
             }
 
             pos += r.size;

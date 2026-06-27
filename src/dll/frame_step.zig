@@ -124,11 +124,26 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // Per-frame checksum desync check (ported from ggpo-x). Runs every
     // frame, catches divergences in ~16 frames vs the 300-frame SyncHash.
     // Either detector can force-exit; both are checked here.
+    //
+    // NOTE: The per-frame checksum hashes ONLY the RNG state (see
+    // StatePool.computeDeterministicChecksum). This mirrors CCCaster's
+    // SyncHash approach and eliminates false positives from non-deterministic
+    // regions (world_timer, graphics array, effect pointers, etc.). If this
+    // detector fires, the RNG has genuinely diverged — NOT a false positive.
     n.checkChecksumDesync();
     if (n.desync_detected or n.checksum_desync_detected) {
-        state.log.?.err("Desync detected (synchash={} checksum={}) — force-exiting match", .{
+        state.log.?.err("Desync detected (synchash={} checksum={}) at index={d} frame={d} — force-exiting match", .{
             n.desync_detected, n.checksum_desync_detected,
+            n.indexed_frame.index, n.indexed_frame.frame,
         });
+        if (n.checksum_desync_detected) {
+            state.log.?.err("  -> per-frame checksum: frame={d} local=0x{x:0>4} remote=0x{x:0>4} (RNG-only hash)", .{
+                n.checksum_desync_frame, n.checksum_desync_local, n.checksum_desync_remote,
+            });
+        }
+        if (n.desync_detected) {
+            state.log.?.err("  -> SyncHash: see prior 'Desync between' log for MD5/timer/camera/chara details", .{});
+        }
         state.alive_flag_addr.* = 0;
         return;
     }

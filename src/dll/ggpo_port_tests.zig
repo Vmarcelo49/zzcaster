@@ -57,7 +57,12 @@ test "Phase 1a: checksum is deterministic (same state → same checksum)" {
     try expectEqual(cksum1, cksum2);
 }
 
-test "Phase 1a: checksum detects state change" {
+test "Phase 1a: checksum is invariant to non-RNG state changes" {
+    // With RNG-only hashing (mirroring CCCaster's SyncHash, see
+    // computeDeterministicChecksum), non-RNG state changes do NOT affect
+    // the per-frame checksum. Only RNG state changes are detected.
+    // See FIX 4 tests in rollback_desync_tests.zig for verification that
+    // RNG changes ARE detected.
     const allocator = std.testing.allocator;
     var pool = rb.StatePool.init(allocator);
     defer pool.deinit();
@@ -69,12 +74,13 @@ test "Phase 1a: checksum detects state change" {
     _ = pool.saveState(10, 1);
     const cksum1 = pool.saved_states.items[0].checksum;
 
-    // Modify the state.
+    // Modify the state — this is a non-RNG region (stack address), so the
+    // checksum should NOT change.
     dummy = 0xBBBB;
     _ = pool.saveState(11, 1);
     const cksum2 = pool.saved_states.items[1].checksum;
 
-    try expect(cksum1 != cksum2);
+    try expectEqual(cksum1, cksum2);
 }
 
 test "Phase 1a: getChecksumForFrame returns the correct checksum" {

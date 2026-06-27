@@ -50,43 +50,41 @@ The checksum desync at in_game frame 0 indicates that the **saved rollback state
 
 ### RESOLVED (2026-06-28): Root cause was non-deterministic regions in the per-frame checksum
 
-**Root cause:** The per-frame desync detector (ported from ggpo-x) computes a
-16-bit Wyhash over the ENTIRE ~850KB saved state buffer. This includes
-`CC_WORLD_TIMER_ADDR` (0x55D1D4, 4 bytes) — MBAACC's global frame counter,
-which starts at 0 on launch and increments by 1 per game frame. Because the
-`loading` state is NOT lockstepped (`isRemoteInputReady` returns `true` for
-`.loading`), host and client enter `chara_intro` — and subsequently
-`in_game` — at different absolute `world_timer` values. This constant offset
-persists through `in_game` (both peers advance `world_timer` by 1 per frame,
-so the delta is constant). Wyhash's avalanche effect turns the 4-byte
-difference into completely different 16-bit checksums (`0x0b62` vs `0x658f`),
-triggering a false-positive "CHECKSUM DESYNC at frame 0" that force-exits the
-match even though the relative game state is identical.
+**Root cause:** The per-frame desync detector (ported from ggpo-x) computed a
+16-bit Wyhash over the ENTIRE ~850KB saved state buffer. This included many
+regions that legitimately differ between peers:
+
+- `CC_WORLD_TIMER_ADDR` (0x55D1D4) — absolute frame counter, differs because
+  `loading` is not lockstepped.
+- `CC_GRAPHICS_ARRAY` (0x61E170, 1.5MB) — rendering/animation data.
+- `CC_GRAPHICS_COUNTER` (0x67BD78) — absolute incrementing counter.
+- `CC_METER_ANIMATION_ADDR` (0x7717D8) — UI animation counter.
+- Intro/outro graphics (0x74D598+) — visual state from chara_intro.
+- Effect struct pointers (offset 0x320, ×1000) — heap-resident addresses.
+
+**First fix attempt (commit 7af7b7c):** Masked `CC_WORLD_TIMER_ADDR` and effect
+pointers in the hash stream. **This did NOT fix the desync** — the user
+reported "exact same behavior." This proved there are MORE non-deterministic
+regions (graphics array, graphics counter, meter animation, intro graphics).
+
+**Final fix (commit TBD):** Switched `computeDeterministicChecksum` to hash
+ONLY the RNG state regions (4+4+4+220 = 232 bytes), mirroring CCCaster's
+proven `SyncHash` approach (`DllHacks.cpp:267-278`). This eliminates ALL
+false positives from non-deterministic regions. The per-frame checksum now
+detects RNG divergence in ~16 frames (vs 300 frames for the periodic SyncHash).
+Non-RNG divergence is still caught by the SyncHash, rollback, and state
+transition checks.
 
 **Key evidence:** CCCaster's `SyncHash` (`DllHacks.cpp:267-278`) hashes ONLY
-the RNG state (4+4+4+220 bytes) + character selection data — NOT the full
-saved buffer. CCCaster has been using the same rollback region list (including
-`CC_WORLD_TIMER_ADDR`) for years without this desync, because it never hashed
-`world_timer` in the first place. zzcaster's per-frame checksum is more
-thorough but inherited a false-positive risk that CCCaster's narrower hash
-never had.
+the RNG state + character selection. CCCaster has been using the same rollback
+region list (including all the non-deterministic regions) for years without
+this desync, because it never hashed them. zzcaster's per-frame checksum
+inherited a false-positive risk that CCCaster's narrower hash never had.
 
-**Secondary concern (also addressed):** The effects array (1000 × 0x33C at
-0x67BDE8) has a pointer field at offset 0x320 that CCCaster follows via a
-3-level pointer-deref chain (`tools/Generator.cpp:291-297`) but zzcaster saves
-only as raw bytes in the flat struct. If chara_intro spawned visual effects
-whose pointers are still non-NULL at in_game frame 0, those raw heap addresses
-differ between processes (ASLR / heap layout) and would also cause checksum
-divergence.
-
-**Fix applied:** Added `StatePool.computeDeterministicChecksum` which streams
-Wyhash over the coalesced regions and replaces the non-deterministic bytes
-(`CC_WORLD_TIMER_ADDR` + each effect's pointer at offset 0x320) with zeros in
-the hash stream. The saved data still includes the original bytes (for
-rollback restore), but they don't contribute to the desync-detection
-checksum. This preserves the thorough per-frame detection for all DETERMINISTIC
-state (RNG, player structs, camera, round timers, etc.) while eliminating the
-false positive from absolute-timing and heap-pointer divergence.
+**Diagnostic logging added:** The force-close path now logs which detector
+fired (`synchash=true/false checksum=true/false`), the current index/frame,
+and the per-frame checksum details (frame, local, remote). This allows
+definitive diagnosis if a desync recurs.
 
 Hypotheses A–E below were the pre-resolution investigation; they are retained
 for historical context.

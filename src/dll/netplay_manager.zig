@@ -421,6 +421,19 @@ const sync_queue_len: u8 = 16;
 // at frame 149.
 const rng_resend_period: u32 = 30;
 
+// Per-frame desync detection (ported from ggpo-x). How many frames must
+// elapse before a saved state's checksum is "confirmed" — i.e. no future
+// rollback can invalidate it. Matches ggpo-x's HowFarBackForChecksums() = 16.
+// Must be >= max_rollback (currently 15) so a rollback window can't
+// overwrite the checksummed state before the comparison runs.
+const checksum_delay: u32 = 16;
+
+// RTT EMA alpha (ported from ggpo-x). Weight given to the new RTT sample
+// each frame. ~0.0033 per frame at 60fps = 10-second time constant.
+// Matches ggpo-x's `emaConstant = 2 / (1.0 + nSamples)` where
+// nSamples = 10000ms / 16.6ms_per_frame ≈ 602.
+const rtt_ema_alpha: f64 = 2.0 / (1.0 + 10_000.0 / 16.6);
+
 // Round-over: extra frames to wait before committing the InGame→Skippable
 // transition when rollback is enabled. Matches ROLLBACK_ROUND_OVER_DELAY in
 // DllMain.cpp:38.
@@ -585,7 +598,7 @@ pub const NetplayManager = struct {
     // The periodic SyncHash above fires every 300 frames — worst-case
     // detection latency is 5 seconds. The per-frame checksum below
     // piggybacks a 16-bit checksum on every input packet, keyed to a
-    // frame old enough to be confirmed (CHECKSUM_DELAY = 16). This cuts
+    // frame old enough to be confirmed (checksum_delay = 16). This cuts
     // detection latency to ~16 frames (~280ms) — 30x faster.
     //
     // The SyncHash remains as a SECONDARY check (richer field-level
@@ -593,13 +606,6 @@ pub const NetplayManager = struct {
     // PRIMARY detector. Either can set desync_detected; both must agree
     // for the force-exit to fire (handled in frame_step.zig).
     // ====================================================================
-
-    /// How many frames must elapse before a saved state's checksum is
-    /// "confirmed" — i.e. no future rollback can invalidate it. Matches
-    /// ggpo-x's HowFarBackForChecksums() = 16. Must be >= max_rollback
-    /// (currently 15) so a rollback window can't overwrite the checksummed
-    /// state before the comparison runs.
-    pub const checksum_delay: u32 = 16;
 
     /// Checksums for frames we've saved locally, awaiting confirmation.
     /// Keyed by frame number (within current index). The per-frame
@@ -633,11 +639,6 @@ pub const NetplayManager = struct {
 
     rtt_ema_ms: f64 = 0,
     rtt_ema_initialized: bool = false,
-
-    /// EMA alpha: weight given to the new sample. ~0.0033 per frame at
-    /// 60fps = 10-second time constant. Matches ggpo-x's
-    /// `emaConstant = 2 / (1.0 + nSamples)` where nSamples = 10000/16.6.
-    pub const rtt_ema_alpha: f64 = 2.0 / (1.0 + 10_000.0 / 16.6);
 
     // ====================================================================
     // Network error tracking (ported from ggpo-x).

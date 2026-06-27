@@ -150,7 +150,6 @@ test "Phase 1b: EMA converges to the mean of samples" {
 test "Phase 1b: EMA smooths spikes" {
     const alpha: f64 = 2.0 / (1.0 + 10_000.0 / 16.6);
     var ema: f64 = 50.0;
-    var initialized = true;
 
     // Steady 50ms for a while.
     var i: usize = 0;

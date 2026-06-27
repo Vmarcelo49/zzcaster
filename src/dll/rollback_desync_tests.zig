@@ -311,7 +311,9 @@ test "REGRESSION: InputBuffer reset clears all state" {
     const stale = [_]u16{0x02};
     buf.setRemote(4, 8, &stale, true);
     try expect(buf.last_changed_frame != null);
-    try expectEqual(@as(u32, 1), buf.getEndIndex());
+    // set(5, ...) → updateMeta sets end_index = 6 (index 5 + 1).
+    // setRemote(4, ...) doesn't lower it. So getEndIndex() = 6, not 1.
+    try expectEqual(@as(u32, 6), buf.getEndIndex());
 
     buf.reset();
     try expect(buf.last_changed_frame == null);

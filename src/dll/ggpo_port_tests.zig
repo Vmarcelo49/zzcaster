@@ -385,3 +385,173 @@ fn expectApproxEqAbs(expected: f64, actual: f64, tolerance: f64) !void {
         return error.ApproximateEqualityFailed;
     }
 }
+
+fn expectApproxEqAbsF32(expected: f32, actual: f32, tolerance: f32) !void {
+    const diff = @abs(expected - actual);
+    if (diff > tolerance) {
+        std.debug.print("\n  expected: {d}\n  actual:   {d}\n  diff:     {d} (tolerance {d})\n", .{
+            expected, actual, diff, tolerance,
+        });
+        return error.ApproximateEqualityFailed;
+    }
+}
+
+// =============================================================================
+// Phase 2: Time-sync — remote frame estimation + sleep recommendation
+//
+// These tests verify the MATH of remoteFrameEstimate, localFrameAdvantage,
+// and recommendFrameWaitMs by replicating the formulas. We can't easily
+// instantiate a NetplayManager in a unit test (it needs ENet, game memory
+// addresses, etc.), so we test the algorithm correctness directly.
+//
+// The formulas (matching netplay_manager.zig):
+//   remoteFrameEstimate = last_received + (rtt_ms / 2) * 60 / 1000 + 0.5
+//   localFrameAdvantage  = remoteFrameEstimate - local_frame
+//   sleep_frames         = -localFrameAdvantage / 2
+//   recommendFrameWaitMs = clamp(sleep_frames, ±30) * (1000/60), or 0 if
+//                          |sleep_frames| < 3 or sleep_frames <= 0
+// =============================================================================
+
+/// Replicate remoteFrameEstimate's math for testing.
+fn computeRemoteFrameEstimate(last_received: u32, rtt_ema_ms: f64) f32 {
+    const last_f: f32 = @as(f32, @floatFromInt(last_received));
+    const single_trip_ms = rtt_ema_ms / 2.0;
+    const single_trip_frames = @as(f32, @floatCast(single_trip_ms * 60.0 / 1000.0));
+    return last_f + single_trip_frames + 0.5;
+}
+
+/// Replicate localFrameAdvantage's math for testing.
+fn computeLocalFrameAdvantage(last_received: u32, rtt_ema_ms: f64, local_frame: u32) f32 {
+    return computeRemoteFrameEstimate(last_received, rtt_ema_ms) - @as(f32, @floatFromInt(local_frame));
+}
+
+/// Replicate recommendFrameWaitMs's math for testing.
+/// Constants match netplay_manager.zig: min=3, max=30, fps=60.
+fn computeRecommendFrameWaitMs(advantage: f32) i32 {
+    const min_frame_advantage: f32 = 3.0;
+    const max_frame_advantage: f32 = 30.0;
+    const sleep_frames = -advantage / 2.0;
+    if (@abs(sleep_frames) < min_frame_advantage) return 0;
+    const clamped: f32 = if (sleep_frames > 0)
+        @min(sleep_frames, max_frame_advantage)
+    else
+        @max(sleep_frames, -max_frame_advantage);
+    if (clamped <= 0) return 0;
+    return @intFromFloat(clamped * (1000.0 / 60.0));
+}
+
+test "Phase 2: remoteFrameEstimate accounts for RTT" {
+    // Scenario: last received frame = 100, RTT = 100ms.
+    // single_trip = 50ms = 3.0 frames at 60fps.
+    // estimate = 100 + 3.0 + 0.5 = 103.5
+    const estimate = computeRemoteFrameEstimate(100, 100.0);
+    try expectApproxEqAbsF32(@as(f32, 103.5), estimate, 0.01);
+}
+
+test "Phase 2: remoteFrameEstimate with zero RTT" {
+    // No network delay — estimate is just last_received + 0.5.
+    const estimate = computeRemoteFrameEstimate(50, 0.0);
+    try expectApproxEqAbsF32(@as(f32, 50.5), estimate, 0.01);
+}
+
+test "Phase 2: remoteFrameEstimate with high RTT (200ms)" {
+    // 200ms RTT → 100ms one-way → 6.0 frames at 60fps.
+    // estimate = 200 + 6.0 + 0.5 = 206.5
+    const estimate = computeRemoteFrameEstimate(200, 200.0);
+    try expectApproxEqAbsF32(@as(f32, 206.5), estimate, 0.01);
+}
+
+test "Phase 2: localFrameAdvantage is negative when we're ahead" {
+    // We're at frame 110, remote's last received is 100, RTT=100ms.
+    // remote_est = 103.5, our frame = 110.
+    // advantage = 103.5 - 110 = -6.5 (we're 6.5 frames AHEAD → negative)
+    const advantage = computeLocalFrameAdvantage(100, 100.0, 110);
+    try expect(advantage < 0);
+    try expectApproxEqAbsF32(@as(f32, -6.5), advantage, 0.01);
+}
+
+test "Phase 2: localFrameAdvantage is positive when we're behind" {
+    // We're at frame 90, remote's last received is 100, RTT=100ms.
+    // remote_est = 103.5, our frame = 90.
+    // advantage = 103.5 - 90 = +13.5 (we're 13.5 frames BEHIND → positive)
+    const advantage = computeLocalFrameAdvantage(100, 100.0, 90);
+    try expect(advantage > 0);
+    try expectApproxEqAbsF32(@as(f32, 13.5), advantage, 0.01);
+}
+
+test "Phase 2: localFrameAdvantage ~0 when peers are aligned" {
+    // We're at frame 103, remote's last received is 100, RTT=100ms.
+    // remote_est = 103.5, our frame = 103.
+    // advantage = 103.5 - 103 = +0.5 (nearly aligned)
+    const advantage = computeLocalFrameAdvantage(100, 100.0, 103);
+    try expectApproxEqAbsF32(@as(f32, 0.5), advantage, 0.01);
+}
+
+test "Phase 2: recommendFrameWaitMs returns 0 for small drift" {
+    // advantage = 1.0 (we're 1 frame behind).
+    // sleep_frames = -1.0 / 2 = -0.5. |−0.5| < min(3) → return 0.
+    try expectEqual(@as(i32, 0), computeRecommendFrameWaitMs(1.0));
+    // advantage = -1.0 (we're 1 frame ahead).
+    // sleep_frames = 0.5. |0.5| < min(3) → return 0.
+    try expectEqual(@as(i32, 0), computeRecommendFrameWaitMs(-1.0));
+    // advantage = 2.0 (we're 2 frames behind).
+    // sleep_frames = -1.0. |−1.0| < min(3) → return 0.
+    try expectEqual(@as(i32, 0), computeRecommendFrameWaitMs(2.0));
+}
+
+test "Phase 2: recommendFrameWaitMs returns 0 when we're behind (can't speed up)" {
+    // advantage = +10 (we're 10 frames behind).
+    // sleep_frames = -5.0. |−5.0| > min(3), but clamped ≤ 0 → return 0.
+    // (We can't speed up the game's frame loop, so negative sleep = 0.)
+    try expectEqual(@as(i32, 0), computeRecommendFrameWaitMs(10.0));
+    try expectEqual(@as(i32, 0), computeRecommendFrameWaitMs(100.0));
+}
+
+test "Phase 2: recommendFrameWaitMs returns positive ms when we're ahead" {
+    // advantage = -10 (we're 10 frames ahead).
+    // sleep_frames = 5.0. 5 > min(3), 5 < max(30) → 5 frames * (1000/60) = 83ms.
+    const result = computeRecommendFrameWaitMs(-10.0);
+    try expectEqual(@as(i32, 83), result);
+}
+
+test "Phase 2: recommendFrameWaitMs clamps to max (30 frames ≈ 500ms)" {
+    // advantage = -100 (we're 100 frames ahead — extreme).
+    // sleep_frames = 50.0. 50 > max(30) → clamped to 30.
+    // 30 frames * (1000/60) = 499.99... → @intFromFloat truncates to 499.
+    // (Floating-point: 1000/60 = 16.666..., × 30 = 499.999...)
+    const result = computeRecommendFrameWaitMs(-100.0);
+    // Accept 499 or 500 — the exact value depends on float rounding.
+    try expect(result == 499 or result == 500);
+}
+
+test "Phase 2: recommendFrameWaitMs at exact min_frame_advantage boundary" {
+    // sleep_frames = exactly 3.0 → |3.0| < min(3.0) is FALSE → not ignored.
+    // But sleep_frames = 3.0 means advantage = -6.0.
+    // 3.0 frames * (1000/60) = 49.99... → @intFromFloat truncates to 49.
+    const result = computeRecommendFrameWaitMs(-6.0);
+    try expect(result == 49 or result == 50);
+}
+
+test "Phase 2: recommendFrameWaitMs just below min_frame_advantage boundary" {
+    // sleep_frames = 2.99 → |2.99| < min(3.0) is TRUE → return 0.
+    // sleep_frames = 2.99 means advantage = -5.98.
+    try expectEqual(@as(i32, 0), computeRecommendFrameWaitMs(-5.98));
+}
+
+test "Phase 2: full scenario — aligned peers, no recommendation" {
+    // Peers perfectly aligned: remote_est == local_frame.
+    // advantage = 0 → sleep_frames = 0 → return 0.
+    const advantage = computeLocalFrameAdvantage(100, 100.0, 103); // ≈ +0.5
+    const result = computeRecommendFrameWaitMs(advantage);
+    // advantage ≈ 0.5, sleep_frames ≈ -0.25, |−0.25| < 3 → return 0.
+    try expectEqual(@as(i32, 0), result);
+}
+
+test "Phase 2: full scenario — we're ahead, recommend sleep" {
+    // We're at frame 120, remote's last received is 100, RTT=100ms.
+    // remote_est = 103.5, advantage = 103.5 - 120 = -16.5.
+    // sleep_frames = 8.25. 8.25 > 3, 8.25 < 30 → 8.25 * (1000/60) ≈ 137ms.
+    const advantage = computeLocalFrameAdvantage(100, 100.0, 120);
+    const result = computeRecommendFrameWaitMs(advantage);
+    try expectEqual(@as(i32, 137), result);
+}

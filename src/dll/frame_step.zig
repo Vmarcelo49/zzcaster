@@ -105,8 +105,25 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     n.pollAndDispatch(3);
 
     // Update RTT EMA every frame (reads ENet's peer.roundTripTime).
-    // Feeds the time-sync recommendation in Phase 2.
+    // Feeds the time-sync recommendation below.
     n.updateRttEma();
+
+    // Time-sync recommendation (ported from ggpo-x, Phase 2).
+    // Every `recommendation_interval` (120) frames, log a sleep
+    // recommendation. CAVEAT: zzcaster can't actually slow down MBAACC's
+    // frame loop (the game owns the timer), so this is diagnostic only.
+    // A future hook into the game's frame timer could honor the sleep;
+    // for now, the log lets us observe peer drift in playtesting.
+    // See docs/ggpo-port-plan.md Phase 2 "Caveat" for details.
+    if (n.indexed_frame.frame > 0 and n.indexed_frame.frame % 120 == 0) {
+        const wait_ms = n.recommendFrameWaitMs();
+        const advantage = n.localFrameAdvantage();
+        const rtt = n.rttMs();
+        const remote_est = n.remoteFrameEstimate();
+        state.log.?.info("TimeSync: frame={d} rtt_ema={d:.1}ms remote_est={d:.1} advantage={d:.2} recommend_sleep={d}ms", .{
+            n.indexed_frame.frame, rtt, remote_est, advantage, wait_ms,
+        });
+    }
 
     n.maybeSendSyncHash();
     n.checkSyncHashDesync();

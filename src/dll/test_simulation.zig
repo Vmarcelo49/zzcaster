@@ -1183,5 +1183,14 @@ test "Mock Rollback Out-of-Bounds Canceled" {
 pub const desync_tests = @import("rollback_desync_tests.zig");
 
 // Import the ggpo-x port tests (Phase 1: per-frame checksums + RTT EMA +
-// NetworkError tracking).
+// NetworkError tracking; Phase 2: time-sync math).
 pub const ggpo_port_tests = @import("ggpo_port_tests.zig");
+
+// Force the imports to be evaluated so their tests are discovered by the
+// Zig 0.16 test runner. Without this, dead-code elimination may skip the
+// imported test containers (they're never referenced from the root file's
+// own test functions).
+comptime {
+    _ = desync_tests;
+    _ = ggpo_port_tests;
+}

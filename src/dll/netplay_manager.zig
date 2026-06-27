@@ -434,6 +434,23 @@ const checksum_delay: u32 = 16;
 // nSamples = 10000ms / 16.6ms_per_frame ≈ 602.
 const rtt_ema_alpha: f64 = 2.0 / (1.0 + 10_000.0 / 16.6);
 
+// Time-sync recommendation (ported from ggpo-x, Phase 2). Every
+// `recommendation_interval` frames, we compute a frame advantage and
+// log a sleep recommendation. Matches ggpo-x's RECOMMENDATION_INTERVAL = 120.
+// Note: zzcaster can't actually slow down MBAACC's frame loop (the game
+// owns the timer), so the recommendation is logged as a diagnostic only.
+// See docs/ggpo-port-plan.md Phase 2 "Caveat" for details.
+const recommendation_interval: u32 = 120;
+
+// Max sleep/speedup in frames (ggpo-x: MAX_FRAME_ADVANTAGE = 30).
+// Bounds the recommendation so a transient huge advantage can't cause
+// a multi-second sleep.
+const max_frame_advantage: f32 = 30.0;
+
+// Ignore drift below this many frames (ggpo-x: MIN_FRAME_ADVANTAGE = 3).
+// Avoids oscillating sleep recommendations when peers are nearly aligned.
+const min_frame_advantage: f32 = 3.0;
+
 // Round-over: extra frames to wait before committing the InGame→Skippable
 // transition when rollback is enabled. Matches ROLLBACK_ROUND_OVER_DELAY in
 // DllMain.cpp:38.
@@ -2550,6 +2567,81 @@ pub const NetplayManager = struct {
 
     pub fn rttMs(self: *const NetplayManager) f64 {
         return self.rtt_ema_ms;
+    }
+
+    // ================================================================
+    // Time-sync: remote frame estimation + sleep recommendation
+    // (ported from ggpo-x, Phase 2).
+    //
+    // remoteFrameEstimate: "where is the remote peer probably right now?"
+    //   = last_received_frame + (rtt_ms / 2) * fps / 1000 + 0.5
+    //
+    // The +0.5 accounts for the fact that, on average, a packet arrives
+    // halfway through one of our frames, so by the time we process it
+    // it's ~0.5 frames old. The (rtt/2) term is the one-way trip time
+    // — the packet we just received was sent ~rtt/2 ago, and the remote
+    // has advanced ~rtt/2 frames since then.
+    //
+    // localFrameAdvantage: how many frames BEHIND the remote we are.
+    //   positive = we're behind (remote is ahead), negative = we're ahead.
+    //   This is counter-intuitive but matches ggpo-x: being behind is an
+    //   "advantage" because the remote will have to predict more often
+    //   and our moves will pop in more frequently.
+    //
+    // recommendFrameWaitMs: how many ms the local peer should sleep to
+    //   re-align with the remote. Positive = sleep (we're ahead), negative
+    //   = speed up (we're behind — but zzcaster can't speed up the game,
+    //   so negative is treated as 0). Uses ggpo-x's symmetric formula:
+    //     sleep_frames = -advantage / 2
+    //   clamped to [-max_frame_advantage, +max_frame_advantage], with
+    //   drift below min_frame_advantage ignored.
+    //
+    // CAVEAT: MBAACC's frame loop is driven by the game's own vsync/timer,
+    // not by frameStepNetplay. We can't actually slow the simulation.
+    // The recommendation is logged as a diagnostic only. True cooperative
+    // time-sync would require hooking the game's frame timer (future work).
+    // See docs/ggpo-port-plan.md Phase 2 "Caveat".
+    // ================================================================
+
+    /// Estimate the remote peer's current frame, accounting for packets
+    /// in flight. Returns 0 if no remote inputs have been received yet.
+    pub fn remoteFrameEstimate(self: *const NetplayManager) f32 {
+        if (self.remote_inputs.getEndIndex() == 0) return 0;
+        const last_received: f32 = @as(f32, @floatFromInt(
+            self.remote_inputs.getEndFrame(self.indexed_frame.index),
+        ));
+        const single_trip_ms = self.rtt_ema_ms / 2.0;
+        const single_trip_frames = @as(f32, @floatCast(single_trip_ms * 60.0 / 1000.0));
+        return last_received + single_trip_frames + 0.5;
+    }
+
+    /// How many frames behind the remote peer we are.
+    /// Positive = we're behind (remote ahead), negative = we're ahead.
+    pub fn localFrameAdvantage(self: *const NetplayManager) f32 {
+        return self.remoteFrameEstimate() - @as(f32, @floatFromInt(self.indexed_frame.frame));
+    }
+
+    /// Recommend how many ms the local peer should sleep to re-align.
+    /// Positive = sleep (we're ahead), 0 = no action needed, negative =
+    /// speed up (treated as 0 by the caller since we can't speed up the
+    /// game's frame loop). Uses ggpo-x's symmetric formula, clamped.
+    pub fn recommendFrameWaitMs(self: *const NetplayManager) i32 {
+        const advantage = self.localFrameAdvantage();
+        // Symmetric formula from ggpo-x: sleep_frames = -advantage / 2.
+        // If we're behind (advantage > 0), sleep_frames is negative → 0.
+        // If we're ahead (advantage < 0), sleep_frames is positive → sleep.
+        const sleep_frames = -advantage / 2.0;
+        // Ignore tiny drift — oscillating 1-frame sleeps cause stutter.
+        if (@abs(sleep_frames) < min_frame_advantage) return 0;
+        // Clamp to ±max_frame_advantage to bound the sleep.
+        const clamped: f32 = if (sleep_frames > 0)
+            @min(sleep_frames, max_frame_advantage)
+        else
+            @max(sleep_frames, -max_frame_advantage);
+        // Convert frames → ms. Negative clamped → speed up → return 0
+        // (we can't speed up the game's frame loop).
+        if (clamped <= 0) return 0;
+        return @intFromFloat(clamped * (1000.0 / 60.0));
     }
 
     fn onEnterInGame(self: *NetplayManager) void {

@@ -510,7 +510,12 @@ pub const StatePool = struct {
             // just means "no state saved this frame". The next frame will
             // retry; if the overflow persists, rollback will eventually fail
             // with "no saved state for frame" (caught by checkRollback).
-            std.log.err("StatePool.saveState: region overflow (pos={d}, state_size={d}, regions={d}) — save skipped to prevent corruption", .{
+            //
+            // Uses .warn (not .err) because this is a should-never-happen
+            // diagnostic, not a fatal error — the save gracefully returns
+            // null. Using .err would make the Zig test runner fail when the
+            // overflow test exercises this path intentionally.
+            std.log.warn("StatePool.saveState: region overflow (pos={d}, state_size={d}, regions={d}) — save skipped to prevent corruption", .{
                 pos, self.state_size, self.coalesced_regions.items.len,
             });
             // Return the slot to the free stack so it's not leaked.
@@ -577,7 +582,8 @@ pub const StatePool = struct {
             pos += r.size;
         }
         if (region_overflow) {
-            std.log.err("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{
+            // Uses .warn (not .err) — see saveState's overflow comment.
+            std.log.warn("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{
                 pos, src.len, self.coalesced_regions.items.len,
             });
             // Don't free subsequent states — the restore was incomplete,

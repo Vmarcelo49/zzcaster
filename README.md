@@ -94,52 +94,56 @@ When you play online, you can see if your opponent is using wifi or wired.
 
 ## Netcode Improvements over CCCaster
 
-ZZCaster's rollback netcode is ported from CCCaster, which predates modern
-rollback refinements. The following changes bring it closer to current
-best practices (informed by the [ggpo-x](https://github.com/thomashenry79/ggpo-x)
-fork of GGPO). These are robustness improvements — they reduce the likelihood
-of false desyncs and improve behavior on poor connections, but do not
-change the fundamental rollback algorithm.
+ZZCaster's rollback netcode is ported from CCCaster and preserves its
+core algorithm (input delay, indexed-frame coordinates, RNG sync,
+SyncHash desync detection, TransitionIndex handshake). The following
+changes add robustness on top of that foundation. They are informed by
+the [ggpo-x](https://github.com/thomashenry79/ggpo-x) fork of GGPO but
+do not replace the rollback algorithm itself.
 
-- **Faster desync detection.** A lightweight per-frame checksum is now
-  piggybacked on every input packet. Desyncs that previously took up to
-  5 seconds to detect (via the periodic SyncHash exchange) should now be
-  caught in roughly half a second. The SyncHash mechanism is retained as
-  a secondary check with richer diagnostics.
+CCCaster already measures ping at connect time (10 pings during the
+handshake, used to compute input delay) and detects desyncs via a
+periodic SyncHash exchange every 300 frames. What's new here:
 
-- **RTT measurement.** The netcode now tracks a smoothed round-trip time
-  (via ENet's built-in RTT and a 10-second exponential moving average).
-  CCCaster had no ping measurement. This enables the time-sync logic below
-  and provides data for future diagnostic overlays.
+- **Per-frame desync detection.** A lightweight 16-bit checksum is now
+  piggybacked on every input packet, for a frame old enough to be
+  confirmed. Desyncs are caught within roughly half a second instead of
+  up to 5 seconds. The original periodic SyncHash is retained as a
+  secondary check with richer field-level diagnostics.
+
+- **Continuous RTT measurement during gameplay.** CCCaster only measures
+  ping at connect time. ZZCaster now reads ENet's built-in round-trip
+  time every frame and maintains a smoothed EMA (10-second window). This
+  does not replace the connect-time ping used for input delay; it
+  provides ongoing connection-quality data.
 
 - **Cooperative time-sync.** When the local peer is running ahead of the
-  remote, the game briefly sleeps a few milliseconds per frame to let the
-  remote catch up. This is the same mechanism GGPO uses, adapted to
-  MBAACC's game-driven frame loop. It should reduce rollback frequency on
-  asymmetric connections. The sleep is capped at 4ms per frame to avoid
-  stutter.
+  remote, the game sleeps a few milliseconds per frame to let the remote
+  catch up. This is the same idea as GGPO's frame advantage adjustment,
+  adapted to MBAACC's game-driven frame loop. The sleep is capped at 4ms
+  per frame to avoid stutter. This is the most experimental change and
+  its effect on game feel has not been extensively playtested yet.
 
-- **Larger rollback history.** The state pool grew from 60 frames (1 second)
-  to 90 frames (1.5 seconds). This gives more headroom on high-latency or
-  jittery connections where the previous 1-second window could be exhausted,
-  causing rollback to fail.
+- **Larger rollback history.** The state pool grew from 60 frames
+  (1 second, matching CCCaster's release build) to 90 frames (1.5
+  seconds). This gives more headroom on high-latency or jittery
+  connections where the 1-second window could be exhausted.
 
 - **Bounded input history.** Confirmed inputs are now discarded once the
-  remote has processed them, keeping memory usage stable over long rounds
-  instead of growing unboundedly.
+  remote has processed them, keeping memory usage stable over long rounds.
 
 - **Network error surfacing.** Consecutive send failures are now tracked
-  and logged before the 120-second heartbeat timeout fires, giving earlier
-  warning of degraded connections.
+  and logged before the heartbeat timeout fires, giving earlier warning
+  of degraded connections.
 
 - **Stale-input rollback fix.** A bug where late input packets from a
-  previous round could silently disable rollback detection for the current
-  round has been fixed. This was likely a contributor to the desync reports
-  that motivated this work.
+  previous round could silently disable rollback detection for the
+  current round has been fixed. This was likely a contributor to the
+  desync reports that motivated this work.
 
-These changes are on the `feature/ggpo-port` branch. The wire protocol
-includes a version field so mismatched clients reject each other cleanly
-at connection time rather than producing corrupted inputs.
+The wire protocol includes a version field so mismatched clients reject
+each other cleanly at connection time rather than producing corrupted
+inputs.
 
 
 ## Dependencies

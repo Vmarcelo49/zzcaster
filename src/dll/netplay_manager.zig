@@ -816,19 +816,18 @@ pub const NetplayManager = struct {
 
             // For spectators, use a non-zero connect data so the host can
             // immediately distinguish them from the main player peer.
-            // 0x5FEC is a ZZCaster-specific sentinel (does NOT match any
-            // CCCaster mechanism — CCCaster uses TCP server sockets and
-            // distinguishes spectators by connection context, not a
-            // connect-data field). The value is arbitrary; it just needs
-            // to be non-zero and distinct from the main peer's connect_data (0).
             //
-            // Protocol versioning: byte 0 = flags (spectator/player), byte 1 = protocol version.
-            // The CONNECT handler rejects mismatched versions. This prevents old clients
-            // (which send the old input packet format without checksum fields) from silently
-            // corrupting inputs when connecting to new clients.
+            // Protocol versioning: byte 0 = spectator flag (0xEC for spectator, 0 for player),
+            // byte 1 = protocol version. The host's CONNECT handler checks byte 1 and rejects
+            // mismatched versions. The spectator flag (byte 0) lets the host distinguish
+            // spectators from the main player peer.
+            //
+            // IMPORTANT: the spectator flag must fit in byte 0 only (must not bleed into
+            // byte 1 where the version lives). The old 0x5FEC sentinel spanned bytes 0-1
+            // and corrupted the version check. We now use 0xEC (low byte only).
             //   Protocol version 1 = per-frame checksums (Phase 1 of ggpo-x port)
-            const flags: u32 = if (self.config.is_spectator) 0x5FEC else 0;
-            const connect_data: u32 = (protocol_version << 8) | flags;
+            const spectator_flag: u32 = if (self.config.is_spectator) 0xEC else 0;
+            const connect_data: u32 = (protocol_version << 8) | spectator_flag;
             self.enet_peer = enet.enet_host_connect(self.enet_host, &addr, 3, connect_data);
             // Stage-0 diag: log the host_connect return — a null here means
             // the connect call itself failed (not the same as a timeout).
@@ -862,12 +861,14 @@ pub const NetplayManager = struct {
             switch (event.type) {
                 enet.ENET_EVENT_TYPE_CONNECT => {
                     // Distinguish main peer (already connected) from spectator
-                    // by checking connect data (0x5FEC ZZCaster sentinel — see
-                    // initEnet for why this doesn't match CCCaster).
+                    // by checking the spectator flag in connect_data byte 0.
+                    // Spectators send connect_data = (protocol_version << 8) | 0xEC.
+                    // Players send connect_data = (protocol_version << 8) | 0.
+                    // We check the low byte: 0xEC = spectator, 0 = player.
                     if (peer_opt) |p| {
                         if (p.data != null) {
                             const cd: *u32 = @ptrCast(@alignCast(p.data.?));
-                            if (cd.* == 0x5FEC) {
+                            if ((cd.* & 0xFF) == 0xEC) {
                                 self.spectators.?.onNewPeer(peer_opt, std.Io.Clock.now(.real, self.io).toMilliseconds());
                                 continue;
                             }
@@ -1006,20 +1007,34 @@ pub const NetplayManager = struct {
                 return null;
             },
             enet.ENET_EVENT_TYPE_CONNECT => {
-                // Protocol version check: reject peers with a mismatched wire format.
-                // connect_data is packed as (protocol_version << 8) | flags. We check
-                // byte 1 (the version) and disconnect if it doesn't match. This prevents
-                // old clients (which send the pre-Phase-1 input format without checksum
-                // fields) from silently corrupting inputs.
-                const remote_version: u32 = (event.data >> 8) & 0xFF;
-                if (remote_version != protocol_version) {
-                    self.log.err("Protocol version mismatch: local={d} remote={d} — disconnecting. Both peers must run the same zzcaster version.", .{
-                        protocol_version, remote_version,
-                    });
-                    if (peer_opt) |peer| {
-                        enet.enet_peer_disconnect(peer, 0);
+                // Protocol version check (host side only).
+                //
+                // The client sends connect_data = (protocol_version << 8) | flags
+                // in its enet_host_connect call. ENet echoes this to the host via
+                // event.data. The host extracts the version and rejects mismatched
+                // peers.
+                //
+                // IMPORTANT: Only check on the HOST side. On the CLIENT side, ENet's
+                // VERIFY_CONNECT handler sets peer->eventData = 0 (the host never
+                // calls enet_host_connect, so there's no connect_data to echo).
+                // Checking on the client side would always see version 0 and reject
+                // every connection — that was the black-screen regression.
+                //
+                // The client doesn't need this check: it already knows its own
+                // version, and the host will reject it if there's a mismatch. The
+                // client will see a DISCONNECT shortly after CONNECT if the host
+                // rejected it.
+                if (self.config.is_host) {
+                    const remote_version: u32 = (event.data >> 8) & 0xFF;
+                    if (remote_version != protocol_version) {
+                        self.log.err("Protocol version mismatch: local={d} remote={d} — disconnecting. Both peers must run the same zzcaster version.", .{
+                            protocol_version, remote_version,
+                        });
+                        if (peer_opt) |peer| {
+                            enet.enet_peer_disconnect(peer, 0);
+                        }
+                        return null;
                     }
-                    return null;
                 }
                 if (peer_opt) |peer| {
                     enet.enet_peer_timeout(peer, 0, 10000, 120000);

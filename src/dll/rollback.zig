@@ -726,9 +726,17 @@ pub const StatePool = struct {
 
         // Restore FPU control state FIRST (before any float ops).
         // restoreFpu() handles the arch guard internally.
-        if (self.logger) |lg| lg.info("StatePool.loadState: restoring FPU...", .{});
-        restoreFpu(&state.fpu_env);
-        if (self.logger) |lg| lg.info("StatePool.loadState: FPU restored", .{});
+        if (self.logger) |lg| {
+            lg.info("StatePool.loadState: restoring FPU... cw=0x{x:0>4} mxcsr_raw=0x{x:0>8} mxcsr_masked=0x{x:0>8}", .{
+                state.fpu_env.cw, state.fpu_env.mxcsr, state.fpu_env.mxcsr & 0xFFC0,
+            });
+            lg.sync(); // flush to disk before the crash-prone FPU restore
+        }
+        restoreFpuSplit(&state.fpu_env, self.logger);
+        if (self.logger) |lg| {
+            lg.info("StatePool.loadState: FPU restored", .{});
+            lg.sync(); // flush before the memcpy loop
+        }
 
         // Restore all (coalesced) memory regions. See `saveState` for why this
         // walks the coalesced list and not the raw region list.
@@ -753,6 +761,7 @@ pub const StatePool = struct {
                     lg.info("StatePool.loadState: region[{d}] addr=0x{x:0>8} size={d} pos={d}", .{
                         region_idx, r.addr, r.size, pos,
                     });
+                    lg.sync(); // flush before each region memcpy
                 }
             }
             const dst: [*]u8 = @ptrFromInt(r.addr);
@@ -760,7 +769,10 @@ pub const StatePool = struct {
             pos += r.size;
             region_idx += 1;
         }
-        if (self.logger) |lg| lg.info("StatePool.loadState: all regions restored (pos={d})", .{pos});
+        if (self.logger) |lg| {
+            lg.info("StatePool.loadState: all regions restored (pos={d})", .{pos});
+            lg.sync();
+        }
         if (region_overflow) {
             // Uses .warn (not .err) — see saveState's overflow comment.
             if (self.logger) |lg| lg.warn("StatePool.loadState: region overflow (pos={d}, src.len={d}, regions={d}) — restore incomplete, desync likely", .{
@@ -875,35 +887,34 @@ fn saveFpu(out: *SavedFpu) void {
 
 // Restore the FPU control state (x87 control word + SSE MXCSR).
 //
-// Uses `fldcw` (NOT `fldenv`) and `ldmxcsr` so that ONLY the control words
-// are written. The x87 status word, tag word, TOP pointer, and data
-// registers are left untouched — eliminating the stale-TOP / FPU-stack-
-// overflow bug that the previous `fldenv`-based implementation triggered
-// on the first rollback after entering `in_game`.
-//
-// MXCSR SAFETY: `ldmxcsr` raises a #GP (general protection fault) if the
-// value has any of the following set:
-//   - Bits 0-5: exception status flags (PE, UE, OE, ZE, DE, IE). These are
-//     READ-ONLY status flags — `stmxcsr` reads them but `ldmxcsr` rejects
-//     any non-zero value. After gameplay that triggers FP exceptions (very
-//     common in MBAACC's rendering/physics), these bits will be set in the
-//     saved MXCSR, and writing them back via `ldmxcsr` crashes the process.
-//   - Bits 16-31: reserved (must be 0).
-//
-// We mask the saved MXCSR to keep only the CONTROL bits (6-15) before
-// restoring. This is what MinGW's `fesetenv` does internally — it masks
-// the status bits before calling `ldmxcsr`. The x87 control word (`fldcw`)
-// is safe to write as-is — all 16 bits are defined and writable.
-fn restoreFpu(env: *const SavedFpu) void {
+// DIAGNOSTIC SPLIT VERSION: logs between fldcw and ldmxcsr to identify
+// which instruction crashes. The previous combined asm made it impossible
+// to tell which instruction faulted.
+fn restoreFpuSplit(env: *const SavedFpu, logger: ?*logging.Logger) void {
     if (builtin.cpu.arch != .x86) return;
     const cw: u16 = env.cw;
     // Keep only MXCSR control bits 6-15 (DAZ, exception masks, rounding, FTZ).
     // Clear status bits 0-5 and reserved bits 16-31 — both cause #GP in ldmxcsr.
     const mxcsr: u32 = env.mxcsr & 0xFFC0;
-    asm volatile (
-        "fldcw %[cw]\n\tldmxcsr %[mxcsr]"
+
+    if (logger) |lg| {
+        lg.info("restoreFpu: about to fldcw (cw=0x{x:0>4})", .{cw});
+        lg.sync();
+    }
+    asm volatile ("fldcw %[cw]"
         :
         : [cw] "m" (cw),
-          [mxcsr] "m" (mxcsr),
     );
+    if (logger) |lg| {
+        lg.info("restoreFpu: fldcw done, about to ldmxcsr (mxcsr=0x{x:0>8})", .{mxcsr});
+        lg.sync();
+    }
+    asm volatile ("ldmxcsr %[mxcsr]"
+        :
+        : [mxcsr] "m" (mxcsr),
+    );
+    if (logger) |lg| {
+        lg.info("restoreFpu: ldmxcsr done", .{});
+        lg.sync();
+    }
 }

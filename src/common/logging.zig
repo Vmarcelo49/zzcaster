@@ -103,4 +103,13 @@ pub const Logger = struct {
             sout.writeStreamingAll(self.io, "\n") catch {};
         }
     }
+
+    /// Flush the file to disk. Call this after critical diagnostic log lines
+    /// to ensure they survive a process crash (the OS file cache may not be
+    /// flushed before a crash kills the process).
+    pub fn sync(self: *Logger) void {
+        if (self.file) |f| {
+            f.sync(self.io) catch {};
+        }
+    }
 };

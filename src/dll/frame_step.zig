@@ -69,6 +69,17 @@ fn frameStepSpectator(n: *netman.NetplayManager) void {
 }
 
 fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
+    // DIAGNOSTIC: log entry to frameStepNetplay at index/frame transitions
+    // and the first few frames of in_game. This catches crashes that happen
+    // between log lines (the desync investigation showed both peers' logs
+    // ending silently after RNG sync at in_game entry).
+    const is_first_frame_of_in_game = (n.state == .in_game and n.indexed_frame.frame < 3);
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] frameStepNetplay ENTER state={s} index={d} frame={d} world_timer={d}", .{
+            @tagName(n.state), n.indexed_frame.index, n.indexed_frame.frame, world_timer,
+        });
+    }
+
     // Read local input
     const raw_input: u16 = blk: {
         if (state.reader) |*r| {
@@ -96,11 +107,21 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     n.updateFrame();
 
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] after updateFrame: indexed_frame.frame={d}", .{n.indexed_frame.frame});
+    }
+
     n.setLocalInput(local_input);
 
     n.sendLocalInputs();
 
     n.syncRngState();
+
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] after syncRngState: rng_synced={} rng_acked={}", .{
+            n.rng_synced, n.rng_acked,
+        });
+    }
 
     n.pollAndDispatch(3);
 
@@ -146,6 +167,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         }
         state.alive_flag_addr.* = 0;
         return;
+    }
+
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] after desync checks: isRemoteInputReady={}", .{n.isRemoteInputReady()});
     }
 
     // Surface network errors (10+ consecutive send failures). Don't
@@ -224,6 +249,9 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // "still loading" to "at InGame, awaiting frames" when the remote
     // finishes loading.
     if (!n.isRemoteInputReady()) {
+        if (is_first_frame_of_in_game) {
+            state.log.?.info("[DIAG] entering lockstep wait loop (isRemoteInputReady=false)", .{});
+        }
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
         var connected_since: i64 = 0; // 0 = not yet connected
         var remote_at_index_since: i64 = 0; // 0 = remote hasn't reached our index yet
@@ -330,6 +358,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
                 return;
             }
         }
+        if (is_first_frame_of_in_game) {
+            state.log.?.info("[DIAG] exited lockstep wait loop", .{});
+        }
+    }
+
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] before checkRollback: isInRollback={} rollback_timer={d} min_spacing={d}", .{
+            n.isInRollback(), n.rollback_timer, n.min_rollback_spacing,
+        });
     }
 
     // Cooperative time-sync: if we're ahead of the remote peer, sleep a
@@ -408,7 +445,19 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         if (n.rollback_timer == 0) n.rollback_timer = n.min_rollback_spacing;
     }
 
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] before saveState: state_size={d} pool_len={d} coalesced_regions={d}", .{
+            n.state_pool.state_size, n.state_pool.pool.len, n.state_pool.coalesced_regions.items.len,
+        });
+    }
+
     const save_ok = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] after saveState: save_ok={} saved_states_len={d}", .{
+            save_ok != null, n.state_pool.saved_states.items.len,
+        });
+    }
     // Record the per-frame checksum ONLY if the save succeeded (H2 fix).
     // saveState returns null on overflow/OOM; reading saved_states[len-1]
     // in that case would give us the PREVIOUS frame's checksum, causing a
@@ -425,7 +474,14 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         n.discardOldChecksums();
     }
 
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] before writeGameInputs", .{});
+    }
     n.writeGameInputs();
+
+    if (is_first_frame_of_in_game) {
+        state.log.?.info("[DIAG] after writeGameInputs — frame complete", .{});
+    }
 
     if (n.config.is_host and n.spectators != null) {
         n.spectators.?.frameStepSpectators(

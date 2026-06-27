@@ -880,10 +880,26 @@ fn saveFpu(out: *SavedFpu) void {
 // registers are left untouched — eliminating the stale-TOP / FPU-stack-
 // overflow bug that the previous `fldenv`-based implementation triggered
 // on the first rollback after entering `in_game`.
+//
+// MXCSR SAFETY: `ldmxcsr` raises a #GP (general protection fault) if the
+// value has any of the following set:
+//   - Bits 0-5: exception status flags (PE, UE, OE, ZE, DE, IE). These are
+//     READ-ONLY status flags — `stmxcsr` reads them but `ldmxcsr` rejects
+//     any non-zero value. After gameplay that triggers FP exceptions (very
+//     common in MBAACC's rendering/physics), these bits will be set in the
+//     saved MXCSR, and writing them back via `ldmxcsr` crashes the process.
+//   - Bits 16-31: reserved (must be 0).
+//
+// We mask the saved MXCSR to keep only the CONTROL bits (6-15) before
+// restoring. This is what MinGW's `fesetenv` does internally — it masks
+// the status bits before calling `ldmxcsr`. The x87 control word (`fldcw`)
+// is safe to write as-is — all 16 bits are defined and writable.
 fn restoreFpu(env: *const SavedFpu) void {
     if (builtin.cpu.arch != .x86) return;
     const cw: u16 = env.cw;
-    const mxcsr: u32 = env.mxcsr;
+    // Keep only MXCSR control bits 6-15 (DAZ, exception masks, rounding, FTZ).
+    // Clear status bits 0-5 and reserved bits 16-31 — both cause #GP in ldmxcsr.
+    const mxcsr: u32 = env.mxcsr & 0xFFC0;
     asm volatile (
         "fldcw %[cw]\n\tldmxcsr %[mxcsr]"
         :

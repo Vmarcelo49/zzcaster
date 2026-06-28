@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const logging = @import("common").logging;
 const gamepad = @import("gamepad.zig");
 const keyboard = @import("keyboard.zig");
@@ -415,6 +416,13 @@ fn applyPostLoadHacks() void {
     }
     damage_level_addr.* = 2;
     timer_speed_addr.* = 2;
+
+    // Disable the game's FPS limiter and enforce 60fps ourselves.
+    // This is critical for netplay: on high-refresh-rate monitors (144Hz+),
+    // the game can run faster than 60fps, causing world_timer to increment
+    // faster, which breaks determinism. Ported from CCCaster's DllFrameRate.
+    // Applied to ALL modes (netplay + offline) for consistent 60fps.
+    asm_hacks.applyDisableFpsLimit();
     // Write the user-configured win count to the game's "best-of-N" address
     // (CC_WIN_COUNT_VS_ADDR = 0x553FDC). The launcher's Game Config page
     // sends `win_count` via the IPC config payload, NetplayManager.configure
@@ -604,6 +612,62 @@ fn lazyInit() void {
     });
 }
 
+// ============================================================================
+// Frame rate limiter — enforces exactly 60fps using QueryPerformanceCounter.
+// Ported from CCCaster's newCasterFrameLimiter (DllFrameRate.cpp).
+//
+// The game's built-in FPS limiter is disabled (applyDisableFpsLimit writes 1
+// to CC_PERF_FREQ_ADDR). Without our own limiter, the game would run at
+// uncapped framerate on high-refresh monitors, breaking netplay determinism.
+//
+// Uses a busy-wait loop for precision (like CCCaster). Sleep() is too coarse
+// (±1ms) for 60fps timing (16.67ms per frame). The busy-wait spins on
+// QueryPerformanceCounter until enough time has elapsed.
+// ============================================================================
+
+const target_fps: u64 = 60;
+
+const qpc = struct {
+    extern "kernel32" fn QueryPerformanceFrequency(lpFrequency: *i64) callconv(.winapi) i32;
+    extern "kernel32" fn QueryPerformanceCounter(lpPerformanceCount: *i64) callconv(.winapi) i32;
+};
+
+var qpc_freq: i64 = 0;
+var qpc_prev: i64 = 0;
+var qpc_initialized: bool = false;
+
+fn limitFrameRate() void {
+    if (builtin.os.tag != .windows) return;
+
+    // Initialize on first call
+    if (!qpc_initialized) {
+        if (qpc.QueryPerformanceFrequency(&qpc_freq) == 0) return; // failed
+        if (qpc_freq == 0) return;
+        qpc_prev = 0;
+        qpc_initialized = true;
+    }
+
+    // Don't limit during skip_frames (fast-forward / rollback re-run)
+    if (skip_frames_addr.* != 0) {
+        // Still update prev so the next non-skip frame doesn't wait for
+        // the accumulated skip time.
+        _ = qpc.QueryPerformanceCounter(&qpc_prev);
+        return;
+    }
+
+    const ticks_per_frame: i64 = @divTrunc(qpc_freq, @as(i64, @intCast(target_fps)));
+
+    // Busy-wait until enough time has elapsed since the last frame.
+    // This matches CCCaster's newCasterFrameLimiter exactly.
+    var curr: i64 = 0;
+    while (true) {
+        _ = qpc.QueryPerformanceCounter(&curr);
+        if (curr - qpc_prev > ticks_per_frame) break;
+    }
+
+    qpc_prev = curr;
+}
+
 fn frameStep() callconv(.c) void {
     if (!dll_initialized.load(.acquire)) return;
     if (state.log == null) return;
@@ -720,4 +784,14 @@ fn frameStep() callconv(.c) void {
     }
 
     frame_step.frameStepInGame(world_timer, game_mode);
+
+    // Enforce 60fps using QueryPerformanceCounter. The game's built-in FPS
+    // limiter has been disabled (applyDisableFpsLimit). Without our own
+    // limiter, the game would run at uncapped framerate on high-refresh
+    // monitors, breaking netplay determinism.
+    //
+    // Ported from CCCaster's newCasterFrameLimiter (DllFrameRate.cpp).
+    // Uses a busy-wait loop (like CCCaster) for precision — Sleep is too
+    // coarse (±1ms) for 60fps timing (16.67ms per frame).
+    limitFrameRate();
 }

@@ -672,6 +672,24 @@ pub const NetplayManager = struct {
     // para não travar o jogo indefinidamente.
     retry_menu_wait_start_ms: i64 = 0,
 
+    // Wall-clock ms when the remote peer first reached our transition index
+    // during the lockstep input-wait (frame_step.zig). 0 = remote hasn't
+    // reached our index yet for the current wait.
+    //
+    // This is hoisted out of the wait loop (where it was previously a function
+    // local) so it persists across frames. The wait loop can be exited and
+    // re-entered every frame: isRemoteInputReady() flips true when a packet
+    // arrives, the outer frame loop runs one frame, then re-enters the wait.
+    // A function-local timestamp reset to 0 on each re-entry, causing the
+    // "Remote reached transition index" log line to spam (37× in one reported
+    // match) and the 10s timeout to never accumulate correctly. As a manager
+    // field it's set once per transition index and reset on each new index.
+    input_wait_remote_at_index_since_ms: i64 = 0,
+    // The transition index that input_wait_remote_at_index_since_ms was
+    // recorded for. Used to detect when we've advanced to a new index and the
+    // timestamp must be re-armed.
+    input_wait_remote_index: u32 = 0,
+
     local_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
     remote_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
     local_sync_count: u8 = 0, // entries valid from index 0
@@ -1414,6 +1432,35 @@ pub const NetplayManager = struct {
         const needed = self.indexed_frame.frame;
         const end_frame = self.remote_inputs.getEndFrame(our_index);
         return (end_frame + max_frames_ahead) > needed;
+    }
+
+    /// Record (idempotently) the wall-clock time at which the remote peer first
+    /// reached our current transition index during the lockstep input-wait.
+    ///
+    /// Returns the recorded timestamp when this is the FIRST call for the
+    /// current index (so the caller can log "starting countdown" once), and
+    /// null on subsequent calls for the same index. The timestamp persists
+    /// across wait-loop re-entries (it's a manager field), so the 10s timeout
+    /// accumulates correctly even when isRemoteInputReady() oscillates.
+    pub fn markRemoteReachedIndex(self: *NetplayManager, now_ms: i64) ?i64 {
+        if (self.input_wait_remote_index != self.indexed_frame.index) {
+            // New index — (re)arm.
+            self.input_wait_remote_index = self.indexed_frame.index;
+            self.input_wait_remote_at_index_since_ms = now_ms;
+            return now_ms;
+        }
+        if (self.input_wait_remote_at_index_since_ms == 0) {
+            // Same index, not yet armed (e.g. remote was behind, now caught up).
+            self.input_wait_remote_at_index_since_ms = now_ms;
+            return now_ms;
+        }
+        return null;
+    }
+
+    /// The wall-clock ms when the remote first reached our index during the
+    /// current wait, or 0 if it hasn't yet. Used by the wait loop's timeout.
+    pub fn inputWaitRemoteAtIndexSinceMs(self: *const NetplayManager) i64 {
+        return self.input_wait_remote_at_index_since_ms;
     }
 
     // --- Send local inputs to peer ---
@@ -2344,6 +2391,8 @@ pub const NetplayManager = struct {
         //
         self.retry_menu_waiting_for_peer = false;
         self.retry_menu_wait_start_ms = 0;
+        self.input_wait_remote_at_index_since_ms = 0;
+        self.input_wait_remote_index = 0;
 
         // Clear sync-hash desync detection queues and the desync flag.
         // Without this, leftover entries from a previous match cause a

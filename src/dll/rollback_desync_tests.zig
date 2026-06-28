@@ -481,3 +481,70 @@ test "FIX 5: deferred_lcf field exists and defaults to null" {
     try expect(stub.deferred_lcf == null);
 }
 
+// =============================================================================
+// FIX 6: input-wait "Remote reached transition index" logged once per index.
+//
+// Original bug:
+//   frame_step.zig's lockstep wait loop tracked `remote_at_index_since` as a
+//   function-local. isRemoteInputReady() can flip true when a packet arrives,
+//   exiting the loop for one frame, then re-entering it next frame with a fresh
+//   local (reset to 0). The "Remote reached transition index ... starting 10s
+//   input-wait countdown" log then fired on every re-entry — 37× in one
+//   reported match — and the 10s timeout never accumulated correctly.
+//
+// Fix:
+//   Hoist the timestamp to a NetplayManager field (input_wait_remote_at_index_since_ms)
+//   plus the index it was armed for (input_wait_remote_index).
+//   markRemoteReachedIndex returns non-null only on the first arm per index.
+//
+// This test mirrors the manager method's logic to verify the idempotency.
+// =============================================================================
+
+const InputWaitStub = struct {
+    input_wait_remote_at_index_since_ms: i64 = 0,
+    input_wait_remote_index: u32 = 0,
+    indexed_frame_index: u32 = 0,
+
+    fn markRemoteReachedIndex(self: *InputWaitStub, now_ms: i64) ?i64 {
+        if (self.input_wait_remote_index != self.indexed_frame_index) {
+            self.input_wait_remote_index = self.indexed_frame_index;
+            self.input_wait_remote_at_index_since_ms = now_ms;
+            return now_ms;
+        }
+        if (self.input_wait_remote_at_index_since_ms == 0) {
+            self.input_wait_remote_at_index_since_ms = now_ms;
+            return now_ms;
+        }
+        return null;
+    }
+};
+
+test "FIX 6a: first arm for an index returns the timestamp" {
+    var s = InputWaitStub{ .indexed_frame_index = 4 };
+    // First call arms and returns.
+    try expectEqual(@as(?i64, 1000), s.markRemoteReachedIndex(1000));
+    try expectEqual(@as(i64, 1000), s.input_wait_remote_at_index_since_ms);
+}
+
+test "FIX 6b: repeated calls for the SAME index return null (no re-log)" {
+    var s = InputWaitStub{ .indexed_frame_index = 4 };
+    _ = s.markRemoteReachedIndex(1000);
+    // Subsequent calls in the same wait (loop re-entries) must NOT re-arm.
+    try expectEqual(@as(?i64, null), s.markRemoteReachedIndex(2000));
+    try expectEqual(@as(?i64, null), s.markRemoteReachedIndex(3000));
+    // Timestamp unchanged from the first arm.
+    try expectEqual(@as(i64, 1000), s.input_wait_remote_at_index_since_ms);
+}
+
+test "FIX 6c: advancing to a new index re-arms exactly once" {
+    var s = InputWaitStub{ .indexed_frame_index = 4 };
+    _ = s.markRemoteReachedIndex(1000);
+    try expectEqual(@as(?i64, null), s.markRemoteReachedIndex(2000));
+
+    // Next round — new transition index.
+    s.indexed_frame_index = 6;
+    try expectEqual(@as(?i64, 5000), s.markRemoteReachedIndex(5000));
+    try expectEqual(@as(?i64, null), s.markRemoteReachedIndex(6000));
+    try expectEqual(@as(i64, 5000), s.input_wait_remote_at_index_since_ms);
+}
+

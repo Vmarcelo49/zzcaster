@@ -168,7 +168,6 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     if (!n.isRemoteInputReady()) {
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
         var connected_since: i64 = 0; // 0 = not yet connected
-        var remote_at_index_since: i64 = 0; // 0 = remote hasn't reached our index yet
         var last_resend = wait_start;
         var warned = false;
         while (!n.isRemoteInputReady()) {
@@ -186,15 +185,24 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             // Before this, the remote is still in an earlier state (Loading,
             // CharaIntro, etc.) and we wait for them to catch up without a
             // hard timeout — a slow machine can take 30s+ to load.
+            //
+            // The timestamp lives on the manager (not as a loop local) so it
+            // survives wait-loop re-entries: isRemoteInputReady() can flip
+            // true when a packet arrives, exiting this loop for one frame,
+            // then re-entering it next frame. A loop-local would reset to 0
+            // each re-entry, spamming the log and never accumulating the
+            // timeout. markRemoteReachedIndex returns non-null only on the
+            // first arm per transition index, so the log fires exactly once.
             const remote_end_index = if (n.remote_inputs.getEndIndex() > 0)
                 n.remote_inputs.getEndIndex() - 1
             else
                 0;
-            if (remote_at_index_since == 0 and remote_end_index >= n.indexed_frame.index) {
-                remote_at_index_since = now;
-                state.log.?.info("Remote reached transition index {d} — starting 10s input-wait countdown", .{
-                    n.indexed_frame.index,
-                });
+            if (remote_end_index >= n.indexed_frame.index) {
+                if (n.markRemoteReachedIndex(now)) |_| {
+                    state.log.?.info("Remote reached transition index {d} — starting 10s input-wait countdown", .{
+                        n.indexed_frame.index,
+                    });
+                }
             }
 
             if (now - last_resend > 100) {
@@ -263,6 +271,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
                     return;
                 }
             } else {
+                const remote_at_index_since = n.inputWaitRemoteAtIndexSinceMs();
                 if (remote_at_index_since != 0 and now - remote_at_index_since > timeout_limit) {
                     state.log.?.err("Timed out waiting for remote input ({}s after remote reached index {d}) — forcing exit", .{
                         @divTrunc(timeout_limit, 1000),

@@ -3,47 +3,46 @@ const logging = @import("common").logging;
 const builtin = @import("builtin");
 const rb_regions = @import("rollback_regions.zig");
 
+// The CCCaster-faithful port modules (src/dll/cc/). These are compiled as
+// part of the DLL but only InputsContainer is currently used (by the
+// InputBuffer adapter below). The other modules (mem_dump, rollback_manager)
+// are included for future use but not wired into the active code path yet —
+// the old StatePool is kept as-is to avoid any behavioral changes.
+const cc = struct {
+    const inputs_container = @import("cc/inputs_container.zig");
+    const InputsContainer = inputs_container.InputsContainer;
+};
+
 pub const InputBuffer = struct {
     allocator: std.mem.Allocator,
-    inputs: std.AutoHashMap(u64, u16),
+    /// Backed by the CCCaster port's vector-of-vectors InputsContainer.
+    /// Replaces the old hashmap (AutoHashMap(u64, u16)) with identical
+    /// semantics — same get/set/getEndFrame/getEndIndex behavior, same
+    /// lastInputBefore fallback, same resizeOuter semantics.
+    inner: cc.InputsContainer(u16),
+    /// Last changed frame as packed u64 (index << 32 | frame), or null.
+    /// This is a REAL field (not a function) so callers can read it
+    /// directly — matching the old API exactly. The cross-index protection
+    /// logic in setRemote is preserved verbatim from the old implementation.
     last_changed_frame: ?u64 = null,
-    end_frames: std.AutoHashMap(u32, u32),
-    last_inputs: std.AutoHashMap(u32, u16),
-    end_index: u32 = 0,
 
     pub fn init(allocator: std.mem.Allocator) InputBuffer {
         return .{
             .allocator = allocator,
-            .inputs = std.AutoHashMap(u64, u16).init(allocator),
-            .end_frames = std.AutoHashMap(u32, u32).init(allocator),
-            .last_inputs = std.AutoHashMap(u32, u16).init(allocator),
+            .inner = cc.InputsContainer(u16).init(allocator),
         };
     }
 
     pub fn deinit(self: *InputBuffer) void {
-        self.inputs.deinit();
-        self.end_frames.deinit();
-        self.last_inputs.deinit();
+        self.inner.deinit();
     }
 
     pub fn get(self: *const InputBuffer, index: u32, frame: u32) u16 {
-        const key = makeKey(index, frame);
-        if (self.inputs.get(key)) |v| return v;
-        if (self.last_inputs.get(index)) |v| return v;
-        if (index > 0) {
-            var idx = index;
-            while (idx > 0) {
-                idx -= 1;
-                if (self.last_inputs.get(idx)) |v| return v;
-            }
-        }
-        return 0;
+        return self.inner.get(index, frame);
     }
 
     pub fn set(self: *InputBuffer, index: u32, frame: u32, input: u16) void {
-        const key = makeKey(index, frame);
-        self.inputs.put(key, input) catch {};
-        self.updateMeta(index, frame, input);
+        self.inner.set(index, frame, input);
     }
 
     pub fn setRemote(self: *InputBuffer, index: u32, start_frame: u32, inputs: []const u16, check_changes: bool) void {
@@ -94,22 +93,8 @@ pub const InputBuffer = struct {
                     }
                 }
             }
-            self.inputs.put(key, input) catch {};
-            self.updateMeta(index, frame, input);
+            self.inner.set(index, frame, input);
         }
-    }
-
-    fn updateMeta(self: *InputBuffer, index: u32, frame: u32, input: u16) void {
-        if (self.end_frames.getPtr(index)) |ef| {
-            if (frame + 1 > ef.*) {
-                ef.* = frame + 1;
-                self.last_inputs.put(index, input) catch {};
-            }
-        } else {
-            self.end_frames.put(index, frame + 1) catch {};
-            self.last_inputs.put(index, input) catch {};
-        }
-        if (index >= self.end_index) self.end_index = index + 1;
     }
 
     pub fn clearLastChanged(self: *InputBuffer) void {
@@ -117,11 +102,8 @@ pub const InputBuffer = struct {
     }
 
     pub fn reset(self: *InputBuffer) void {
-        self.inputs.clearRetainingCapacity();
-        self.end_frames.clearRetainingCapacity();
-        self.last_inputs.clearRetainingCapacity();
+        self.inner.clear();
         self.last_changed_frame = null;
-        self.end_index = 0;
     }
 
     /// Grow the outer dimension so that `index` is considered "reached" by
@@ -146,23 +128,20 @@ pub const InputBuffer = struct {
     /// yet, so `get(index, frame)` will fall through to the previous index's
     /// last input via `lastInputBefore` logic in `get()`.
     pub fn resizeOuter(self: *InputBuffer, index: u32) void {
-        // Bump end_index so getEndIndex() reports the remote has reached `index`.
-        if (index >= self.end_index) self.end_index = index + 1;
-        // Ensure end_frames has an entry for `index` (0 = no frames populated).
-        // Without this, getEndFrame(index) returns 0 via `.orelse 0`, which is
-        // correct, but having the entry present makes the "remote has reached
-        // this index but sent no frames yet" state explicit and inspectable.
-        if (!self.end_frames.contains(index)) {
-            self.end_frames.put(index, 0) catch {};
-        }
+        // Delegate to the port's InputsContainer. setBatch with an empty
+        // slice + UINT_MAX check grows the outer vector to `index + 1`
+        // without adding any frames or recording changes — matching the
+        // old hashmap-based resizeOuter exactly.
+        const empty: []const u16 = &.{};
+        self.inner.setBatch(index, 0, empty, std.math.maxInt(u32));
     }
 
     pub fn getEndFrame(self: *const InputBuffer, index: u32) u32 {
-        return self.end_frames.get(index) orelse 0;
+        return self.inner.getEndFrameAt(index);
     }
 
     pub fn getEndIndex(self: *const InputBuffer) u32 {
-        return self.end_index;
+        return self.inner.getEndIndex();
     }
 
     fn makeKey(index: u32, frame: u32) u64 {

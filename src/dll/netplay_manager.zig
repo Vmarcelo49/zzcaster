@@ -2399,26 +2399,20 @@ pub const NetplayManager = struct {
         }
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
-        // Don't rollback during the first few frames of in_game. The state
-        // at frame 0 may differ between peers because both peers enter in_game
-        // at slightly different absolute world_timer values (the
-        // round_start_counter fires at the same logical frame, but the
-        // absolute timer differs due to non-lockstepped loading). Rolling back
-        // to frame 0 loads a state that's already divergent → desync.
+        // Don't rollback to early frames (0-7). The state at frame 0 may
+        // differ between peers because both peers enter in_game at slightly
+        // different absolute world_timer values. Rolling back to frame 0 or 1
+        // loads a divergent state → desync.
         //
-        // Instead, let the game run for a few frames to build up a history of
-        // converged states. By frame `rollback_min_frame_delay`, both peers
-        // have saved enough states that a rollback loads a synchronized state.
-        // The `delay` config (typically 1) adds input delay so the remote's
-        // inputs for these early frames arrive before we need them.
-        //
-        // This effectively means: during the first few frames, we accept the
-        // prediction (remote input = 0) and don't correct it. If the remote
-        // actually pressed something, the correction happens once we have
-        // enough saved states — by then, the states are converged.
-        if (self.indexed_frame.frame < rollback_min_frame_delay) {
-            // Clear the lcf so we don't keep trying to rollback during the
-            // delay window. The next real input change will set it again.
+        // We check BOTH the current frame AND the lcf_frame:
+        // - If we're still in the first few frames, skip (building up history)
+        // - If the lcf points to an early frame (< rollback_min_frame_delay),
+        //   the remote input change was detected for an early frame but the
+        //   packet arrived late. Skip and clear — we can't safely rollback to
+        //   those early divergent states.
+        if (self.indexed_frame.frame < rollback_min_frame_delay or
+            lcf_frame < rollback_min_frame_delay)
+        {
             self.remote_inputs.clearLastChanged();
             return false;
         }

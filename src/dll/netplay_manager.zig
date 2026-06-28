@@ -1296,10 +1296,14 @@ pub const NetplayManager = struct {
         // Remote is behind us — wait for them to catch up to our index
         if (remote_end_index < our_index) return false;
 
-        // Remote is ahead of us — use prediction, don't wait
-        if (remote_end_index > our_index) return true;
-
-        // Same index — check if we have the frame we need.
+        // Remote is ahead of us OR at the same index — check if we have the
+        // frame we need. Even if the remote is at a higher index (they've sent
+        // TransitionIndex for a future state), they may not have sent actual
+        // PlayerInputs for our current index yet. Without this check, we'd
+        // predict remote input = 0 and run ahead, causing a large rollback
+        // when the real inputs arrive — exactly the "huge rollback at Fight!"
+        // symptom.
+        //
         // If rollback is enabled, we can simulate up to `rollback` frames ahead.
         const max_frames_ahead = if (self.isInRollback()) self.config.rollback else 0;
         const needed = self.indexed_frame.frame;

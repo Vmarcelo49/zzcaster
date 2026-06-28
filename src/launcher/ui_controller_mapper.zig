@@ -439,14 +439,19 @@ pub fn buildDeviceList(
             const name = c.SDL_JoystickNameForIndex(j);
             if (name != null) {
                 const span = std.mem.span(name);
-                const n = @min(span.len, 63);
-                @memcpy(dev_names_buf[@intCast(dev_count)][0..n], span[0..n]);
-                dev_names_buf[@intCast(dev_count)][n] = 0;
+                const max_len = 58; // leave space for null terminator and ##{j} suffix (up to ##15)
+                const n = @min(span.len, max_len);
+                const printed = std.fmt.bufPrintZ(&dev_names_buf[@intCast(dev_count)], "{s}##{d}", .{ span[0..n], j }) catch blk: {
+                    @memcpy(dev_names_buf[@intCast(dev_count)][0..n], span[0..n]);
+                    dev_names_buf[@intCast(dev_count)][n] = 0;
+                    break :blk dev_names_buf[@intCast(dev_count)][0..n :0];
+                };
+                _ = printed;
                 dev_names[@intCast(dev_count)] = @ptrCast(&dev_names_buf[@intCast(dev_count)]);
             } else {
                 const fallback = "Unknown Joystick";
-                @memcpy(dev_names_buf[@intCast(dev_count)][0..fallback.len], fallback);
-                dev_names_buf[@intCast(dev_count)][fallback.len] = 0;
+                const printed = std.fmt.bufPrintZ(&dev_names_buf[@intCast(dev_count)], "{s}##{d}", .{ fallback, j }) catch fallback;
+                _ = printed;
                 dev_names[@intCast(dev_count)] = @ptrCast(&dev_names_buf[@intCast(dev_count)]);
             }
             dev_count += 1;

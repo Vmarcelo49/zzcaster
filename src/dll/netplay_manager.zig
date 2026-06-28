@@ -1237,7 +1237,23 @@ pub const NetplayManager = struct {
         // in getNetplayInput() ensures the lagging side auto-skips.
         switch (self.state) {
             .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
-            .chara_select, .chara_intro, .in_game => {},
+            // During chara_intro, if the remote has already transitioned to a
+            // higher index (in_game), let the game continue running so
+            // checkRoundStart can fire and transition us too. Without this,
+            // we'd deadlock: we're waiting for index 3 inputs, but the remote
+            // has moved to index 4 and is sending index 4 inputs — we'd time
+            // out after 10s.
+            //
+            // This matches CCCaster's isRemoteInputReady which returns true
+            // for CharaIntro (DllNetplayManager.cpp:976-981).
+            .chara_intro => {
+                if (self.remote_inputs.getEndIndex() > 0 and
+                    self.remote_inputs.getEndIndex() - 1 > self.indexed_frame.index)
+                {
+                    return true;
+                }
+            },
+            .chara_select, .in_game => {},
         }
 
         // Offline / spectator: always ready

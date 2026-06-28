@@ -1160,7 +1160,7 @@ test "Real StatePool Save, Load, and Reset" {
     // 4. Save state at frame 10
     const slot0 = pool.saveState(10, 1, 0, 0).?;
     try expectEqual(@as(usize, 0), slot0);
-    try expectEqual(@as(usize, 1), pool.saved_states.items.len);
+    try expectEqual(@as(usize, 1), pool.saved_states_count());
 
     // 5. Modify dummy variables
     dummy_val0 = 999;
@@ -1178,8 +1178,8 @@ test "Real StatePool Save, Load, and Reset" {
 
     // 7. Test reset() - should clear saved states and refill free stack
     pool.reset();
-    try expectEqual(@as(usize, 0), pool.saved_states.items.len);
-    try expectEqual(@as(usize, 5), pool.free_stack.items.len);
+    try expectEqual(@as(usize, 0), pool.saved_states_count());
+    try expectEqual(@as(usize, 5), pool.free_stack_count());
 }
 
 test "Mock Rollback Out-of-Bounds Canceled" {

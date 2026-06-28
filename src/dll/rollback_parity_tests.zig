@@ -7,7 +7,7 @@
 //   - Re-run state pool poisoning (stop saving during re-run)
 //   - Stale last_changed_frame (per-frame clear)
 //   - Effects pointer-followed chain (12KB missing data)
-//   - Early-frame rollback desyncs (rollback_min_frame_delay)
+//   - Early-frame rollback now fires directly (no deferred_lcf gate — matches CCCaster)
 //
 // Each test verifies a specific fix. If the fix is REVERTED, the test FAILS.
 //
@@ -65,8 +65,8 @@ test "FIX 1c: saveState stores netplay_state and start_world_time" {
     // Save with netplay_state=4 (in_game) and start_world_time=12345
     _ = pool.saveState(10, 1, 4, 12345);
 
-    try expectEqual(@as(usize, 1), pool.saved_states.items.len);
-    const state = pool.saved_states.items[0];
+    try expectEqual(@as(usize, 1), pool.saved_states_count());
+    const state = pool.getSavedState(0);
     try expectEqual(@as(u8, 4), state.netplay_state);
     try expectEqual(@as(u32, 12345), state.start_world_time);
 }
@@ -159,10 +159,10 @@ test "FIX 3: saveState with all parameters works correctly" {
     _ = pool.saveState(1, 1, 4, 1000); // in_game
     _ = pool.saveState(2, 1, 4, 1000); // in_game
 
-    try expectEqual(@as(usize, 3), pool.saved_states.items.len);
-    try expectEqual(@as(u8, 3), pool.saved_states.items[0].netplay_state); // chara_intro
-    try expectEqual(@as(u8, 4), pool.saved_states.items[1].netplay_state); // in_game
-    try expectEqual(@as(u8, 4), pool.saved_states.items[2].netplay_state); // in_game
+    try expectEqual(@as(usize, 3), pool.saved_states_count());
+    try expectEqual(@as(u8, 3), pool.getSavedState(0).netplay_state); // chara_intro
+    try expectEqual(@as(u8, 4), pool.getSavedState(1).netplay_state); // in_game
+    try expectEqual(@as(u8, 4), pool.getSavedState(2).netplay_state); // in_game
 }
 
 // =============================================================================
@@ -189,23 +189,21 @@ test "FIX 4b: effects pointer data size is 12000 (12 bytes × 1000 effects)" {
     try expectEqual(@as(usize, 12000), regions.CC_EFFECT_PTR_DATA_SIZE);
 }
 
-test "FIX 4c: state_size includes effects ptr data when effects are present" {
+test "FIX 4c: state_size equals total region size (flat regions, no effects ptr)" {
+    // The adapter currently uses flat regions (no pointer-following). The
+    // new port supports pointer-following via MemDumpPtr, but that's
+    // configured in the region table, not auto-detected. So state_size
+    // always equals totalRegionSize in the adapter.
     const allocator = std.testing.allocator;
     var pool = rb.StatePool.init(allocator);
     defer pool.deinit();
 
-    // Add a region that contains the effects array address
-    const effects_start = regions.CC_EFFECTS_ARRAY_ADDR;
-    const effects_size = regions.CC_EFFECTS_ARRAY_COUNT * regions.CC_EFFECT_ELEMENT_SIZE;
-    try pool.addRegion(effects_start, effects_size);
-    try pool.addRegion(0x563778, 4); // Some other region
+    try pool.addRegion(0x563778, 4);
+    try pool.addRegion(0x1000, 64);
 
     try pool.allocate(5, 0);
-
-    // state_size should be: region_size + CC_EFFECT_PTR_DATA_SIZE
-    const expected = pool.totalRegionSize() + regions.CC_EFFECT_PTR_DATA_SIZE;
-    try expectEqual(expected, pool.state_size);
-    try expect(pool.has_effects);
+    try expectEqual(pool.totalRegionSize(), pool.stateSize());
+    try expect(!pool.has_effects);
 }
 
 test "FIX 4d: state_size does NOT include effects ptr data when effects absent" {
@@ -213,35 +211,22 @@ test "FIX 4d: state_size does NOT include effects ptr data when effects absent" 
     var pool = rb.StatePool.init(allocator);
     defer pool.deinit();
 
-    // Add regions that do NOT contain the effects array
     try pool.addRegion(0x1000, 64);
     try pool.addRegion(0x2000, 32);
 
     try pool.allocate(5, 0);
-
-    // state_size should be just the region size, no effects ptr data
-    try expectEqual(pool.totalRegionSize(), pool.state_size);
+    try expectEqual(pool.totalRegionSize(), pool.stateSize());
     try expect(!pool.has_effects);
 }
 
 // =============================================================================
-// FIX 5: rollback_min_frame_delay prevents early-frame rollbacks
+// FIX 5: Pool stores/retrieves states at ALL frames (no early-frame gate)
 //
-// The state at frame 0 may differ between peers (both enter in_game at
-// slightly different absolute world_timer values). Rolling back to frame 0
-// loads a divergent state → desync.
-//
-// Fix (commit d6feb46 + c4829c0): checkRollback skips when either the
-// current frame OR the lcf_frame is < rollback_min_frame_delay.
-//
-// Note: The constant is private to netplay_manager.zig, but we can verify
-// the behavior by checking that the StatePool correctly handles the case
-// where we try to load early frames — the pool itself doesn't gate, but
-// the checkRollback logic does. This test verifies the pool-level
-// infrastructure works for the gated scenario.
+// zzcaster previously had a rollback_min_frame_delay gate. Removed to match
+// CCCaster. The pool must correctly store and retrieve states at early frames.
 // =============================================================================
 
-test "FIX 5: pool correctly stores and retrieves states at various frames" {
+test "FIX 5: pool stores and retrieves states at early frames (0, 1, ...)" {
     const allocator = std.testing.allocator;
     var pool = rb.StatePool.init(allocator);
     defer pool.deinit();
@@ -250,26 +235,37 @@ test "FIX 5: pool correctly stores and retrieves states at various frames" {
     try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
     try pool.allocate(30, 0);
 
-    // Save states at frames 0-15
+    // Save states at frames 0-3
     var frame: u32 = 0;
-    while (frame <= 15) : (frame += 1) {
+    while (frame <= 3) : (frame += 1) {
         _ = pool.saveState(frame, 1, 4, 1000);
     }
 
-    // Verify the pool has 16 states (no eviction with 30 slots)
-    try expectEqual(@as(usize, 16), pool.saved_states.items.len);
+    // Verify we can load frame 0 (critical for start-of-game rollbacks).
+    const loaded_0 = pool.loadStateForFrame(0, 1);
+    try expect(loaded_0 != null);
+    try expectEqual(@as(u32, 0), loaded_0.?.frame);
+}
 
-    // Verify the last saved frame is 15
-    // NOTE: Do this BEFORE any loadStateForFrame call — loadState frees
-    // states after the loaded slot, so loading frame 8 would destroy 9-15.
-    const last_state = pool.saved_states.items[pool.saved_states.items.len - 1];
-    try expectEqual(@as(u32, 15), last_state.frame);
+test "FIX 5b: pool retrieves the latest state <= target (CCCaster parity)" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
 
-    // Now verify we can load frame 8 (post-delay).
-    // This will free frames 9-15, but that's expected rollback behavior.
-    const loaded_8 = pool.loadStateForFrame(8, 1);
-    try expect(loaded_8 != null);
-    try expectEqual(@as(u32, 8), loaded_8.?.frame);
+    var dummy: u32 = 0;
+    try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
+    try pool.allocate(30, 0);
+
+    // Save states at frames 0, 1, 2, 3
+    var frame: u32 = 0;
+    while (frame <= 3) : (frame += 1) {
+        _ = pool.saveState(frame, 1, 4, 1000);
+    }
+
+    // Request frame 5 (no exact match). Should return frame 3 (latest <= 5).
+    const loaded = pool.loadStateForFrame(5, 1);
+    try expect(loaded != null);
+    try expectEqual(@as(u32, 3), loaded.?.frame);
 }
 
 // =============================================================================
@@ -302,7 +298,7 @@ test "FIX 6b: FPU state is saved and stored in SavedState" {
     _ = pool.saveState(0, 0, 0, 0);
 
     // The fpu_env should be populated (non-zero on x86, defaults on other archs)
-    const state = pool.saved_states.items[0];
+    const state = pool.getSavedState(0);
     // On x86, fnstcw/stmxcsr will produce non-zero values. On non-x86 (test
     // runner), the defaults are 0x037F / 0x1F80. Either way, the fields exist.
     _ = state.fpu_env.cw;
@@ -429,12 +425,12 @@ test "FIX 9: ring-buffer eviction works with netplay_state + start_world_time" {
     _ = pool.saveState(3, 1, 4, 2000);
     _ = pool.saveState(4, 1, 4, 2000);
 
-    try expectEqual(@as(usize, 3), pool.saved_states.items.len);
+    try expectEqual(@as(usize, 3), pool.saved_states_count());
 
     // Oldest surviving should be frame 2
-    try expectEqual(@as(u32, 2), pool.saved_states.items[0].frame);
-    try expectEqual(@as(u8, 4), pool.saved_states.items[0].netplay_state);
-    try expectEqual(@as(u32, 2000), pool.saved_states.items[0].start_world_time);
+    try expectEqual(@as(u32, 2), pool.getSavedState(0).frame);
+    try expectEqual(@as(u8, 4), pool.getSavedState(0).netplay_state);
+    try expectEqual(@as(u32, 2000), pool.getSavedState(0).start_world_time);
 
     // Frame 0 and 1 should be evicted
     try expect(pool.loadStateForFrame(0, 1) == null);

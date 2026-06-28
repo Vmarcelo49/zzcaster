@@ -185,12 +185,13 @@ const game_state_intro_done: u32 = 99; // CC_GAME_STATE_INTRO_DONE
 // to 0 so the re-run doesn't re-trigger intro logic.
 const pre_game_intro_frames: u32 = 224;
 
-/// Minimum frame number before rollback can load a state. States at frames
-/// 0-7 may differ between peers (both enter in_game at slightly different
-/// absolute world_timer values). Rolling back to those frames loads a
-/// divergent state → desync. The lcf is kept (not cleared) so the
-/// misprediction is corrected once we're past this delay.
-const rollback_min_frame_delay: u32 = 8;
+// NOTE: zzcaster previously had a `rollback_min_frame_delay = 8` constant and
+// a "deferred_lcf" mechanism that skipped rollback for the first 8 frames of
+// each in_game index. This was WRONG — it caused start-of-game desyncs because
+// a misprediction at frame 0-7 was deferred, the divergence compounded through
+// frames 1-7, and by the time the deferred rollback fired at frame 8 it loaded
+// an already-divergent state. CCCaster has NO early-frame gate — it rolls back
+// to lcf_frame directly. We match CCCaster's behavior here.
 
 // Protocol version for compatibility checking. Increment when the wire format
 // or rollback state layout changes. Both peers must have the same version.
@@ -543,22 +544,6 @@ pub const NetplayManager = struct {
     rollback_timer: u8 = 0,
     min_rollback_spacing: u8 = 2,
     fast_fwd_stop_frame: u32 = 0,
-
-    // Deferred rollback: a misprediction that arrived while the lcf_frame was
-    // inside the rollback_min_frame_delay window (frames 0-7). Rolling back to
-    // those early frames loads a divergent state (both peers enter in_game at
-    // slightly different absolute world_timer values), so checkRollback skips
-    // the rollback. The previous design left last_changed_frame set, expecting
-    // the next frame to correct it — but the per-frame clearLastChanged() at
-    // the top of the frame loop (frame_step.zig) nukes the lcf before
-    // checkRollback runs again, so the misprediction was silently forgotten.
-    //
-    // Instead we capture the pending misprediction here. This field is NOT
-    // cleared by clearLastChanged(); it persists until the local frame
-    // advances past rollback_min_frame_delay, at which point checkRollback
-    // triggers a real rollback to the earliest saved state for this index
-    // (which, by then, is >= rollback_min_frame_delay and safe to load).
-    deferred_lcf: ?u64 = null,
 
     // RTT EMA for time-sync (ported from ggpo-x).
     rtt_ema_ms: f64 = 0,
@@ -1344,14 +1329,16 @@ pub const NetplayManager = struct {
     }
 
     pub fn setLocalInput(self: *NetplayManager, input: u16) void {
-        // Use rollback_delay during re-runs, delay otherwise — matches
-        // CCCaster's getDelay() (DllNetplayManager.hpp:118):
+        // Matches CCCaster's setInput (DllNetplayManager.cpp:825-841) and
+        // getDelay() (DllNetplayManager.hpp:118):
         //   return ( isInRollback() ? config.rollbackDelay : config.delay );
-        // During a rollback re-run, we want minimal input lag so the
-        // re-simulation catches up quickly. rollback_delay is typically 0
-        // (re-run inputs are immediate), while delay is typically 1 (normal
-        // play has 1 frame of input lag for network transit).
-        const effective_delay: u8 = if (self.isRerunning())
+        // isInRollback() is true for ALL in_game frames with rollback enabled
+        // (not just re-runs), so the local input gets rollbackDelay (typically
+        // 0 = minimal lag) during gameplay and delay during chara_select etc.
+        // The previous code used isRerunning() which only applied rollbackDelay
+        // during re-runs — a divergence from CCCaster that made the local
+        // input land at a different frame than the remote peer expected.
+        const effective_delay: u8 = if (self.isInRollback())
             self.config.rollback_delay
         else
             self.config.delay;
@@ -1481,8 +1468,9 @@ pub const NetplayManager = struct {
         // Send the last num_inputs frames of local input, up to frame+delay.
         // Wire format (after sendInputs prepends 0x01 tag):
         //   [4 start_frame][4 index][N × 2 inputs]
-        // Use rollback_delay during re-runs (matches setLocalInput).
-        const effective_delay: u8 = if (self.isRerunning())
+        // Use the same delay as setLocalInput (isInRollback ? rollback_delay : delay)
+        // so the packet covers exactly the frames the peer expects.
+        const effective_delay: u8 = if (self.isInRollback())
             self.config.rollback_delay
         else
             self.config.delay;
@@ -2425,7 +2413,6 @@ pub const NetplayManager = struct {
         self.desync_local = null;
         self.desync_remote = null;
         self.fast_fwd_stop_frame = 0;
-        self.deferred_lcf = null;
 
         if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
             if (self.state_pool.pool.len == 0) {
@@ -2453,94 +2440,54 @@ pub const NetplayManager = struct {
     // --- Rollback ---
 
     pub fn checkRollback(self: *NetplayManager) bool {
+        // Matches CCCaster DllMain.cpp:591-621:
+        //   if ( netMan.isInRollback()
+        //           && rollbackTimer == minRollbackSpacing
+        //           && netMan.getLastChangedFrame().value < netMan.getIndexedFrame().value )
+        //   {
+        //       fastFwdStopFrame = netMan.getIndexedFrame();
+        //       if ( rollMan.loadState ( netMan.getLastChangedFrame(), netMan ) )
+        //       {
+        //           *CC_SKIP_FRAMES_ADDR = 1;
+        //           netMan.clearLastChangedFrame();
+        //           --rollbackTimer;
+        //           return;
+        //       }
+        //       // loadState failed — DON'T clear lcf, retry next frame
+        //   }
+        //
+        // CCCaster rolls back to lcf_frame directly — NO early-frame gate, NO
+        // deferral. The state at frame 0 is deterministic because both peers
+        // apply the same synced RNG before in_game entry, and
+        // `frame = world_timer - start_world_time` is relative.
         if (!self.isInRollback()) return false;
         if (self.rollback_timer < self.min_rollback_spacing) return false;
 
-        // Resolve the misprediction we want to roll back to.
-        //
-        // `last_changed_frame` is the live lcf, set by setRemote this frame.
-        // `deferred_lcf` holds an early-frame misprediction (lcf_frame < 8)
-        // that we previously deferred because rolling back to frames 0-7 loads
-        // a divergent state.
-        //
-        // The per-frame clearLastChanged() at the top of the frame loop nukes
-        // the live lcf every frame, so an early-frame misprediction can't
-        // survive there. We carry it in deferred_lcf instead (which is NOT
-        // cleared by clearLastChanged), and promote it once the local frame
-        // has advanced past rollback_min_frame_delay — at which point we load
-        // the earliest SAFE saved state (frame rollback_min_frame_delay, NOT
-        // lcf_frame) and re-simulate forward with the corrected inputs.
-        var lcf = self.remote_inputs.last_changed_frame;
-        const from_deferred = (lcf == null);
-        if (from_deferred) {
-            if (self.deferred_lcf != null and self.indexed_frame.frame >= rollback_min_frame_delay) {
-                // Promote the deferred misprediction. Because we load
-                // safe_target (>= rollback_min_frame_delay) below rather than
-                // lcf_frame, the early-frame gate does NOT apply to a promoted
-                // entry — otherwise the deferred lcf would be re-deferred
-                // forever (lcf_frame < 8 always) and rollback would be
-                // permanently broken for the rest of the round.
-                lcf = self.deferred_lcf;
-            } else {
-                return false;
-            }
-        }
+        const lcf = self.remote_inputs.last_changed_frame orelse return false;
 
-        const lcf_frame = @as(u32, @intCast(lcf.? & 0xFFFFFFFF));
-        const lcf_index = @as(u32, @intCast(lcf.? >> 32));
+        const lcf_frame = @as(u32, @intCast(lcf & 0xFFFFFFFF));
+        const lcf_index = @as(u32, @intCast(lcf >> 32));
+
+        // Stale lcf from a previous transition index. Clear it so it doesn't
+        // block future current-index changes from being detected.
         if (lcf_index != self.indexed_frame.index) {
-            // Stale lcf from a previous transition index. Clear it so it
-            // doesn't block future current-index changes from being detected.
             self.remote_inputs.clearLastChanged();
-            self.deferred_lcf = null;
             return false;
         }
+
+        // lcf must be strictly before the current frame (matches CCCaster's
+        // `getLastChangedFrame().value < getIndexedFrame().value`).
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
-        // Don't rollback to early frames (0-7). The state at frame 0 may
-        // differ between peers because both peers enter in_game at slightly
-        // different absolute world_timer values. Rolling back to frame 0 or 1
-        // loads a divergent state → desync.
-        //
-        // Capture the misprediction into deferred_lcf and clear the live lcf.
-        // The deferred entry survives the next frame's per-frame
-        // clearLastChanged(); once the local frame advances past
-        // rollback_min_frame_delay, the block above promotes it and we roll
-        // back to the earliest safe saved state for this index.
-        //
-        // NOTE: this gate only applies to a FRESH (live) misprediction. A
-        // promoted deferred entry already passed this gate when it was first
-        // captured and is now being acted on with a safe load target, so we
-        // skip the re-deferral.
-        if (!from_deferred and lcf_frame < rollback_min_frame_delay) {
-            self.deferred_lcf = lcf;
-            self.remote_inputs.clearLastChanged();
-            return false;
-        }
-
-        // We're past the early-frame window. A real rollback is safe — clear
-        // any deferred entry so it doesn't fire again.
-        self.deferred_lcf = null;
-
-        // If this misprediction was deferred (lcf_frame < rollback_min_frame_delay),
-        // do NOT load lcf_frame's state — that state may still carry the
-        // entry-timing divergence between peers (the reason the skip exists).
-        // Instead, load the earliest SAFE state: the one at
-        // rollback_min_frame_delay. States are saved at the START of each frame
-        // (before writeGameInputs), so loadStateForFrame(N) returns the
-        // start-of-frame-N state; re-simulating N→current with the corrected
-        // remote inputs (now in the buffer) fixes the input-driven divergence
-        // from frame N onward.
-        const safe_target = if (lcf_frame < rollback_min_frame_delay)
-            rollback_min_frame_delay
-        else
-            lcf_frame;
-
-        const loaded = self.state_pool.loadStateForFrame(safe_target, lcf_index);
+        // Load the latest saved state with frame <= lcf_frame for this index.
+        // loadStateForFrame returns the most recent state <= lcf_frame, which
+        // is exactly what CCCaster's loadState does (reverse-iterate
+        // _statesList, find first with indexedFrame.value <= target.value).
+        const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
         if (loaded == null) {
-            // Do NOT clear last changed frame! Let's keep it so it retries on subsequent frames.
-            // Matches CCCaster: DllMain.cpp:620
-            self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ safe_target, self.state_pool.num_states });
+            // Do NOT clear last changed frame — keep it so it retries on
+            // subsequent frames. Matches CCCaster: DllMain.cpp:620.
+            self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
             return false;
         }
 
@@ -2561,13 +2508,7 @@ pub const NetplayManager = struct {
         // Trigger rollback!
         const current_frame = self.indexed_frame.frame;
         self.fast_fwd_stop_frame = current_frame;
-        if (safe_target != lcf_frame) {
-            self.log.info("ROLLBACK (deferred): frame {d} -> {d} (misprediction at {d}, loading earliest safe state)", .{
-                current_frame, safe_target, lcf_frame,
-            });
-        } else {
-            self.log.info("ROLLBACK: frame {d} -> {d}", .{ current_frame, lcf_frame });
-        }
+        self.log.info("ROLLBACK: frame {d} -> {d}", .{ current_frame, lcf_frame });
 
         // Apply SFX dedup filter: OR together snapshots between loaded and
         // current frame, then mark with 0x80 sentinel so the play-hook

@@ -320,7 +320,7 @@ pub fn drawWaitingForPeer(
                     // Host: show room code (relay) or IP:port (direct)
                     if (s.getRoomCode()) |code| {
                         var code_buf: [16]u8 = undefined;
-                        const code_z = std.fmt.bufPrintZ(&code_buf, "{s}", .{code}) catch "????";
+                        const code_z = std.fmt.bufPrintZ(&code_buf, "#{s}", .{code}) catch "#????";
                         ui_theme.textColored(ui_theme.COL_MUTED, "Share this room code with your opponent:", .{});
                         zgui.spacing();
                         ui_theme.textColored(ui_theme.COL_RED, "{s}", .{code_z});

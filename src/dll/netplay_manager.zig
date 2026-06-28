@@ -483,6 +483,18 @@ fn readU32At(p: [*]u8) u32 {
 const sync_send_period: u32 = 5 * 60; // 5 seconds at 60fps
 const sync_queue_len: u8 = 16;
 
+// Early-game SyncHash cadence. The base cadence (frame 149, then every 300)
+// lets divergence compound undetected for ~2.5s before the first check — long
+// enough for a missed rollback to grow into an unrecoverable gap by the time
+// it's caught (two reported desyncs both originated in the first 150 frames
+// with >2000-unit position gaps). During the first `early_sync_window` frames
+// of each in_game index we check every `early_sync_period` frames instead, so
+// a divergence is caught while the resim window is still small enough to
+// correct. SyncHash packets are tiny (137 bytes) and reliable-ordered, so the
+// extra bandwidth (at most 6 extra packets per round) is negligible.
+const early_sync_period: u32 = 30; // 0.5s at 60fps
+const early_sync_window: u32 = 180; // first 3s of each in_game index
+
 // Host re-sends the RNG state this many frames apart while waiting for the
 // peer's RNG_ACK. ~0.5s at 60fps is slow enough not to flood, fast enough to
 // recover within the chara-select phase well before the first SyncHash check
@@ -2193,7 +2205,12 @@ pub const NetplayManager = struct {
         const frame = self.indexed_frame.frame;
         const due_period = (frame % sync_send_period == 0);
         const due_149 = (frame % 150 == 149);
-        if (!due_period and !due_149) return;
+        // Early-game dense cadence: during the first early_sync_window frames
+        // of each in_game index, also check every early_sync_period frames.
+        // Catches divergence while the resim window is still small. See the
+        // constants above for rationale.
+        const due_early = (frame < early_sync_window and frame % early_sync_period == 0);
+        if (!due_period and !due_149 and !due_early) return;
 
         if (self.isRerunning()) return;
 

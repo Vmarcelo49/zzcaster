@@ -548,3 +548,61 @@ test "FIX 6c: advancing to a new index re-arms exactly once" {
     try expectEqual(@as(i64, 5000), s.input_wait_remote_at_index_since_ms);
 }
 
+// =============================================================================
+// FIX 7: denser early-game SyncHash cadence.
+//
+// Original behavior:
+//   SyncHash was sent at frame 149 and then every 300 frames. Divergence could
+//   compound undetected for ~2.5s before the first check — two reported
+//   desyncs both originated in the first 150 frames with >2000-unit gaps.
+//
+// Fix:
+//   During the first early_sync_window (180) frames of each in_game index, also
+//   send every early_sync_period (30) frames. Catches divergence early while
+//   the resim window is small. The base cadence (149 / every 300) is preserved.
+//
+// This test mirrors the cadence decision logic to verify which frames trigger.
+// =============================================================================
+
+const sync_send_period_t: u32 = 5 * 60;
+const early_sync_period_t: u32 = 30;
+const early_sync_window_t: u32 = 180;
+
+fn syncDueAtFrame(frame: u32) bool {
+    const due_period = (frame % sync_send_period_t == 0);
+    const due_149 = (frame % 150 == 149);
+    const due_early = (frame < early_sync_window_t and frame % early_sync_period_t == 0);
+    return due_period or due_149 or due_early;
+}
+
+test "FIX 7a: early-game frames 30/60/90/120 trigger sync (dense cadence)" {
+    try expect(syncDueAtFrame(30));
+    try expect(syncDueAtFrame(60));
+    try expect(syncDueAtFrame(90));
+    try expect(syncDueAtFrame(120));
+}
+
+test "FIX 7b: non-early, non-period frames do NOT trigger (frame 50, 100)" {
+    try expect(!syncDueAtFrame(50));
+    try expect(!syncDueAtFrame(100));
+}
+
+test "FIX 7c: frame 149 still triggers (legacy cadence preserved)" {
+    try expect(syncDueAtFrame(149));
+}
+
+test "FIX 7d: frames past the early window fall back to base cadence" {
+    // 200 is past 180, not a multiple of 300, not 149 mod 150 → no sync.
+    try expect(!syncDueAtFrame(200));
+    // 300 is a multiple of sync_send_period (300) → sync.
+    try expect(syncDueAtFrame(300));
+}
+
+test "FIX 7e: early cadence only applies within the window (frame 180 excluded)" {
+    // 180 is the boundary; < early_sync_window excludes it. 150 % 30 == 0 but
+    // 150 < 180 so it WOULD be early-triggered — verify 150 still triggers.
+    try expect(syncDueAtFrame(150));
+    // 180 itself is NOT < 180, and 180 % 300 != 0, 180 % 150 != 149 → no sync.
+    try expect(!syncDueAtFrame(180));
+}
+

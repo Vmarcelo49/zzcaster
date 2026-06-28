@@ -137,6 +137,15 @@ const game_state_intro_done: u32 = 99; // CC_GAME_STATE_INTRO_DONE
 // to 0 so the re-run doesn't re-trigger intro logic.
 const pre_game_intro_frames: u32 = 224;
 
+/// Minimum number of frames that must elapse in in_game before rollback can
+/// fire. During the first few frames, the saved state at frame 0 may differ
+/// between peers (both enter in_game at slightly different absolute
+/// world_timer values). Rolling back to frame 0 loads a divergent state →
+/// desync. This delay lets both peers build up converged saved states
+/// before any rollback is attempted. Set to `delay + rollback + 2` so we
+/// have at least `rollback` states to re-simulate from.
+const rollback_min_frame_delay: u32 = 8;
+
 // Game modes
 const mode_startup: u32 = 65535;
 const mode_opening: u32 = 3;
@@ -2385,19 +2394,34 @@ pub const NetplayManager = struct {
         if (lcf_index != self.indexed_frame.index) {
             // Stale lcf from a previous transition index. Clear it so it
             // doesn't block future current-index changes from being detected.
-            // Without this, a stale lcf (with a smaller key than any
-            // current-index key) would persist indefinitely — setRemote's
-            // `key < last_changed_frame` check would always be false for the
-            // current index, and rollback would never fire.
-            //
-            // This pairs with the fix in InputBuffer.setRemote which prevents
-            // stale-index keys from being stored in the first place. Together
-            // they ensure last_changed_frame only ever tracks the CURRENT
-            // index's earliest misprediction.
             self.remote_inputs.clearLastChanged();
             return false;
         }
         if (lcf_frame >= self.indexed_frame.frame) return false;
+
+        // Don't rollback during the first few frames of in_game. The state
+        // at frame 0 may differ between peers because both peers enter in_game
+        // at slightly different absolute world_timer values (the
+        // round_start_counter fires at the same logical frame, but the
+        // absolute timer differs due to non-lockstepped loading). Rolling back
+        // to frame 0 loads a state that's already divergent → desync.
+        //
+        // Instead, let the game run for a few frames to build up a history of
+        // converged states. By frame `rollback_min_frame_delay`, both peers
+        // have saved enough states that a rollback loads a synchronized state.
+        // The `delay` config (typically 1) adds input delay so the remote's
+        // inputs for these early frames arrive before we need them.
+        //
+        // This effectively means: during the first few frames, we accept the
+        // prediction (remote input = 0) and don't correct it. If the remote
+        // actually pressed something, the correction happens once we have
+        // enough saved states — by then, the states are converged.
+        if (self.indexed_frame.frame < rollback_min_frame_delay) {
+            // Clear the lcf so we don't keep trying to rollback during the
+            // delay window. The next real input change will set it again.
+            self.remote_inputs.clearLastChanged();
+            return false;
+        }
 
         const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
         if (loaded == null) {

@@ -1,0 +1,14 @@
+.{
+    .name = .cc_rollback,
+    .version = "0.1.0",
+    .fingerprint = 0xc97f91a6567485df,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "tests",
+        "README.md",
+    },
+}

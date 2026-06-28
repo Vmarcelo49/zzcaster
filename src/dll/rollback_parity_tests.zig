@@ -7,7 +7,7 @@
 //   - Re-run state pool poisoning (stop saving during re-run)
 //   - Stale last_changed_frame (per-frame clear)
 //   - Effects pointer-followed chain (12KB missing data)
-//   - Early-frame rollback desyncs (rollback_min_frame_delay)
+//   - Early-frame rollback now fires directly (no deferred_lcf gate — matches CCCaster)
 //
 // Each test verifies a specific fix. If the fix is REVERTED, the test FAILS.
 //
@@ -225,23 +225,20 @@ test "FIX 4d: state_size does NOT include effects ptr data when effects absent" 
 }
 
 // =============================================================================
-// FIX 5: rollback_min_frame_delay prevents early-frame rollbacks
+// FIX 5: Pool stores/retrieves states at ALL frames (no early-frame gate)
 //
-// The state at frame 0 may differ between peers (both enter in_game at
-// slightly different absolute world_timer values). Rolling back to frame 0
-// loads a divergent state → desync.
+// zzcaster previously had a `rollback_min_frame_delay = 8` gate that prevented
+// rollback to frames 0-7. This was removed to match CCCaster, which rolls back
+// to lcf_frame directly regardless of frame number. The state at frame 0 is
+// deterministic because both peers apply the same synced RNG before in_game
+// entry, and `frame = world_timer - start_world_time` is relative.
 //
-// Fix (commit d6feb46 + c4829c0): checkRollback skips when either the
-// current frame OR the lcf_frame is < rollback_min_frame_delay.
-//
-// Note: The constant is private to netplay_manager.zig, but we can verify
-// the behavior by checking that the StatePool correctly handles the case
-// where we try to load early frames — the pool itself doesn't gate, but
-// the checkRollback logic does. This test verifies the pool-level
-// infrastructure works for the gated scenario.
+// This test verifies the StatePool correctly stores and retrieves states at
+// early frames (0, 1, ...) so checkRollback can load them when a misprediction
+// is detected at the start of the round.
 // =============================================================================
 
-test "FIX 5: pool correctly stores and retrieves states at various frames" {
+test "FIX 5: pool stores and retrieves states at early frames (0, 1, ...)" {
     const allocator = std.testing.allocator;
     var pool = rb.StatePool.init(allocator);
     defer pool.deinit();
@@ -265,11 +262,36 @@ test "FIX 5: pool correctly stores and retrieves states at various frames" {
     const last_state = pool.saved_states.items[pool.saved_states.items.len - 1];
     try expectEqual(@as(u32, 15), last_state.frame);
 
-    // Now verify we can load frame 8 (post-delay).
-    // This will free frames 9-15, but that's expected rollback behavior.
-    const loaded_8 = pool.loadStateForFrame(8, 1);
-    try expect(loaded_8 != null);
-    try expectEqual(@as(u32, 8), loaded_8.?.frame);
+    // Verify we can load frame 0 (the most critical early frame for start-of-
+    // game rollbacks). CCCaster loads this directly; zzcaster must too.
+    const loaded_0 = pool.loadStateForFrame(0, 1);
+    try expect(loaded_0 != null);
+    try expectEqual(@as(u32, 0), loaded_0.?.frame);
+}
+
+test "FIX 5b: pool retrieves the latest state <= target (CCCaster loadState parity)" {
+    // CCCaster's loadState reverse-iterates _statesList and loads the most
+    // recent state with indexedFrame.value <= target.value. zzcaster's
+    // loadStateForFrame does the same: find the latest state with
+    // frame <= target_frame for the target index.
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    var dummy: u32 = 0;
+    try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
+    try pool.allocate(30, 0);
+
+    // Save states at frames 0, 1, 2, 3
+    var frame: u32 = 0;
+    while (frame <= 3) : (frame += 1) {
+        _ = pool.saveState(frame, 1, 4, 1000);
+    }
+
+    // Request frame 5 (no exact match). Should return frame 3 (latest <= 5).
+    const loaded = pool.loadStateForFrame(5, 1);
+    try expect(loaded != null);
+    try expectEqual(@as(u32, 3), loaded.?.frame);
 }
 
 // =============================================================================

@@ -518,6 +518,14 @@ pub const NetplayManager = struct {
 
     intro_rng_enabled: bool = false,
 
+    /// True after the first in_game entry of a match. Used by checkIntroDone
+    /// to distinguish round 1 (where RNG is already synced at chara_select +
+    /// in_game entry) from rounds 2+ (where intro_done RNG sync is needed).
+    /// Without this, the intro_done RNG sync fires for round 1, causing the
+    /// host to send advanced RNG that the client applies early → desync.
+    /// Reset to false on new match chara_select.
+    first_in_game_completed: bool = false,
+
     // Host-side cache of the RNG state captured for each transition index.
     // Populated by `syncRngState` when the host captures+sends RNG to the
     // client. Looked up by `getCachedRngState` so the SpectatorManager can
@@ -1720,14 +1728,21 @@ pub const NetplayManager = struct {
         // Track the intro-done edge so we enable RNG exactly once per round.
         // (game_state_addr isn't a simple monotonic flag — it cycles through
         // several values — so we watch for the 99 value with a one-shot.)
-        if (!self.intro_rng_enabled and game_state_addr.* == game_state_intro_done) {
+        //
+        // Only arm RNG sync at intro_done for rounds 2+ (after the first
+        // in_game has completed). For round 1, RNG is already synced at
+        // chara_select entry and in_game entry. Arming at intro_done for
+        // round 1 causes the host to send advanced RNG (advanced during
+        // chara_intro) which the client applies early → ~750 frame
+        // mismatch → desync on the next match.
+        if (!self.intro_rng_enabled and game_state_addr.* == game_state_intro_done and self.first_in_game_completed) {
             self.intro_rng_enabled = true;
             self.should_sync_rng = true;
             self.rng_synced = false;
             self.rng_acked = false;
             self.rng_send_cooldown = 0;
             self.rng_send_count = 0;
-            self.log.info("Intro done (game_state=99) — RNG sync enabled", .{});
+            self.log.info("Intro done (game_state=99) — RNG sync enabled (round 2+)", .{});
         }
 
         // chara_intro → in_game: requires BOTH signals to fire.
@@ -1987,6 +2002,19 @@ pub const NetplayManager = struct {
             // silently no-ops every frame. Rounds 2+ are handled separately
             // by checkIntroDone when game_state == 99.
             self.intro_rng_enabled = true;
+
+            // Mark first in_game as completed so that checkIntroDone knows
+            // to enable intro_done RNG sync for subsequent rounds (2+).
+            if (new == .in_game) {
+                self.first_in_game_completed = true;
+            }
+
+            // Reset first_in_game_completed when starting a new match at
+            // chara_select. This allows the intro_done RNG sync guard to
+            // correctly suppress for round 1 of the new match.
+            if (new == .chara_select) {
+                self.first_in_game_completed = false;
+            }
 
             // Client/Spectator: apply the cached RNG state if we received and cached it early
             if (!self.config.is_host) {

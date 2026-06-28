@@ -51,7 +51,29 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.startsWith(u8, a, "--name=")) {
             cli_name = a["--name=".len..];
         } else if (std.mem.eql(u8, a, "-h") or std.mem.eql(u8, a, "--help")) {
-            std.Io.File.stdout().writeStreamingAll(io, "Usage: zzcaster.exe [--mode=training|versus|host|join|spectate] [--port=N] [--peer=ip:port] [--name=NAME]\n") catch {};
+            const usage =
+                \\zzcaster v{s} — MBAACC netplay launcher
+                \\
+                \\Usage: zzcaster.exe [options]
+                \\
+                \\Options:
+                \\  --mode=training       Launch offline training mode
+                \\  --mode=versus         Launch offline versus mode
+                \\  --mode=host           Host a netplay session (use --port)
+                \\  --mode=join           Join a netplay session (use --peer)
+                \\  --mode=spectate       Spectate a session (use --peer)
+                \\  --port=N              Port number (default: 46318)
+                \\  --peer=ip:port        Remote address to join/spectate
+                \\  --peer=#ROOM          Room code to join via relay
+                \\  --name=NAME           Display name for this session
+                \\  -h, --help            Show this help message
+                \\
+                \\No arguments starts the GUI launcher.
+                \\
+            ;
+            var buf: [512]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, usage, .{config.version_string}) catch usage[0..100];
+            std.Io.File.stdout().writeStreamingAll(io, msg) catch {};
             return;
         }
     }

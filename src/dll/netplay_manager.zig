@@ -1244,27 +1244,20 @@ pub const NetplayManager = struct {
         // keeps both sides synchronized — without it, one side can race
         // ahead (e.g. start the match while the other is still loading).
         //
-        // Loading / Skippable / RetryMenu do NOT block:
+        // Loading / Skippable / CharaIntro / RetryMenu do NOT block:
         // each side runs at its own pace, and the catch-up mash logic
         // in getNetplayInput() ensures the lagging side auto-skips.
+        //
+        // CharaIntro returns true unconditionally — matches CCCaster's
+        // isRemoteInputReady (DllNetplayManager.cpp:976-981). Both peers
+        // run at full speed during chara_intro, each transitioning to
+        // in_game independently when their local round_start_counter fires.
+        // Synchronization happens only after both are in in_game, via the
+        // RNG gate and the lockstep wait. Frame-synchronizing during
+        // chara_intro causes timing differences that affect the game's
+        // internal state machine → RNG divergence → desync.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
-            // During chara_intro, if the remote has already transitioned to a
-            // higher index (in_game), let the game continue running so
-            // checkRoundStart can fire and transition us too. Without this,
-            // we'd deadlock: we're waiting for index 3 inputs, but the remote
-            // has moved to index 4 and is sending index 4 inputs — we'd time
-            // out after 10s.
-            //
-            // This matches CCCaster's isRemoteInputReady which returns true
-            // for CharaIntro (DllNetplayManager.cpp:976-981).
-            .chara_intro => {
-                if (self.remote_inputs.getEndIndex() > 0 and
-                    self.remote_inputs.getEndIndex() - 1 > self.indexed_frame.index)
-                {
-                    return true;
-                }
-            },
+            .pre_initial, .initial, .loading, .skippable, .retry_menu, .chara_intro => return true,
             .chara_select, .in_game => {},
         }
 

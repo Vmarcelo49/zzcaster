@@ -1119,9 +1119,22 @@ pub const NetplayManager = struct {
             .chara_select => {
                 var input = raw_input;
 
-                // Mask Cancel so neither player can back out of chara-select
-                // and desync the state machine (legacy getCharaSelectInput).
-                input &= ~@as(u16, 0x8000);
+                // Conditionally mask Cancel (B button) — only when actively
+                // selecting a CHARACTER (selector_mode == 0). This prevents
+                // backing out of the character select screen entirely (which
+                // would desync the state machine), while still allowing B to
+                // work as "back" in the moon/color select sub-menus.
+                // Matches CCCaster (DllNetplayManager.cpp:143-147).
+                const p1_selector_mode: *u32 = @ptrFromInt(0x74D8EC);
+                const p2_selector_mode: *u32 = @ptrFromInt(0x74D910);
+                const selector_mode = if (self.config.local_player == 1)
+                    p1_selector_mode.*
+                else
+                    p2_selector_mode.*;
+                if (selector_mode == 0) { // CC_SELECT_CHARA
+                    input &= ~@as(u16, 0x8000); // Cancel
+                    input &= ~@as(u16, 0x0020); // B button
+                }
 
                 // Moon-selector desync guard (legacy DllNetplayManager.cpp:138):
                 // for the first 150 frames of chara-select, mask A + Confirm.

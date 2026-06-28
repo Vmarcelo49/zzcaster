@@ -990,7 +990,6 @@ pub const NetplayManager = struct {
                     self.enet_connected = true;
                     self.was_connected = true;
                     self.log.info("Main peer connected", .{});
-                    self.notifyPeerConnected();
                 } else if (!self.config.is_host) {
                     self.enet_peer = event.peer;
                     self.enet_connected = true;
@@ -2517,17 +2516,6 @@ pub const NetplayManager = struct {
             std.mem.writeInt(u16, out[11 + i * 4 .. 13 + i * 4][0..2], p2, .little);
         }
         return 1 + 8 + num_inputs * 4;
-    }
-
-    fn notifyPeerConnected(self: *NetplayManager) void {
-        if (builtin.os.tag != .windows) return;
-
-        const hwnd = win32.getWindowHandle();
-        if (hwnd) |h| {
-            _ = win32.FlashWindow(h, 1);
-        }
-        _ = win32.MessageBeep(0);
-        self.log.info("Played peer connection notification and requested window attention", .{});
     }
 };
 

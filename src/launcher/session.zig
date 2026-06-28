@@ -6,6 +6,7 @@ const net_util = @import("net_util.zig");
 const relay_client_mod = @import("net").relay_client;
 const relay_config = @import("net").relay_config;
 const relay_protocol = @import("net").relay_protocol;
+const builtin = @import("builtin");
 
 pub const NetplayConfig = struct {
     is_host: bool = false,
@@ -1133,6 +1134,7 @@ pub const NetplaySession = struct {
             // No active deadline while we wait for the user to click Start.
             self.setPhaseTimeout(0);
             self.log.info("Handshake complete — waiting for host to confirm start", .{});
+            self.notifyHostConfirmation();
         } else {
             self.handshake_subphase = 3;
             // Client waits for host's config — no explicit timeout (the
@@ -1227,5 +1229,66 @@ pub const NetplaySession = struct {
         self.setPhaseTimeout(host_wait_confirm_timeout_ms);
         self.state = .handshaking;
         self.log.info("Host confirmed — sent config, waiting for client confirm (delay={d})", .{self.config.delay});
+    }
+
+    fn notifyHostConfirmation(self: *NetplaySession) void {
+        if (builtin.os.tag != .windows) return;
+
+        const hwnd = win32.getWindowHandle();
+        if (hwnd) |h| {
+            _ = win32.FlashWindow(h, 1);
+        }
+        _ = win32.MessageBeep(0);
+        self.log.info("Handshake complete: played notification sound and requested attention on launcher window", .{});
+    }
+};
+
+const win32 = struct {
+    const HWND = ?*anyopaque;
+    const BOOL = i32;
+    const LPARAM = usize;
+    const WPARAM = usize;
+    const UINT = u32;
+
+    extern "user32" fn FlashWindow(hWnd: HWND, bInvert: BOOL) callconv(.winapi) BOOL;
+    extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
+    extern "user32" fn GetActiveWindow() callconv(.winapi) HWND;
+    extern "user32" fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: ?*u32) callconv(.winapi) u32;
+    extern "user32" fn EnumWindows(lpEnumFunc: *const fn (HWND, LPARAM) callconv(.winapi) BOOL, lParam: LPARAM) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+    const EnumState = struct {
+        pid: u32,
+        hwnd: HWND,
+    };
+
+    fn getWindowHandle() HWND {
+        if (builtin.os.tag != .windows) return null;
+        
+        if (GetActiveWindow()) |hwnd| {
+            return hwnd;
+        }
+
+        const target_pid = GetCurrentProcessId();
+        var state = EnumState{
+            .pid = target_pid,
+            .hwnd = null,
+        };
+
+        const Helper = struct {
+            fn enumProc(hwnd: HWND, lParam: LPARAM) callconv(.winapi) BOOL {
+                var s: *EnumState = @ptrFromInt(lParam);
+                var process_id: u32 = 0;
+                _ = GetWindowThreadProcessId(hwnd, &process_id);
+                if (process_id == s.pid) {
+                    s.hwnd = hwnd;
+                    return 0; // stop
+                }
+                return 1; // continue
+            }
+        };
+
+        _ = EnumWindows(Helper.enumProc, @intFromPtr(&state));
+        return state.hwnd;
     }
 };

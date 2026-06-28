@@ -108,6 +108,7 @@ const default_pipe_name_z: [:0]const u8 = "\\\\.\\pipe\\zzcaster_pipe";
 // Private to dllmain — used only by applyPostLoadHacks.
 const damage_level_addr: *u32 = @ptrFromInt(0x553FCC);
 const timer_speed_addr: *u32 = @ptrFromInt(0x553FD0);
+const stage_animation_off_addr: *u32 = @ptrFromInt(0x554124);
 const win_count_vs_addr: *u32 = @ptrFromInt(0x553FDC);
 
 const mode_startup: u32 = 65535;
@@ -450,6 +451,12 @@ fn applyPostLoadHacks() void {
         // rollback at the start of gameplay.
         if (state.nm.?.config.rollback > 0) {
             asm_hacks.applyHijackIntroState();
+            // Disable stage animations — matches CCCaster (DllMain.cpp:1902-1906).
+            // Stage animations can use non-deterministic data (wall-clock timing,
+            // different RNG draws), causing position drift between peers during
+            // pre-game. CC_STAGE_ANIMATION_OFF_ADDR = 0x554124.
+            stage_animation_off_addr.* = 1;
+            state.log.?.info("Stage animations disabled (rollback mode)", .{});
         }
     }
 }

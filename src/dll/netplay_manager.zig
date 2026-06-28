@@ -2458,23 +2458,28 @@ pub const NetplayManager = struct {
 
         // Resolve the misprediction we want to roll back to.
         //
-        // `last_changed_frame` is the live lcf, set by setRemote this frame or
-        // a prior frame. `deferred_lcf` holds an early-frame misprediction
-        // (lcf_frame < rollback_min_frame_delay) that we previously deferred
-        // because rolling back to frames 0-7 loads a divergent state.
+        // `last_changed_frame` is the live lcf, set by setRemote this frame.
+        // `deferred_lcf` holds an early-frame misprediction (lcf_frame < 8)
+        // that we previously deferred because rolling back to frames 0-7 loads
+        // a divergent state.
         //
         // The per-frame clearLastChanged() at the top of the frame loop nukes
-        // the live lcf every frame, so a deferred misprediction can't survive
-        // there. We carry it in deferred_lcf instead (which is NOT cleared by
-        // clearLastChanged), and promote it once the local frame has advanced
-        // past rollback_min_frame_delay — at which point the earliest saved
-        // state for this index is safe to load.
+        // the live lcf every frame, so an early-frame misprediction can't
+        // survive there. We carry it in deferred_lcf instead (which is NOT
+        // cleared by clearLastChanged), and promote it once the local frame
+        // has advanced past rollback_min_frame_delay — at which point we load
+        // the earliest SAFE saved state (frame rollback_min_frame_delay, NOT
+        // lcf_frame) and re-simulate forward with the corrected inputs.
         var lcf = self.remote_inputs.last_changed_frame;
-        if (lcf == null) {
-            // No fresh misprediction this frame. If we have a deferred one and
-            // we've now advanced past the early-frame window, promote it so we
-            // can roll back to the earliest safe saved state below.
+        const from_deferred = (lcf == null);
+        if (from_deferred) {
             if (self.deferred_lcf != null and self.indexed_frame.frame >= rollback_min_frame_delay) {
+                // Promote the deferred misprediction. Because we load
+                // safe_target (>= rollback_min_frame_delay) below rather than
+                // lcf_frame, the early-frame gate does NOT apply to a promoted
+                // entry — otherwise the deferred lcf would be re-deferred
+                // forever (lcf_frame < 8 always) and rollback would be
+                // permanently broken for the rest of the round.
                 lcf = self.deferred_lcf;
             } else {
                 return false;
@@ -2501,10 +2506,13 @@ pub const NetplayManager = struct {
         // The deferred entry survives the next frame's per-frame
         // clearLastChanged(); once the local frame advances past
         // rollback_min_frame_delay, the block above promotes it and we roll
-        // back to the earliest safe saved state for this index. This is what
-        // the old "DON'T clear lcf" comment intended, but which the per-frame
-        // clear silently defeated.
-        if (lcf_frame < rollback_min_frame_delay) {
+        // back to the earliest safe saved state for this index.
+        //
+        // NOTE: this gate only applies to a FRESH (live) misprediction. A
+        // promoted deferred entry already passed this gate when it was first
+        // captured and is now being acted on with a safe load target, so we
+        // skip the re-deferral.
+        if (!from_deferred and lcf_frame < rollback_min_frame_delay) {
             self.deferred_lcf = lcf;
             self.remote_inputs.clearLastChanged();
             return false;

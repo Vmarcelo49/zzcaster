@@ -459,6 +459,59 @@ test "FIX 4b: a later-frame misprediction is still detected after the early skip
 }
 
 // =============================================================================
+// FIX 4c: deferred early-frame misprediction does NOT get re-deferred forever.
+//
+// Original bug (regression introduced by the deferred_lcf fix):
+//   When an early-frame misprediction (frame < rollback_min_frame_delay) was
+//   captured into deferred_lcf, the promotion logic at frame >= 8 would set
+//   lcf = deferred_lcf. But the early-frame gate `if (lcf_frame < 8)` then ran
+//   AGAIN on the promoted value (lcf_frame is still < 8) and re-deferred it.
+//   This created an infinite re-deferral loop: once a misprediction landed in
+//   frames 0-7, rollback was permanently broken for the rest of the round.
+//
+//   This caused systematic desyncs at frame 30 (the first early sync check) in
+//   6 consecutive matches — even simple walking diverged because the early
+//   misprediction was never corrected and the state gap compounded, while later
+//   inputs agreed (so no new lcf was set to trigger a fresh rollback).
+//
+// Fix:
+//   Track whether the lcf came from a deferred promotion (from_deferred). The
+//   early-frame gate only applies to FRESH live mispredictions, not promoted
+//   ones — promoted entries load safe_target (rollback_min_frame_delay) instead
+//   of lcf_frame, so there's no divergent-state risk.
+//
+// This test models the checkRollback decision logic to verify the promoted
+// deferred entry escapes the gate.
+// =============================================================================
+
+const rollback_min_frame_delay_t: u32 = 8;
+
+// Models the checkRollback early-frame gate decision after deferred promotion.
+// Returns true if a rollback would proceed (gate passed), false if re-deferred.
+fn deferredPromotionProceeds(lcf_frame: u32, from_deferred: bool) bool {
+    if (!from_deferred and lcf_frame < rollback_min_frame_delay_t) {
+        return false; // fresh early-frame misprediction → defer
+    }
+    return true; // promoted deferred OR fresh late-frame → proceed
+}
+
+test "FIX 4c: promoted deferred entry (lcf_frame < 8) is NOT re-deferred" {
+    // A deferred misprediction at frame 3, promoted at frame 8+.
+    // from_deferred=true, lcf_frame=3. Must proceed, not re-defer.
+    try expect(deferredPromotionProceeds(3, true));
+}
+
+test "FIX 4d: fresh live misprediction at frame < 8 IS deferred (gate still works)" {
+    // A fresh misprediction arriving at frame 5 (not promoted). Must defer.
+    try expect(!deferredPromotionProceeds(5, false));
+}
+
+test "FIX 4e: fresh live misprediction at frame >= 8 proceeds normally" {
+    try expect(deferredPromotionProceeds(10, false));
+    try expect(deferredPromotionProceeds(8, false));
+}
+
+// =============================================================================
 // FIX 5: deferred_lcf field exists on NetplayManager and is reset on round start.
 //
 // Since NetplayManager itself can't be host-tested (Win32 externs), this is a

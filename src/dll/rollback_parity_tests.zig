@@ -482,3 +482,30 @@ test "REGRESSION: coalesce + save + load round-trip with new fields" {
     try expectEqual(@as(u32, 200), b);
     try expectEqual(@as(u32, 300), c);
 }
+
+test "FIX: loadStateForFrame falls back to oldest state when enable_fallback = true" {
+    const allocator = std.testing.allocator;
+    var pool = rb.StatePool.init(allocator);
+    defer pool.deinit();
+
+    var dummy: u32 = 42;
+    try pool.addRegion(@intFromPtr(&dummy), @sizeOf(u32));
+    try pool.allocate(5, 0);
+
+    // Save states at frames 10 and 20
+    _ = pool.saveState(10, 1, 4, 1000);
+    _ = pool.saveState(20, 1, 4, 2000);
+
+    // Default: enable_fallback = false in tests.
+    // Searching for frame 5 should return null (no state <= 5).
+    try expect(pool.loadStateForFrame(5, 1) == null);
+
+    // Explicitly enable fallback.
+    pool.enable_fallback = true;
+
+    // Searching for frame 5 should now fall back to the oldest state (frame 10).
+    const loaded = pool.loadStateForFrame(5, 1);
+    try expect(loaded != null);
+    try expectEqual(@as(u32, 10), loaded.?.frame);
+    try expectEqual(@as(u32, 1000), loaded.?.start_world_time);
+}

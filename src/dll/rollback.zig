@@ -239,6 +239,7 @@ pub const StatePool = struct {
     /// `allocate` by checking if any coalesced region contains the effects
     /// array address.
     has_effects: bool = false,
+    enable_fallback: bool = !builtin.is_test,
 
     pub fn init(allocator: std.mem.Allocator) StatePool {
         return .{
@@ -663,7 +664,7 @@ pub const StatePool = struct {
 
         // Fallback: in production (non-test), load the oldest state if available
         // to prevent rollback failures (matches CCCaster's RELEASE fallback).
-        if (!builtin.is_test and self.saved_states.items.len > 0) {
+        if (self.enable_fallback and self.saved_states.items.len > 0) {
             const oldest = self.saved_states.items[0];
             if (oldest.index == target_index) {
                 self.loadState(0);

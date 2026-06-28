@@ -274,8 +274,7 @@ const MockPeer = struct {
 
         if (self.state == .skippable or self.state == .chara_intro) {
             if (self.state == .chara_intro) {
-                const remote_idx = if (self.remote_end_index > 0) self.remote_end_index - 1 else 0;
-                if (remote_idx <= self.index) {
+                if (self.remote_end_index <= self.index) {
                     if (!self.round_start_waiting_logged) {
                         self.round_start_waiting_logged = true;
                     }
@@ -1216,7 +1215,7 @@ test "checkRoundStart deadlock regression test" {
     peer.last_round_start = 0;
     peer.round_start_counter = 0;
 
-    // 1. Remote is behind (remote_end_index is 2, meaning remote_idx = 1 <= peer.index of 2).
+    // 1. Remote is behind (remote_end_index is 2 <= peer.index of 2).
     peer.remote_end_index = 2;
     
     // Increment counter to 1
@@ -1226,8 +1225,8 @@ test "checkRoundStart deadlock regression test" {
     peer.checkRoundStart();
     try expectEqual(NetplayState.chara_intro, peer.state);
     
-    // 3. Remote catches up (remote_end_index becomes 4, so remote_idx = 3 > peer.index of 2).
-    peer.remote_end_index = 4;
+    // 3. Remote catches up (remote_end_index becomes 3 > peer.index of 2).
+    peer.remote_end_index = 3;
     
     // 4. Call checkRoundStart again.
     // With the fix: last_round_start was NOT updated to 1 during the early return,

@@ -24,6 +24,54 @@ const win32 = struct {
         bDisablePriorityBoost: i32,
     ) callconv(.winapi) i32;
 
+    const HWND = ?*anyopaque;
+    const BOOL = i32;
+    const LPARAM = usize;
+    const WPARAM = usize;
+    const UINT = u32;
+
+    extern "user32" fn FlashWindow(hWnd: HWND, bInvert: BOOL) callconv(.winapi) BOOL;
+    extern "user32" fn MessageBeep(uType: UINT) callconv(.winapi) BOOL;
+    extern "user32" fn GetActiveWindow() callconv(.winapi) HWND;
+    extern "user32" fn GetWindowThreadProcessId(hWnd: HWND, lpdwProcessId: ?*u32) callconv(.winapi) u32;
+    extern "user32" fn EnumWindows(lpEnumFunc: *const fn (HWND, LPARAM) callconv(.winapi) BOOL, lParam: LPARAM) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+
+    const EnumState = struct {
+        pid: u32,
+        hwnd: HWND,
+    };
+
+    fn getWindowHandle() HWND {
+        if (builtin.os.tag != .windows) return null;
+        
+        if (GetActiveWindow()) |hwnd| {
+            return hwnd;
+        }
+
+        const target_pid = GetCurrentProcessId();
+        var state = EnumState{
+            .pid = target_pid,
+            .hwnd = null,
+        };
+
+        const Helper = struct {
+            fn enumProc(hwnd: HWND, lParam: LPARAM) callconv(.winapi) BOOL {
+                var s: *EnumState = @ptrFromInt(lParam);
+                var process_id: u32 = 0;
+                _ = GetWindowThreadProcessId(hwnd, &process_id);
+                if (process_id == s.pid) {
+                    s.hwnd = hwnd;
+                    return 0; // stop
+                }
+                return 1; // continue
+            }
+        };
+
+        _ = EnumWindows(Helper.enumProc, @intFromPtr(&state));
+        return state.hwnd;
+    }
+
     // https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-setthreadpriority
     const THREAD_PRIORITY_NORMAL: i32 = 0;
     const THREAD_PRIORITY_TIME_CRITICAL: i32 = 15;
@@ -942,6 +990,7 @@ pub const NetplayManager = struct {
                     self.enet_connected = true;
                     self.was_connected = true;
                     self.log.info("Main peer connected", .{});
+                    self.notifyPeerConnected();
                 } else if (!self.config.is_host) {
                     self.enet_peer = event.peer;
                     self.enet_connected = true;
@@ -2468,6 +2517,17 @@ pub const NetplayManager = struct {
             std.mem.writeInt(u16, out[11 + i * 4 .. 13 + i * 4][0..2], p2, .little);
         }
         return 1 + 8 + num_inputs * 4;
+    }
+
+    fn notifyPeerConnected(self: *NetplayManager) void {
+        if (builtin.os.tag != .windows) return;
+
+        const hwnd = win32.getWindowHandle();
+        if (hwnd) |h| {
+            _ = win32.FlashWindow(h, 1);
+        }
+        _ = win32.MessageBeep(0);
+        self.log.info("Played peer connection notification and requested window attention", .{});
     }
 };
 

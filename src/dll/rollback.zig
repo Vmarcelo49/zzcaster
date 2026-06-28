@@ -210,6 +210,13 @@ pub const SavedState = struct {
     index: u32,
     fpu_env: SavedFpu, // x87 cw + SSE MXCSR only (see SavedFpu doc)
     data: []u8, // contiguous buffer for all memory regions
+    // NetplayManager state that must be restored during rollback.
+    // Mirrors CCCaster's GameState struct (DllRollbackManager.cpp:106-113):
+    //   { netplayState, startWorldTime, indexedFrame, fp_env, rawBytes }
+    // Without restoring these, the re-run uses stale FSM state / wrong
+    // frame counter base → wrong inputs → RNG diverges.
+    netplay_state: u8 = 0, // NetplayState enum value
+    start_world_time: u32 = 0, // world_timer at index start
 };
 
 pub const StatePool = struct {
@@ -446,7 +453,7 @@ pub const StatePool = struct {
     /// If no free slots are available, the OLDEST saved state is overwritten
     /// (ring-buffer semantics). This prevents rollback from silently dying
     /// after `num_states` saves (e.g. 60 frames at 60 FPS = 1 second of play).
-    pub fn saveState(self: *StatePool, frame: u32, index: u32) ?usize {
+    pub fn saveState(self: *StatePool, frame: u32, index: u32, netplay_state: u8, start_world_time: u32) ?usize {
         if (self.state_size == 0) return null;
 
         var slot: usize = undefined;
@@ -525,6 +532,8 @@ pub const StatePool = struct {
             .index = index,
             .fpu_env = fpu_env,
             .data = dst,
+            .netplay_state = netplay_state,
+            .start_world_time = start_world_time,
         }) catch return null;
 
         return slot;
@@ -578,24 +587,37 @@ pub const StatePool = struct {
         }
     }
 
-    /// Find and load the latest state with frame <= target_frame
-    /// Returns the frame that was loaded, or null if no match
-    pub fn loadStateForFrame(self: *StatePool, target_frame: u32, target_index: u32) ?u32 {
+    /// Result of loadStateForFrame: the frame + NetplayManager state that
+    /// was saved with the loaded state. All fields must be restored by the
+    /// caller to match CCCaster's loadState behavior.
+    pub const LoadResult = struct {
+        frame: u32,
+        netplay_state: u8,
+        start_world_time: u32,
+    };
+
+    /// Find and load the latest state with frame <= target_frame.
+    /// Returns the frame + NetplayManager state, or null if no match.
+    pub fn loadStateForFrame(self: *StatePool, target_frame: u32, target_index: u32) ?LoadResult {
         var best_slot: ?usize = null;
         var best_frame: u32 = 0;
+        var best_nps: u8 = 0;
+        var best_swt: u32 = 0;
 
         for (self.saved_states.items, 0..) |state, i| {
             if (state.index == target_index and state.frame <= target_frame) {
                 if (best_slot == null or state.frame > best_frame) {
                     best_slot = i;
                     best_frame = state.frame;
+                    best_nps = state.netplay_state;
+                    best_swt = state.start_world_time;
                 }
             }
         }
 
         if (best_slot) |slot| {
             self.loadState(slot);
-            return best_frame;
+            return .{ .frame = best_frame, .netplay_state = best_nps, .start_world_time = best_swt };
         }
         return null;
     }
@@ -655,14 +677,30 @@ fn saveFpu(out: *SavedFpu) void {
 // registers are left untouched — eliminating the stale-TOP / FPU-stack-
 // overflow bug that the previous `fldenv`-based implementation triggered
 // on the first rollback after entering `in_game`.
+//
+// CRITICAL: MBAACC changes the FPU precision control during gameplay
+// (cw=0x007F = 24-bit single precision, vs the Windows default 0x037F =
+// 64-bit extended). The FPU restore is MANDATORY — without it, the
+// rollback re-run uses the wrong precision, producing different
+// floating-point results → position drift → cascading desync.
+//
+// REGISTER-POINTER ADDRESSING: The "m" constraint codegen on x86-32
+// generates an invalid addressing mode for ldmxcsr (crashes with #GP even
+// with a valid 0x1F80 value). The fix: use register-pointer addressing.
+// The "r" constraint puts the pointer in a GPR, and (%reg) syntax always
+// generates valid ldmxcsr/fldcw encoding.
 fn restoreFpu(env: *const SavedFpu) void {
     if (builtin.cpu.arch != .x86) return;
-    const cw: u16 = env.cw;
-    const mxcsr: u32 = env.mxcsr;
-    asm volatile (
-        "fldcw %[cw]\n\tldmxcsr %[mxcsr]"
+    var cw_buf: u16 = env.cw;
+    var mxcsr_buf: u32 = env.mxcsr & 0xFFC0; // mask status bits + reserved
+    const cw_ptr: *const u16 = &cw_buf;
+    const mxcsr_ptr: *const u32 = &mxcsr_buf;
+    asm volatile ("fldcw (%[ptr])"
         :
-        : [cw] "m" (cw),
-          [mxcsr] "m" (mxcsr),
+        : [ptr] "r" (cw_ptr),
+    );
+    asm volatile ("ldmxcsr (%[ptr])"
+        :
+        : [ptr] "r" (mxcsr_ptr),
     );
 }

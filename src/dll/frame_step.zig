@@ -102,6 +102,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     n.syncRngState();
 
+    // Per-frame clearLastChangedFrame (matches CCCaster's behavior).
+    // CCCaster clears lastChangedFrame every frame when the rollback timer
+    // allows, BEFORE receiving new inputs. This prevents a stale lcf from a
+    // previous frame's setRemote from triggering a late spurious rollback.
+    // zzcaster only cleared lcf inside checkRollback, so stale lcfs persisted.
+    if (n.rollback_timer == n.min_rollback_spacing) {
+        n.remote_inputs.clearLastChanged();
+    }
+
     n.pollAndDispatch(3);
 
     n.maybeSendSyncHash();
@@ -297,21 +306,17 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         // saved into the StatePool snapshot). Without this, the entire
         // point of rollback — re-simulating with corrected inputs — is
         // defeated.
-        //
-        // The legacy CCCaster calls writeGameInputs at the end of every
-        // frame, including re-run frames (DllMain.cpp's `frameStep` calls
-        // either `frameStepRerun` or `frameStepNormal` based on
-        // `fastFwdStopFrame`, then unconditionally writes inputs at lines
-        // 988-989). The Zig port's early `return` here was a regression
-        // that broke rollback correctness.
         n.writeGameInputs();
         if (n.checkRerunComplete()) {
             // Rerun completed on this frame. Fall through to normal frame logic so the frame
             // is saved, spectator packets are sent, etc.
         } else {
-            // Rerun still in progress. Save state for this re-simulated frame so we have
-            // correct intermediate checkpoints.
-            _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+            // Rerun still in progress. Do NOT save state here — CCCaster
+            // deliberately does NOT save re-run states ("the inputs are
+            // faked" — DllMain.cpp:923). Saving potentially-wrong re-run
+            // states poisons the pool; a second rollback loading a poisoned
+            // state propagates the error. Just return and let the next
+            // frame continue the re-run.
             return;
         }
     }
@@ -321,7 +326,7 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         if (n.rollback_timer == 0) n.rollback_timer = n.min_rollback_spacing;
     }
 
-    _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index);
+    _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
     // Snapshot SFX filter into history ring (for future rollback dedup).
     if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
 

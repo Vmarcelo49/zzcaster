@@ -2339,23 +2339,25 @@ pub const NetplayManager = struct {
         }
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
-        const loaded_frame = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
-        if (loaded_frame == null) {
+        const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
+        if (loaded == null) {
             self.remote_inputs.clearLastChanged();
             self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
             return false;
         }
 
+        // CRITICAL: Restore NetplayManager state to match CCCaster's loadState
+        // (DllRollbackManager.cpp:147-149):
+        //   netMan._state = it->netplayState;
+        //   netMan._startWorldTime = it->startWorldTime;
+        //   netMan._indexedFrame = it->indexedFrame;
+        // Without restoring these, the re-run uses stale FSM state / wrong
+        // frame counter base → wrong inputs → RNG diverges.
+        self.state = @enumFromInt(loaded.?.netplay_state);
+        self.start_world_time = loaded.?.start_world_time;
+
         // Strategy 2B (docs/dll-optimization-plan.md): raise the calling
         // thread to TIME_CRITICAL priority for the duration of the rerun.
-        // A rollback can fast-forward 8+ frames in a single 16.6ms tick; if
-        // the Windows scheduler preempts us mid-rerun (e.g. a background
-        // AV scan thread, or another high-priority process), the rerun
-        // misses its deadline and the next 16.6ms frame starts late —
-        // causing a stutter. Bumping to TIME_CRITICAL for the rerun window
-        // makes preemption ~10x less likely without permanently starving
-        // other threads. We restore priority inside `checkRerunComplete`
-        // once `fast_fwd_stop_frame == 0`.
         win32.boostForRerun();
 
         // Trigger rollback!
@@ -2367,11 +2369,11 @@ pub const NetplayManager = struct {
         // current frame, then mark with 0x80 sentinel so the play-hook
         // knows to suppress them.
         if (self.sfx_dedup) |*sd| {
-            sd.applyRollbackFilter(loaded_frame.?, current_frame);
+            sd.applyRollbackFilter(loaded.?.frame, current_frame);
         }
 
-        self.indexed_frame.frame = loaded_frame.?;
-        self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded_frame.?, current_frame });
+        self.indexed_frame.frame = loaded.?.frame;
+        self.log.info("ROLLBACK: loaded state for frame {d}, re-running to {d}", .{ loaded.?.frame, current_frame });
 
         self.remote_inputs.clearLastChanged();
         self.rollback_timer = 0;

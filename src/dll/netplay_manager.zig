@@ -1114,18 +1114,23 @@ pub const NetplayManager = struct {
                 //
                 // checkRoundStart transitions to .in_game when round_start_counter
                 // fires (at intro_state==1, pre-game). So we should only be in
-                // .chara_intro while intro_state==2 (intro animation). If
-                // intro_state is 1 or 0 here, checkRoundStart will transition us
-                // this frame — pass input through so the player can move.
-                if (intro_state_addr.* != 2) {
-                    return raw_input;
-                }
-                // Still in character intro animation: only allow Confirm/Cancel.
-                // If remote is ahead, mash Confirm EVERY frame to catch up.
-                // Using every-other-frame (frame % 2) can cause a race when
-                // peers are at different frame counts — the skip happens at
-                // different game-internal frames, causing desync.
+                // .chara_intro while intro_state==2 (intro animation).
+                //
+                // FILTER ALL INPUTS to Confirm/Cancel only — matches CCCaster's
+                // getSkippableInput (DllNetplayManager.cpp:158-179). CCCaster
+                // does NOT pass movement inputs through during CharaIntro, even
+                // during pre-game (intro_state==1). This prevents movement-input
+                // correction debt from accumulating during the chara_intro phase
+                // (where we don't save rollback states), which would discharge
+                // as a desync when transitioning to in_game.
+                //
+                // The previous zzcaster "enhancement" of letting players move
+                // during pre-game caused 50% desync rates when players mashed
+                // directions and dashes — the movement inputs entered the
+                // InputBuffer, differed from prediction, and caused rollbacks
+                // that couldn't be resolved (no saved states to roll back to).
                 if (self.shouldCatchUp()) {
+                    // If remote is ahead, mash Confirm EVERY frame to catch up.
                     return button_confirm << 4;
                 }
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits

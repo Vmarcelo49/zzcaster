@@ -2557,16 +2557,15 @@ pub const NetplayManager = struct {
         // different absolute world_timer values. Rolling back to frame 0 or 1
         // loads a divergent state → desync.
         //
-        // We check BOTH the current frame AND the lcf_frame:
-        // - If we're still in the first few frames, skip (building up history)
-        // - If the lcf points to an early frame (< rollback_min_frame_delay),
-        //   the remote input change was detected for an early frame but the
-        //   packet arrived late. Skip and clear — we can't safely rollback to
-        //   those early divergent states.
-        if (self.indexed_frame.frame < rollback_min_frame_delay or
-            lcf_frame < rollback_min_frame_delay)
+        // However, we only skip the rollback — we do NOT clear the lcf.
+        // This means the misprediction is still tracked. On the next frame,
+        // if we're past the delay window, the rollback will fire and correct
+        // it. This prevents the "wrong RNG persists uncorrected" problem
+        // while still avoiding loading divergent early states.
+        if (lcf_frame < rollback_min_frame_delay)
         {
-            self.remote_inputs.clearLastChanged();
+            // Can't safely rollback to early frames — but DON'T clear lcf.
+            // The misprediction will be corrected once we're past the delay.
             return false;
         }
 

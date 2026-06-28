@@ -326,9 +326,17 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         if (n.rollback_timer == 0) n.rollback_timer = n.min_rollback_spacing;
     }
 
-    _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
-    // Snapshot SFX filter into history ring (for future rollback dedup).
-    if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
+    // Only save rollback states in-game — matches CCCaster (DllMain.cpp:206-207,
+    // "Only save rollback states in-game"). The C++ switch places saveState in
+    // the case InGame block BEFORE the fallthrough into the shared
+    // CharaSelect/Loading/CharaIntro/Skippable block, so CharaIntro never
+    // saves. This prevents the rollback pool from filling with .chara_intro
+    // states that would cause state-machine inconsistency on load.
+    if (n.state == .in_game) {
+        _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
+        // Snapshot SFX filter into history ring (for future rollback dedup).
+        if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
+    }
 
     n.writeGameInputs();
 

@@ -441,6 +441,16 @@ fn applyPostLoadHacks() void {
             state.log.?.err("ENet init failed — netplay disabled", .{});
             is_netplay = false;
         };
+
+        // Rollback-specific ASM hacks (ported from CCCaster DllMain.cpp:1896-1907).
+        // hijackIntroState disables the game's natural intro_state 1→0 progression
+        // so we can manually control it during rollback. Required for the
+        // chara_intro → in_game transition to fire at pre-game (intro_state==1)
+        // instead of at "Fight!" (intro_state==0) — which eliminates the huge
+        // rollback at the start of gameplay.
+        if (state.nm.?.config.rollback > 0) {
+            asm_hacks.applyHijackIntroState();
+        }
     }
 }
 

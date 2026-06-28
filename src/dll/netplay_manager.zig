@@ -1749,44 +1749,21 @@ pub const NetplayManager = struct {
             self.log.info("Intro done (game_state=99) — RNG sync enabled (round 2+)", .{});
         }
 
-        // chara_intro → in_game: requires BOTH signals to fire.
+        // chara_intro → in_game transition is now handled by checkRoundStart()
+        // via the round_start_counter (which fires at intro_state==1, pre-game).
+        // This matches CCCaster's Variable::RoundStart handler.
         //
-        //   1. intro_state_addr.* == 0: the game itself confirms "Fight!"
-        //      fired and the round timer started. This is REQUIRED to preserve
-        //      the invariant that `state == .in_game` implies `intro_state == 0`.
-        //      Without this invariant, rollback could load a state with
-        //      intro_state != 0, and clearIntroStateDuringRollback only fires
-        //      past frame 224 — so early-frame rollbacks would corrupt the
-        //      game's intro-state code path → desync.
+        // The old intro_state==0 trigger is REMOVED — transitioning at "Fight!"
+        // (intro_state==0) caused the "huge rollback at Fight!" because rollback
+        // was inactive for the entire 224-frame pre-game phase.
         //
-        //      Attempted transitioning at intro_state <= 1 (pre-game) to move
-        //      the sync earlier, but this caused desyncs because the game's
-        //      behavior differs between intro_state 1 and 0, and rollback
-        //      loading a state with intro_state==1 corrupts the gameplay path.
+        // The hijackIntroState ASM hack (applied in applyPostLoadHacks when
+        // rollback is enabled) disables the game's natural intro_state 1→0
+        // progression, so rollback can safely load states with intro_state==1
+        // without the game re-firing intro logic → no desync.
         //
-        //   2. remote_inputs.getEndIndex() > indexed_frame.index: the remote
-        //      peer has reached our current transition index. This makes the
-        //      faster peer wait during chara_intro for the slower peer to
-        //      catch up before both enter in_game.
-        if (self.state == .chara_intro and intro_state_addr.* == 0) {
-            const remote_end_index = self.remote_inputs.getEndIndex();
-            if (remote_end_index > self.indexed_frame.index) {
-                const old = self.state;
-                _ = self.isValidNext(.in_game);
-                self.state = .in_game;
-                self.onStateTransition(old, .in_game);
-                self.log.info("CharaIntro -> InGame (intro_state=0, remote caught up at index {d})", .{self.indexed_frame.index});
-                if (self.sfx_dedup) |*sd| sd.clearPerFrame();
-            } else {
-                // Faster peer: chara_intro finished visually but remote is
-                // still behind. Keep state == .chara_intro so getNetplayInput
-                // still suppresses direction/action buttons, and the next
-                // frame's checkIntroDone will re-evaluate.
-                self.log.info("CharaIntro intro_state=0 but remote behind (remote_end_index={d}, our_index={d}) — waiting", .{
-                    remote_end_index, self.indexed_frame.index,
-                });
-            }
-        }
+        // We keep the INTRO_DONE RNG sync arming above (game_state==99) for
+        // rounds 2+, but do NOT transition state here anymore.
     }
 
     pub fn checkRoundOver(self: *NetplayManager) void {
@@ -1908,11 +1885,25 @@ pub const NetplayManager = struct {
         const prev = self.last_round_start;
         self.last_round_start = current;
 
-        // Only the Skippable → InGame transition is driven by this signal.
-        // In other states, the increment is informational only.
-        if (self.state == .skippable) {
-            self.log.info("Round start detected (counter {d} -> {d}) — Skippable -> InGame", .{
-                prev, current,
+        // The round_start_counter fires when players can move (intro_state==1,
+        // pre-game). Both CharaIntro→InGame and Skippable→InGame transitions
+        // are driven by this signal — matching CCCaster's Variable::RoundStart
+        // handler (DllMain.cpp:1266-1270) which fires netplayStateChanged(InGame)
+        // unconditionally.
+        //
+        // This transitions at pre-game (intro_state==1), NOT at "Fight!"
+        // (intro_state==0), so rollback is active during the entire pre-game
+        // phase. This eliminates the "huge rollback at Fight!" because small
+        // mispredictions are smoothed out over ~224 pre-game frames instead
+        // of discharging as a single huge rollback at InGame frame 0.
+        //
+        // Requires the hijackIntroState ASM hack (applied in applyPostLoadHacks
+        // when rollback is enabled) to disable the game's natural intro_state
+        // 1→0 progression — otherwise rollback loading a state with
+        // intro_state==1 would desync.
+        if (self.state == .skippable or self.state == .chara_intro) {
+            self.log.info("Round start detected (counter {d} -> {d}) — {s} -> InGame", .{
+                prev, current, @tagName(self.state),
             });
             self.transitionTo(.in_game);
         } else {

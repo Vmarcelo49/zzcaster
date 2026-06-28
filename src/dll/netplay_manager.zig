@@ -2448,11 +2448,25 @@ pub const NetplayManager = struct {
         // any deferred entry so it doesn't fire again.
         self.deferred_lcf = null;
 
-        const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
+        // If this misprediction was deferred (lcf_frame < rollback_min_frame_delay),
+        // do NOT load lcf_frame's state — that state may still carry the
+        // entry-timing divergence between peers (the reason the skip exists).
+        // Instead, load the earliest SAFE state: the one at
+        // rollback_min_frame_delay. States are saved at the START of each frame
+        // (before writeGameInputs), so loadStateForFrame(N) returns the
+        // start-of-frame-N state; re-simulating N→current with the corrected
+        // remote inputs (now in the buffer) fixes the input-driven divergence
+        // from frame N onward.
+        const safe_target = if (lcf_frame < rollback_min_frame_delay)
+            rollback_min_frame_delay
+        else
+            lcf_frame;
+
+        const loaded = self.state_pool.loadStateForFrame(safe_target, lcf_index);
         if (loaded == null) {
             // Do NOT clear last changed frame! Let's keep it so it retries on subsequent frames.
             // Matches CCCaster: DllMain.cpp:620
-            self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
+            self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ safe_target, self.state_pool.num_states });
             return false;
         }
 
@@ -2473,7 +2487,13 @@ pub const NetplayManager = struct {
         // Trigger rollback!
         const current_frame = self.indexed_frame.frame;
         self.fast_fwd_stop_frame = current_frame;
-        self.log.info("ROLLBACK: frame {d} -> {d}", .{ current_frame, lcf_frame });
+        if (safe_target != lcf_frame) {
+            self.log.info("ROLLBACK (deferred): frame {d} -> {d} (misprediction at {d}, loading earliest safe state)", .{
+                current_frame, safe_target, lcf_frame,
+            });
+        } else {
+            self.log.info("ROLLBACK: frame {d} -> {d}", .{ current_frame, lcf_frame });
+        }
 
         // Apply SFX dedup filter: OR together snapshots between loaded and
         // current frame, then mark with 0x80 sentinel so the play-hook

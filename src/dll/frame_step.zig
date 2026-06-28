@@ -160,54 +160,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
-    // Lockstep wait for the remote's input.
-    //
-    // CCCaster's wait loop (DllMain.cpp:540-581) runs unconditionally inside
-    // `frameStepNormal()` — it does NOT skip when the socket is disconnected.
-    // When the remote hasn't connected yet, `isRemoteInputReady()` returns
-    // false (the remote input container is empty), so the loop blocks the
-    // game's main thread until the remote connects AND sends its first
-    // `PlayerInputs` for the current transition index. This is the mechanism
-    // that prevents the "fast peer enters gameplay before slow peer" desync:
-    // the faster peer's game freezes on InGame frame 0.
-    //
-    // The previous zzcaster code short-circuited this with:
-    //   if (!n.enet_connected) { n.writeGameInputs(); return; }
-    // which let the game run at FULL SPEED with no synchronization whenever
-    // ENet hadn't connected yet. This was the root cause of the user's bug:
-    // the lazy ENet reconnect (frame_step.zig:18-36) takes up to 15s, and if
-    // either peer reached InGame frame 0 during that window, the game would
-    // advance without waiting for the remote peer — causing the match to
-    // terminate or desync immediately.
-    //
-    // The fix: enter the wait loop unconditionally. The loop already polls
-    // ENet via `pollAndDispatch(10)`, which processes CONNECT events and
-    // establishes the connection.
-    //
-    // TIMEOUT POLICY:
-    // The 10s hard timeout (matching CCCaster's MAX_WAIT_INPUTS_INTERVAL)
-    // only fires when the remote peer has ALREADY reached the same transition
-    // index as the local peer but isn't sending frames — this indicates a
-    // real connectivity problem (peer crashed, packet loss, etc.).
-    //
-    // If the remote peer is still in an EARLIER transition index (i.e., still
-    // loading while the local peer has already reached InGame), the timeout
-    // does NOT fire. The faster peer's game simply freezes on InGame frame 0
-    // and waits for the slower peer to finish loading and catch up. This is
-    // the behavior the user described: "the player that loaded first should
-    // have their thread paused until the other catches up". A slow machine
-    // can take 15-30s to load, and terminating the session in that window
-    // would be incorrect — the slower peer is still making progress, just
-    // hasn't reached InGame yet.
-    //
-    // We detect "remote is still in an earlier state" by checking whether
-    // `remote_inputs.getEndIndex()` (which reflects the highest transition
-    // index the remote has sent inputs for) is less than the local peer's
-    // current `indexed_frame.index`. When the remote sends its
-    // `TransitionIndex` for InGame, `setRemoteIndex` → `resizeOuter` bumps
-    // `end_index` to InGame+1, so this check correctly transitions from
-    // "still loading" to "at InGame, awaiting frames" when the remote
-    // finishes loading.
+    // Lockstep wait: block until the remote peer has sent input for the
+    // current frame. The faster peer's game freezes here until the slower
+    // peer catches up. 30s timeout only fires after the remote reaches our
+    // transition index but stops sending frames (crash/packet loss).
     if (!n.isRemoteInputReady()) {
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
         var connected_since: i64 = 0; // 0 = not yet connected

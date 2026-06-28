@@ -593,15 +593,15 @@ pub const NetplayManager = struct {
 
     last_packet_ms: i64 = 0,
 
-    // Retry-menu sync gate: true quando entramos em .retry_menu mas o peer
+    // Retry-menu sync gate: true when we enter .retry_menu but the remote
     // remoto ainda não confirmou (via TransitionIndex) que também chegou lá.
-    // Enquanto true, getNetplayInput suprime TODOS os inputs locais — o
+    // While true, getNetplayInput suppresses all local inputs — the
     // player mais rápido não pode skipar a animação de vitória nem apertar
     // rematch antes do player mais lento chegar no menu. Impede a dessincronia
     // onde o player rápido avança para .loading enquanto o lento ainda vê a
     // tela de vitória.
     retry_menu_waiting_for_peer: bool = false,
-    // Wall-clock ms de quando o retry-menu wait começou (0 = ainda não
+    // Wall-clock ms when the retry-menu wait started (0 = not started yet).
     // iniciado). Usado para o timeout de segurança de 10s — se o peer
     // crashar ou o TransitionIndex se perder, os inputs são liberados
     // para não travar o jogo indefinidamente.
@@ -1204,17 +1204,17 @@ pub const NetplayManager = struct {
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits
             },
             .in_game, .retry_menu => {
-                // Retry-menu sync gate: se estamos em .retry_menu esperando
-                // o peer remoto alcançar nosso transition index, suprime
-                // TODOS os inputs locais. Impede que o player mais rápido
-                // skip a animação de vitória e aperte rematch antes do
-                // player mais lento chegar no menu — o que causaria
-                // dessincronia (.retry_menu → .loading de um lado enquanto
-                // o outro ainda vê a vitória).
+                // Retry-menu sync gate: if in .retry_menu waiting for the remote to
+                // reach our transition index, suppress all local inputs.
+                // Prevents the faster player from skipping the victory
+                // animation and pressing rematch before the slower player
+                // reaches the menu — which would desync (.retry_menu → .loading
+                // on one side while the other still sees victory).
                 //
-                // Timeout de segurança de 10s: se o peer crashar ou o
-                // TransitionIndex se perder, libera os inputs para não
-                // travar o jogo indefinidamente.
+                //
+                // 30s safety timeout: if the peer crashes or the
+                // TransitionIndex is lost, unblock inputs to avoid
+                // freezing the game indefinitely.
                 if (self.state == .retry_menu and self.retry_menu_waiting_for_peer) {
                     const now = std.Io.Clock.now(.real, self.io).toMilliseconds();
                     if (self.retry_menu_wait_start_ms == 0) {
@@ -1225,7 +1225,7 @@ pub const NetplayManager = struct {
                         self.retry_menu_wait_start_ms = 0;
                         self.log.warn("Retry menu peer wait timed out (10s) — unblocking inputs", .{});
                     } else {
-                        return 0; // suprime input
+                        return 0; // suppress input
                     }
                 }
                 // Real input. In netplay, strip the Start button to prevent
@@ -1299,69 +1299,19 @@ pub const NetplayManager = struct {
     }
 
     pub fn isRemoteInputReady(self: *const NetplayManager) bool {
-        // In CharaSelect and InGame, the frame loop MUST block until the
-        // remote peer has caught up to our transition index AND has sent
-        // input for the current frame. This is the lock-step gate that
-        // keeps both sides synchronized — without it, one side can race
-        // ahead (e.g. start the match while the other is still loading).
-        //
-        // Loading / Skippable / CharaIntro / RetryMenu do NOT block:
-        // each side runs at its own pace, and the catch-up mash logic
-        // in getNetplayInput() ensures the lagging side auto-skips.
-        //
-        // CharaIntro returns true unconditionally — matches CCCaster's
-        // isRemoteInputReady (DllNetplayManager.cpp:976-981). Both peers
-        // run at full speed during chara_intro, each transitioning to
-        // in_game independently when their local round_start_counter fires.
-        // Synchronization happens only after both are in in_game, via the
-        // RNG gate and the lockstep wait. Frame-synchronizing during
-        // chara_intro causes timing differences that affect the game's
-        // internal state machine → RNG divergence → desync.
+        // CharaSelect and InGame block on remote input (lockstep).
+        // All other states return true (run at own pace, catch-up mash handles lag).
+        // CharaIntro returns true unconditionally — matches CCCaster.
         switch (self.state) {
             .pre_initial, .initial, .loading, .skippable, .retry_menu, .chara_intro => return true,
             .chara_select, .in_game => {},
         }
 
-        // Offline / spectator: always ready
         if (!self.config.is_netplay or self.config.is_spectator) return true;
 
-        // ----------------------------------------------------------------
-        // RNG readiness gate (client only).
-        //
-        // The host captures and sends the game's RNG state at a specific
-        // frame F (when `should_sync_rng` is armed by `onStateTransition`
-        // or `checkIntroDone`). The client must apply that snapshot at the
-        // SAME logical frame F. If the client advances past frame F before
-        // the host's RNG packet arrives, the client's game will already
-        // have advanced its RNG past S_F; overwriting it with S_F at frame
-        // F+N bakes in a permanent advancement offset that the SyncHash
-        // detector flags as "RNG hash mismatch" at the first 150-frame
-        // check (indexed_frame 0x0000000100000095 = index 1, frame 149).
-        //
-        // CCCaster closes this race by gating the poll loop on
-        // `isRngStateReady(shouldSyncRngState)` (DllNetplayManager.cpp:1054)
-        // and deferring `procMan.setRngState()` until after the poll loop
-        // exits (DllMain.cpp:624-646). The Zig port's
-        // `applyRemoteRng` writes to game memory immediately on packet
-        // receipt, so the equivalent fix is to gate `isRemoteInputReady`
-        // on `rng_synced` — the client blocks in the lockstep wait loop
-        // (frame_step.zig), polling ENet until the RNG packet arrives and
-        // is applied, then proceeds. The host does not gate (it captures
-        // and sends its own RNG, and naturally blocks on remote input
-        // because the client can't send inputs while it's waiting for
-        // RNG).
-        //
-        // This gate only applies during .chara_intro and .in_game — NOT
-        // during .chara_select. CharaSelect is a low-stakes state (no
-        // gameplay yet) where blocking on RNG risks the 10s input-wait
-        // timeout force-exit if the host's RNG packet is delayed. The
-        // deferred-application logic in `applyRemoteRng` (see "If this
-        // RNG is for the next index, cache it but defer application")
-        // handles early-arrival packets correctly, so the client can
-        // safely run a few chara_select frames without `rng_synced` and
-        // apply the host's RNG via the cached-state path in
-        // `onStateTransition` when it enters .in_game.
-        // ----------------------------------------------------------------
+        // Client blocks until host's RNG packet is applied (prevents RNG
+        // advancement race). Not gated during chara_select (low-stakes,
+        // cached RNG applied on in_game transition).
         if (self.state != .chara_select and
             self.should_sync_rng and !self.config.is_host and !self.rng_synced)
         {
@@ -1426,32 +1376,10 @@ pub const NetplayManager = struct {
     pub fn syncRngState(self: *NetplayManager) void {
         if (!self.should_sync_rng or self.rng_acked) return;
         if (!self.config.is_host) return;
-        // `should_sync_rng` is the single source of truth for "should the
-        // host send RNG now?" It's armed at exactly the right moments by
-        // `onStateTransition` (chara_select entry, in_game entry) and by
-        // `checkIntroDone` (intro-done edge for rounds 2+).
-        //
-        // The legacy `intro_rng_enabled` defense-in-depth gate that used
-        // to live here was removed because it incorrectly blocked
-        // chara_select RNG sync even when `should_sync_rng` was armed.
-        // The `intro_rng_enabled` FIELD is still used by `checkIntroDone`
-        // for one-shot edge detection on rounds 2+ — it just no longer
-        // gates `syncRngState` itself.
-        //
-        // The legacy CCCaster arms RNG sync at THREE points — CharaSelect,
-        // InGame, and INTRO_DONE (`DllMain.cpp:1075-1081`) — and relies on
-        // the `isRngStateReady` poll-loop gate (`DllNetplayManager.cpp:1054`)
-        // plus deferred application (`DllMain.cpp:624-646`) to keep it
-        // deterministic. The Zig port arms at the same three points and
-        // additionally gates `isRemoteInputReady` on `rng_synced` (see
-        // that function) to achieve the same determinism with immediate
-        // application.
-        //
-        // Lazy-reconnect: only send once the ENet peer has actually connected.
-        // The peer's CONNECT event may not have arrived yet on the first
-        // frames of chara-select; sending before that silently drops the
-        // packet (sendReliable bails when !enet_connected), so we must not
-        // burn a send attempt or mark anything done in that window.
+        // Host captures and sends RNG at 3 points: chara_select entry,
+        // in_game entry (via onStateTransition), and intro_done for rounds
+        // 2+ (via checkIntroDone). Client blocks via isRemoteInputReady
+        // gate until the RNG packet arrives.
         if (self.enet_peer == null or !self.enet_connected) return;
 
         // Throttle resends so we don't flood the peer every frame while the
@@ -1703,61 +1631,9 @@ pub const NetplayManager = struct {
 
     // --- State transitions ---
 
-    /// Validate that a state transition is allowed. CCCaster uses an explicit
-    /// white-list; invalid transitions indicate a desync and should be logged.
-    /// Returns true if the transition is valid, false otherwise.
-    ///
-    /// Valid transitions (adapted from CCCaster's isValidNext; see divergences
-    /// noted inline). CCCaster states not present in this port (AutoCharaSelect,
-    /// ReplayMenu) are omitted, and the following changes vs. CCCaster are made:
-    ///   pre_initial → initial | chara_select | loading | chara_intro | in_game
-    ///     ↑ ADDED: the original white-list only allowed `pre_initial → initial`,
-    ///       but nothing in the codebase ever fires that transition. The first
-    ///       gameplay mode the game enters after the launcher handshake is
-    ///       `mode_chara_select (20)`, so `onGameModeChanged(20)` would try
-    ///       `pre_initial → chara_select`, get refused by the strict white-list,
-    ///       and the FSM would be permanently stuck in `pre_initial` (user
-    ///       inputs ignored, no sync, no transitions). We allow `pre_initial`
-    ///       to transition directly to any gameplay state — the `initial`
-    ///       state was a vestigial placeholder that the legacy code used
-    ///       during a setup phase that the Zig port doesn't have.
-    ///   initial → chara_select (netplay) | in_game (training)
-    ///     ↑ ADDED: replaces CCCaster's Initial → AutoCharaSelect → Loading → InGame
-    ///       chain for training mode (no AutoCharaSelect in this port).
-    ///   chara_select → loading
-    ///   loading → chara_intro (versus) | in_game (training)
-    ///     ↑ DROPPED vs CCCaster: Loading → Skippable.
-    ///   chara_intro → in_game
-    ///     ↑ During chara_intro, the game has a "pre-game" sub-phase where
-    ///       CC_INTRO_STATE_ADDR == 1: characters are on the arena and
-    ///       players can move (input is passed through via the
-    ///       `chara_intro_intro_state != 2` check in getNetplayInput), but
-    ///       the round hasn't officially started. We do NOT add a separate
-    ///       `.pre_game` state because that would require an extra
-    ///       `TransitionIndex` packet and index increment per round, which
-    ///       complicates peer sync (host at index N+1 sending inputs while
-    ///       remote is still at index N in chara_intro).
-    ///   in_game → skippable | chara_select | retry_menu
-    ///     ↑ retry_menu: the post-match menu (game_mode=5) opens directly
-    ///       from the in-game round when the deciding round ends. Also
-    ///       accepts the inter-round .skippable → retry_menu transition.
-    ///       The CCCaster reference allows both InGame→RetryMenu and
-    ///       Skippable→RetryMenu (DllNetplayManager.hpp:1151-1152).
-    ///       DROPPED vs CCCaster: InGame → RetryMenu → ReplayMenu (we have
-    ///       no replay playback path).
-    ///   skippable → in_game (next round) | retry_menu | chara_select
-    ///     ↑ ADDED: when the match ends (someone hits `win_count` wins), the
-    ///       game returns to `chara_select (mode 20)`. Without this transition,
-    ///       `onGameModeChanged(20)` from `.skippable` would be refused, the
-    ///       FSM would get stuck in `.skippable`, and the user couldn't pick
-    ///       a character for the rematch (inputs filtered to Confirm/Cancel
-    ///       only while in `.skippable`). Allowing `skippable → chara_select`
-    ///       unblocks the rematch flow.
-    ///   in_game → retry_menu (match-over only, detected by routeRoundOver
-    ///     checking CC_P1_WINS_ADDR / CC_P2_WINS_ADDR against win_count).
-    ///     The post-match menu lets the player choose rematch or character
-    ///     select with the d-pad (input passes through in .retry_menu).
-    ///   retry_menu → loading (rematch) | chara_select
+    /// Validate state transitions. Diverges from CCCaster: no AutoCharaSelect
+    /// or ReplayMenu states; pre_initial can go directly to any gameplay state;
+    /// skippable → chara_select added for rematch flow.
     fn isValidNext(self: *const NetplayManager, new: NetplayState) bool {
         const old = self.state;
         const valid = switch (old) {
@@ -1948,76 +1824,33 @@ pub const NetplayManager = struct {
         if (self.round_over_timer > 0) self.round_over_timer -= 1;
     }
 
-    /// Watch the `round_start_counter` (incremented by the detectRoundStart
-    /// ASM hack in asm_hacks.zig) for changes. When the counter increments,
-    /// a new round has just started (players can move).
-    ///
-    /// If we're currently in `.skippable` (post-round-over), this is the
-    /// signal to transition back to `.in_game` for the next round. Other
-    /// states ignore the increment — e.g. during `.chara_intro` the first
-    /// increment is the FIRST round starting, which is handled separately
-    /// by checkIntroDone().
-    ///
-    /// Mirrors the legacy Variable::RoundStart change-monitor in
-    /// DllMain.cpp:1266-1270, which fired netplayStateChanged(InGame)
-    /// unconditionally on counter change (valid from CharaIntro, Skippable,
-    /// or Loading per CCCaster's isValidNext). The Zig only acts on this
-    /// signal for the Skippable→InGame case; CharaIntro→InGame is handled
-    /// separately by checkIntroDone() via CC_INTRO_STATE_ADDR.
+    /// Watch round_start_counter for changes. Fires when players can move
+    /// (intro_state==1, pre-game). Transitions chara_intro→in_game and
+    /// skippable→in_game. Requires hijackIntroState ASM hack to be active.
     pub fn checkRoundStart(self: *NetplayManager) void {
         const current = asm_hacks.round_start_counter;
         if (current == self.last_round_start) return;
 
-        // Counter changed — record the new value so we don't re-fire on
-        // the same increment next frame.
         const prev = self.last_round_start;
         self.last_round_start = current;
 
-        // The round_start_counter fires when players can move (intro_state==1,
-        // pre-game). Both CharaIntro→InGame and Skippable→InGame transitions
-        // are driven by this signal — matching CCCaster's Variable::RoundStart
-        // handler (DllMain.cpp:1266-1270) which fires netplayStateChanged(InGame)
-        // unconditionally.
-        //
-        // This transitions at pre-game (intro_state==1), NOT at "Fight!"
-        // (intro_state==0), so rollback is active during the entire pre-game
-        // phase. This eliminates the "huge rollback at Fight!" because small
-        // mispredictions are smoothed out over ~224 pre-game frames instead
-        // of discharging as a single huge rollback at InGame frame 0.
-        //
-        // Requires the hijackIntroState ASM hack (applied in applyPostLoadHacks
-        // when rollback is enabled) to disable the game's natural intro_state
-        // 1→0 progression — otherwise rollback loading a state with
-        // intro_state==1 would desync.
         if (self.state == .skippable or self.state == .chara_intro) {
-            // For chara_intro → in_game, gate on the remote peer having reached
-            // our transition index. This ensures both peers enter in_game at the
-            // same logical moment (same indexed_frame), preventing the camera
-            // and entity positions from diverging at frame 0.
-            //
-            // Without this gate, the faster peer enters in_game alone, saves a
-            // state at frame 0 with their local camera position, then when the
-            // remote catches up and the first rollback fires, the loaded state
-            // has a different camera position than the remote's → desync.
-            //
-            // The skippable → in_game transition (round 2+) doesn't need this
-            // gate because both peers are already synchronized from round 1.
+            // For chara_intro→in_game, wait until the remote has reached
+            // our transition index (prevents frame-0 state divergence).
             if (self.state == .chara_intro) {
                 const remote_end_index = self.remote_inputs.getEndIndex();
                 if (remote_end_index <= self.indexed_frame.index) {
-                    self.log.info("Round start detected (counter {d} -> {d}) — chara_intro but remote behind (remote_end_index={d}, our_index={d}), waiting", .{
+                    self.log.info("Round start (counter {d} -> {d}) — chara_intro but remote behind (remote_end_index={d}, our_index={d}), waiting", .{
                         prev, current, remote_end_index, self.indexed_frame.index,
                     });
                     return;
                 }
             }
-            self.log.info("Round start detected (counter {d} -> {d}) — {s} -> InGame", .{
+            self.log.info("Round start (counter {d} -> {d}) — {s} -> InGame", .{
                 prev, current, @tagName(self.state),
             });
             self.transitionTo(.in_game);
         } else {
-            // Log the increment for diagnostics — useful to confirm the
-            // ASM hack is firing even in states where we don't act on it.
             self.log.info("Round start counter {d} -> {d} (state={s}, no transition)", .{
                 prev, current, @tagName(self.state),
             });
@@ -2140,11 +1973,11 @@ pub const NetplayManager = struct {
             self.intro_rng_enabled = false;
         }
 
-        // Retry-menu sync gate: quando entramos em .retry_menu, verifica se
-        // o peer remoto já chegou no nosso transition index. Se não, ativa
-        // a flag que suprime inputs locais até o peer alcançar (confirmado
-        // via setRemoteIndex). Impede que o player mais rápido skip a
-        // animação de vitória e aperte rematch antes do lento chegar no menu.
+        // Retry-menu sync gate: when entering .retry_menu, check if
+        // the remote has reached our transition index. If not, set
+        // the flag that suppresses local inputs until the peer catches up
+        // (confirmed via setRemoteIndex).
+        //
         if (new == .retry_menu and self.config.is_netplay and !self.config.is_spectator) {
             const remote_end_index = if (self.remote_inputs.getEndIndex() > 0)
                 self.remote_inputs.getEndIndex() - 1
@@ -2152,7 +1985,7 @@ pub const NetplayManager = struct {
                 0;
             if (remote_end_index < self.indexed_frame.index) {
                 self.retry_menu_waiting_for_peer = true;
-                self.retry_menu_wait_start_ms = 0; // será setado no primeiro getNetplayInput
+                self.retry_menu_wait_start_ms = 0; // set on first getNetplayInput call
                 self.log.info("Retry menu: blocking inputs until peer catches up (remote_end_index={d}, our_index={d})", .{
                     remote_end_index, self.indexed_frame.index,
                 });
@@ -2174,34 +2007,12 @@ pub const NetplayManager = struct {
     }
 
     /// Called when we receive a TransitionIndex message from the remote peer.
-    /// Records their current transition index so isRemoteInputReady can
-    /// decide whether to wait or predict.
-    ///
-    /// In addition to storing `remote_idx` for diagnostics, this MUST resize
-    /// the remote input container's outer dimension so that `getEndIndex()`
-    /// reflects the remote's new index. This mirrors CCCaster's
-    /// `NetplayManager::setRemoteIndex` (DllNetplayManager.cpp:1130-1138):
-    ///   _inputs[_remotePlayer - 1].resize ( remoteIndex - _startIndex, 0, 0 );
-    ///
-    /// Without the resize, the local peer's `isRemoteInputReady()` would not
-    /// see the remote's transition until the first `PlayerInputs` for the new
-    /// index arrives. In the "fast peer enters InGame, slow peer still in
-    /// CharaIntro" scenario, the fast peer's wait loop would correctly block
-    /// — but if the slow peer's `TransitionIndex(InGame)` arrives BEFORE its
-    /// first InGame `PlayerInputs`, the fast peer's `remote_end_index` would
-    /// NOT update, and once the slow peer's first InGame `PlayerInputs` did
-    /// arrive, the container's `end_index` would jump straight to that index
-    /// without the intermediate "remote has reached InGame, awaiting frames"
-    /// state that CCCaster relies on for its prediction-vs-wait decision.
-    ///
-    /// The `remote_index` field is retained for diagnostics but is now also
-    /// used to drive the resize — previously it was dead code (written but
-    /// never read).
+    /// Resizes the remote input container so getEndIndex() reflects the
+    /// remote's new index. Matches CCCaster's setRemoteIndex.
     pub fn setRemoteIndex(self: *NetplayManager, remote_idx: u32) void {
         self.remote_index = remote_idx;
         self.remote_inputs.resizeOuter(remote_idx);
-        // Desbloqueia os inputs do retry menu se estávamos esperando o peer
-        // alcançar nosso transition index e ele acabou de chegar.
+        // Unblock retry menu inputs if we were waiting for the peer.
         if (self.retry_menu_waiting_for_peer and remote_idx >= self.indexed_frame.index) {
             self.retry_menu_waiting_for_peer = false;
             self.retry_menu_wait_start_ms = 0;
@@ -2449,9 +2260,9 @@ pub const NetplayManager = struct {
         self.local_inputs.reset();
         self.remote_inputs.reset();
 
-        // Reset defensivo do retry-menu sync gate — garante que a flag não
-        // vaze para a próxima match caso o peer tenha chegado ao retry_menu
-        // mas não tenha transicionado a tempo.
+        // Defensive reset of the retry-menu sync gate.
+        //
+        //
         self.retry_menu_waiting_for_peer = false;
         self.retry_menu_wait_start_ms = 0;
 

@@ -666,6 +666,19 @@ pub const NetplaySession = struct {
     /// relay client and continues with direct-only mode.
     fn stepParallelRelay(self: *NetplaySession) void {
         const rc = &self.relay_client.?;
+
+        // While the relay is retrying (backoff wait between attempts),
+        // keep the host screen informative: the direct listener is still
+        // open and the room code is still valid, but the relay path is
+        // re-attempting. Without this, the host would see a stale
+        // "Listening for direct connection..." with no hint that the relay
+        // is recovering.
+        if (rc.getState() == .retrying) {
+            var buf: [112]u8 = undefined;
+            const msg = std.fmt.bufPrint(&buf, "Listening for direct connection... (retrying relay, attempt {d})", .{rc.getRetryCount()}) catch "Listening for direct connection... (retrying relay)";
+            self.setStatus(msg);
+        }
+
         const result = rc.step(self.io);
 
         if (result == null) return; // still in progress
@@ -791,6 +804,14 @@ pub const NetplaySession = struct {
             },
             .waiting_for_tun_info => self.setStatus("Negotiating connection..."),
             .hole_punching => self.setStatus("Hole-punching through NAT..."),
+            .retrying => {
+                // Relay handshake failed but will be retried (backoff).
+                // Surface the attempt number so the user sees progress
+                // rather than a stuck "Connecting..." message.
+                var buf: [96]u8 = undefined;
+                const msg = std.fmt.bufPrint(&buf, "Retrying relay connection (attempt {d})...", .{rc.getRetryCount()}) catch "Retrying relay connection...";
+                self.setStatus(msg);
+            },
             else => {},
         }
 

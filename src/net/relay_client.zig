@@ -124,6 +124,17 @@ const match_info_timeout_ms: i64 = 60_000; // relay TTL
 const tun_info_timeout_ms: i64 = 10_000;
 const hole_punch_timeout_ms: i64 = 10_000;
 
+/// Retry backoff (milliseconds) for the relay handshake. After a transient
+/// failure, the client waits before re-attempting the TCP connect + handshake.
+/// The delay grows exponentially and is capped so it doesn't get excessive:
+///   attempt 1 → 1s, 2 → 2s, 3 → 4s, 4+ → 5s (capped).
+///
+/// Retries continue indefinitely until the user cancels — this makes the
+/// relay connection self-healing for transient outages (relay restart, DNS
+/// hiccup, momentary packet loss) without forcing an app restart.
+const retry_initial_delay_ms: i64 = 1_000;
+const retry_max_delay_ms: i64 = 5_000;
+
 /// How often to send UdpData to the relay (milliseconds).
 /// Keeps the NAT mapping fresh on the same socket used to talk to the peer.
 const udp_data_interval_ms: i64 = 50;
@@ -226,7 +237,8 @@ pub const RelayState = enum {
     waiting_for_tun_info, // got MatchInfo, sending UdpData, waiting for TunInfo
     hole_punching, // got TunInfo, sending NullMsg to peer, waiting for first packet
     connected, // SUCCESS — peer_addr is valid, caller can hand off to ENet
-    failed, // error occurred — check error field
+    failed, // terminal error occurred — check error field
+    retrying, // transient error occurred — waiting for backoff, then restart handshake
 };
 
 /// The result of a step() call — either in progress, success, or failure.
@@ -278,6 +290,21 @@ pub const RelayClient = struct {
     state: RelayState = .idle,
     error_val: ?RelayError = null,
 
+    // --- Retry state ---
+    // When the handshake fails with a retriable error, the client enters the
+    // `.retrying` state and waits `next_retry_ms - now` before re-attempting.
+    // `retry_count` is the number of retries scheduled so far (0 = first
+    // attempt in flight). The room code is NOT regenerated across retries so
+    // the host's shared code stays stable.
+    retry_count: u32 = 0,
+    next_retry_ms: i64 = 0,
+
+    // --- Current wall-clock time (set at the top of step()) ---
+    // Cached so fail() can compute the retry deadline without every helper
+    // having to thread `now_ms` through its signature. Only valid for the
+    // duration of a single step() call.
+    current_ms: i64 = 0,
+
     // ========================================================================
     // Init / deinit
     // ========================================================================
@@ -310,43 +337,79 @@ pub const RelayClient = struct {
             rc.room_code_set = true;
         }
 
-        // Resolve relay address and start TCP connect.
-        const relay_ip = resolveHost(cfg.relay.host);
-        if (relay_ip == 0) {
-            rc.state = .failed;
-            rc.error_val = .tcp_connect_failed;
-            return rc;
-        }
+        // Start the first handshake attempt. On failure, this sets the
+        // terminal `.failed` state with the appropriate error (the first
+        // attempt is never retried indirectly — a caller-visible failure
+        // here means the relay address itself is bad, e.g. unresolvable).
+        rc.restartHandshake(io);
+        return rc;
+    }
 
-        rc.relay_udp_addr = makeSockaddr(relay_ip, cfg.relay.port);
+    /// (Re)start the relay handshake: resolve the relay host, create a fresh
+    /// non-blocking TCP socket, and kick off a non-blocking connect().
+    ///
+    /// Called once from `init()` and again from `stepRetrying()` after a
+    /// transient failure. The room code is NOT regenerated here — it stays
+    /// stable across retries so a host's shared code remains valid.
+    ///
+    /// On failure this transitions to the terminal `.failed` state with
+    /// `tcp_connect_failed` (host unresolvable) or `socket_error` (socket
+    /// creation failed). These are not scheduled for retry here because
+    /// they occur before any state machine runs; the next reachable failure
+    /// points (stepTcpConnecting timeout, relay disconnect, etc.) ARE
+    /// retriable via `fail()`.
+    fn restartHandshake(self: *RelayClient, io: std.Io) void {
+        // Reset per-attempt mutable state so a retry starts clean.
+        self.tcp_read_pos = 0;
+        self.udp_sock = INVALID_SOCKET;
+        self.tcp_sock = INVALID_SOCKET;
+        self.local_udp_port = 0;
+        self.match_id = 0;
+        self.peer_addr = null;
+        self.last_udp_data_ms = 0;
+        self.last_null_msg_ms = 0;
+        self.error_val = null;
+
+        // Stamp the wall clock so fail() (if reached below) schedules a
+        // retry against a real deadline. step() also sets this, but
+        // restartHandshake runs from init() where step() hasn't run yet.
+        self.current_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+
+        // Re-resolve the relay address each attempt — DNS results may change
+        // between retries (e.g., the relay's IP rotates after a restart).
+        const relay_ip = resolveHost(self.relay.host);
+        if (relay_ip == 0) {
+            // Unresolvable host is treated as retriable: DNS may recover
+            // while the user waits. Retries until cancel.
+            self.fail(.tcp_connect_failed);
+            return;
+        }
+        self.relay_udp_addr = makeSockaddr(relay_ip, self.relay.port);
 
         // Create non-blocking TCP socket and connect.
         const tcp_fd = ws2_32.socket(ws2_32.AF_INET, ws2_32.SOCK_STREAM, 0);
         if (tcp_fd < 0) {
-            rc.state = .failed;
-            rc.error_val = .socket_error;
-            return rc;
+            self.fail(.socket_error);
+            return;
         }
         setNonBlocking(tcp_fd, true);
 
-        const tcp_dest = makeSockaddr(relay_ip, cfg.relay.port);
+        const tcp_dest = makeSockaddr(relay_ip, self.relay.port);
         const connect_ret = ws2_32.connect(tcp_fd, &tcp_dest, @sizeOf(ws2_32.sockaddr_in));
         if (connect_ret != 0) {
             const err = ws2_32.WSAGetLastError();
             if (err != ws2_32.WSAEWOULDBLOCK and err != ws2_32.WSAEINPROGRESS) {
                 _ = ws2_32.closesocket(tcp_fd);
-                rc.state = .failed;
-                rc.error_val = .tcp_connect_failed;
-                return rc;
+                self.fail(.tcp_connect_failed);
+                return;
             }
             // WSAEWOULDBLOCK is expected for non-blocking connect — we'll
             // poll for writability in stepTcpConnecting().
         }
 
-        rc.tcp_sock = tcp_fd;
-        rc.state = .tcp_connecting;
-        rc.phase_start_ms = std.Io.Clock.now(.real, io).toMilliseconds();
-        return rc;
+        self.tcp_sock = tcp_fd;
+        self.state = .tcp_connecting;
+        self.phase_start_ms = self.current_ms;
     }
 
     pub fn deinit(self: *RelayClient) void {
@@ -376,6 +439,7 @@ pub const RelayClient = struct {
         }
 
         const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+        self.current_ms = now_ms;
 
         switch (self.state) {
             .idle => return null,
@@ -384,6 +448,7 @@ pub const RelayClient = struct {
             .waiting_for_match_info => self.stepWaitingForMatchInfo(io, now_ms),
             .waiting_for_tun_info => self.stepWaitingForTunInfo(io, now_ms),
             .hole_punching => self.stepHolePunching(io, now_ms),
+            .retrying => self.stepRetrying(io, now_ms),
             .connected, .failed => return null,
         }
 
@@ -410,6 +475,12 @@ pub const RelayClient = struct {
 
     pub fn getError(self: *const RelayClient) ?RelayError {
         return self.error_val;
+    }
+
+    /// Number of retries scheduled so far (0 = the first attempt is in
+    /// flight). Exposed so the UI can show "Retrying (attempt N)...".
+    pub fn getRetryCount(self: *const RelayClient) u32 {
+        return self.retry_count;
     }
 
     // ========================================================================
@@ -804,9 +875,31 @@ pub const RelayClient = struct {
     // Internal helpers — utilities
     // ========================================================================
 
+    /// Record a failure. If the error is retriable, tears down the current
+    /// sockets and schedules a retry (`.retrying` state with backoff) instead
+    /// of going terminal — the handshake restarts from stepRetrying() once
+    /// the backoff window elapses. Non-retriable errors (e.g. invalid room
+    /// code) transition straight to `.failed`.
     fn fail(self: *RelayClient, err: RelayError) void {
-        self.state = .failed;
         self.error_val = err;
+        if (!isRetriable(err)) {
+            self.state = .failed;
+            return;
+        }
+        // Retriable: close any open sockets so the next attempt can rebind,
+        // then schedule a backoff-waited retry. The room code is preserved.
+        self.deinit();
+        self.retry_count += 1;
+        self.next_retry_ms = self.current_ms + retryDelayMs(self.retry_count);
+        self.state = .retrying;
+    }
+
+    /// Wait out the backoff window, then restart the handshake. Returns
+    /// without doing anything while the backoff hasn't elapsed so the UI
+    /// can keep rendering the "Retrying..." status each frame.
+    fn stepRetrying(self: *RelayClient, io: std.Io, now_ms: i64) void {
+        if (now_ms < self.next_retry_ms) return;
+        self.restartHandshake(io);
     }
 
     fn buildResult(self: *const RelayClient) RelayResult {
@@ -833,6 +926,36 @@ pub const RelayClient = struct {
 fn setNonBlocking(fd: c_int, enable: bool) void {
     var mode: u32 = if (enable) 1 else 0;
     _ = ws2_32.ioctlsocket(fd, ws2_32.FIONBIO, &mode);
+}
+
+/// True if a relay error is worth retrying. Transient/network errors
+/// (relay unreachable, timeouts, disconnects, hole-punch failures) are
+/// retriable — they may resolve on their own (relay restart, peer joins
+/// late, NAT mapping refreshes). The only terminal error is
+/// `invalid_room_code`, which can never succeed without the user retyping
+/// the code.
+///
+/// Note: `.relay_error` (server-sent Error, e.g. room-not-found on join or
+/// room-taken on host) is treated as retriable — with a stable room code,
+/// room-taken clears once the server's TTL expires, and room-not-found
+/// resolves once the host registers. This matches "retry until cancel".
+pub fn isRetriable(err: RelayError) bool {
+    return switch (err) {
+        .invalid_room_code => false,
+        else => true,
+    };
+}
+
+/// Backoff delay (milliseconds) for the Nth retry attempt. Grows
+/// exponentially from `retry_initial_delay_ms` and caps at
+/// `retry_max_delay_ms`:
+///   attempt 1 → 1000, 2 → 2000, 3 → 4000, 4+ → 5000 (capped).
+pub fn retryDelayMs(attempt: u32) i64 {
+    // Shift the attempt index by the initial delay; cap at the max.
+    // attempt=1 → 1000<<0 = 1000, attempt=2 → 1000<<1 = 2000, etc.
+    const shift: u6 = if (attempt >= 30) 30 else @intCast(attempt - 1);
+    const raw: i64 = retry_initial_delay_ms << shift;
+    return @min(raw, retry_max_delay_ms);
 }
 
 fn makeSockaddr(ip_nbo: u32, port_host: u16) ws2_32.sockaddr_in {

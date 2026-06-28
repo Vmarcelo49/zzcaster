@@ -265,3 +265,35 @@ test "RelayError hole_punch_failed suggests port forwarding" {
     try std.testing.expect(std.mem.indexOf(u8, suggestion, "port") != null or
         std.mem.indexOf(u8, suggestion, "VPN") != null);
 }
+
+// ============================================================================
+// Retry policy — isRetriable() + retryDelayMs() backoff curve
+// ============================================================================
+
+test "isRetriable: only invalid_room_code is terminal" {
+    // Every network/relay failure is retriable — the connection self-heals
+    // until the user cancels.
+    try std.testing.expect(relay_client_mod.isRetriable(.tcp_connect_failed));
+    try std.testing.expect(relay_client_mod.isRetriable(.tcp_timeout));
+    try std.testing.expect(relay_client_mod.isRetriable(.relay_error));
+    try std.testing.expect(relay_client_mod.isRetriable(.relay_disconnected));
+    try std.testing.expect(relay_client_mod.isRetriable(.match_info_timeout));
+    try std.testing.expect(relay_client_mod.isRetriable(.tun_info_timeout));
+    try std.testing.expect(relay_client_mod.isRetriable(.hole_punch_failed));
+    try std.testing.expect(relay_client_mod.isRetriable(.socket_error));
+
+    // The ONLY terminal error: a bad room code can never succeed on retry —
+    // the user must retype it. Retrying would loop forever pointlessly.
+    try std.testing.expect(!relay_client_mod.isRetriable(.invalid_room_code));
+}
+
+test "retryDelayMs: exponential backoff capped at 5s" {
+    // attempt 1 → 1s, 2 → 2s, 3 → 4s, 4+ → 5s (capped).
+    try std.testing.expectEqual(@as(i64, 1_000), relay_client_mod.retryDelayMs(1));
+    try std.testing.expectEqual(@as(i64, 2_000), relay_client_mod.retryDelayMs(2));
+    try std.testing.expectEqual(@as(i64, 4_000), relay_client_mod.retryDelayMs(3));
+    try std.testing.expectEqual(@as(i64, 5_000), relay_client_mod.retryDelayMs(4));
+    try std.testing.expectEqual(@as(i64, 5_000), relay_client_mod.retryDelayMs(5));
+    // Stays capped even for very high attempt counts (no overflow).
+    try std.testing.expectEqual(@as(i64, 5_000), relay_client_mod.retryDelayMs(100));
+}

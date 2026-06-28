@@ -532,6 +532,22 @@ pub const NetplayManager = struct {
     min_rollback_spacing: u8 = 2,
     fast_fwd_stop_frame: u32 = 0,
 
+    // Deferred rollback: a misprediction that arrived while the lcf_frame was
+    // inside the rollback_min_frame_delay window (frames 0-7). Rolling back to
+    // those early frames loads a divergent state (both peers enter in_game at
+    // slightly different absolute world_timer values), so checkRollback skips
+    // the rollback. The previous design left last_changed_frame set, expecting
+    // the next frame to correct it — but the per-frame clearLastChanged() at
+    // the top of the frame loop (frame_step.zig) nukes the lcf before
+    // checkRollback runs again, so the misprediction was silently forgotten.
+    //
+    // Instead we capture the pending misprediction here. This field is NOT
+    // cleared by clearLastChanged(); it persists until the local frame
+    // advances past rollback_min_frame_delay, at which point checkRollback
+    // triggers a real rollback to the earliest saved state for this index
+    // (which, by then, is >= rollback_min_frame_delay and safe to load).
+    deferred_lcf: ?u64 = null,
+
     // RTT EMA for time-sync (ported from ggpo-x).
     rtt_ema_ms: f64 = 0,
     rtt_ema_initialized: bool = false,
@@ -2343,6 +2359,7 @@ pub const NetplayManager = struct {
         self.desync_local = null;
         self.desync_remote = null;
         self.fast_fwd_stop_frame = 0;
+        self.deferred_lcf = null;
 
         if (self.config.rollback > 0 and self.config.is_netplay and !self.config.is_spectator) {
             if (self.state_pool.pool.len == 0) {
@@ -2373,8 +2390,30 @@ pub const NetplayManager = struct {
         if (!self.isInRollback()) return false;
         if (self.rollback_timer < self.min_rollback_spacing) return false;
 
-        const lcf = self.remote_inputs.last_changed_frame;
-        if (lcf == null) return false;
+        // Resolve the misprediction we want to roll back to.
+        //
+        // `last_changed_frame` is the live lcf, set by setRemote this frame or
+        // a prior frame. `deferred_lcf` holds an early-frame misprediction
+        // (lcf_frame < rollback_min_frame_delay) that we previously deferred
+        // because rolling back to frames 0-7 loads a divergent state.
+        //
+        // The per-frame clearLastChanged() at the top of the frame loop nukes
+        // the live lcf every frame, so a deferred misprediction can't survive
+        // there. We carry it in deferred_lcf instead (which is NOT cleared by
+        // clearLastChanged), and promote it once the local frame has advanced
+        // past rollback_min_frame_delay — at which point the earliest saved
+        // state for this index is safe to load.
+        var lcf = self.remote_inputs.last_changed_frame;
+        if (lcf == null) {
+            // No fresh misprediction this frame. If we have a deferred one and
+            // we've now advanced past the early-frame window, promote it so we
+            // can roll back to the earliest safe saved state below.
+            if (self.deferred_lcf != null and self.indexed_frame.frame >= rollback_min_frame_delay) {
+                lcf = self.deferred_lcf;
+            } else {
+                return false;
+            }
+        }
 
         const lcf_frame = @as(u32, @intCast(lcf.? & 0xFFFFFFFF));
         const lcf_index = @as(u32, @intCast(lcf.? >> 32));
@@ -2382,6 +2421,7 @@ pub const NetplayManager = struct {
             // Stale lcf from a previous transition index. Clear it so it
             // doesn't block future current-index changes from being detected.
             self.remote_inputs.clearLastChanged();
+            self.deferred_lcf = null;
             return false;
         }
         if (lcf_frame >= self.indexed_frame.frame) return false;
@@ -2391,17 +2431,22 @@ pub const NetplayManager = struct {
         // different absolute world_timer values. Rolling back to frame 0 or 1
         // loads a divergent state → desync.
         //
-        // However, we only skip the rollback — we do NOT clear the lcf.
-        // This means the misprediction is still tracked. On the next frame,
-        // if we're past the delay window, the rollback will fire and correct
-        // it. This prevents the "wrong RNG persists uncorrected" problem
-        // while still avoiding loading divergent early states.
-        if (lcf_frame < rollback_min_frame_delay)
-        {
-            // Can't safely rollback to early frames — but DON'T clear lcf.
-            // The misprediction will be corrected once we're past the delay.
+        // Capture the misprediction into deferred_lcf and clear the live lcf.
+        // The deferred entry survives the next frame's per-frame
+        // clearLastChanged(); once the local frame advances past
+        // rollback_min_frame_delay, the block above promotes it and we roll
+        // back to the earliest safe saved state for this index. This is what
+        // the old "DON'T clear lcf" comment intended, but which the per-frame
+        // clear silently defeated.
+        if (lcf_frame < rollback_min_frame_delay) {
+            self.deferred_lcf = lcf;
+            self.remote_inputs.clearLastChanged();
             return false;
         }
+
+        // We're past the early-frame window. A real rollback is safe — clear
+        // any deferred entry so it doesn't fire again.
+        self.deferred_lcf = null;
 
         const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
         if (loaded == null) {

@@ -2198,6 +2198,14 @@ pub const NetplayManager = struct {
         // one fires at frame 149 (or 300).
         if (self.should_sync_rng and !self.rng_synced) return;
         const frame = self.indexed_frame.frame;
+
+        // CRITICAL: Do NOT fire SyncHash on frame 0 of in_game. At frame 0
+        // the game may not have fully initialized the player structs, camera,
+        // and timer addresses that SyncHash.capture reads — this can cause
+        // an access violation (silent crash, no exception handler). Skip frame
+        // 0 entirely; the first real check fires at frame 30 (early_sync_period).
+        if (frame == 0) return;
+
         const due_period = (frame % sync_send_period == 0);
         const due_149 = (frame % 150 == 149);
         // Early-game dense cadence: during the first early_sync_window frames

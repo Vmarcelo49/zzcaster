@@ -353,7 +353,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     // Only save rollback states in-game — matches CCCaster (DllMain.cpp:206-207,
     // "Only save rollback states in-game").
-    if (n.state == .in_game) {
+    // Skip frame 0: the effects array (0x67BDE8, ~810KB) and other large
+    // regions may not be fully mapped/initialized at the very first in_game
+    // frame, causing an access violation in saveState's memcpy.
+    if (n.state == .in_game and n.indexed_frame.frame > 0) {
         _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
         // Snapshot SFX filter into history ring (for future rollback dedup).
         if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);

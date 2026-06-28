@@ -13,6 +13,109 @@ const state = @import("dll_state.zig");
 const game_mode_addr = state.game_mode_addr;
 const world_timer_addr = state.world_timer_addr;
 const skip_frames_addr = state.skip_frames_addr;
+
+// ============================================================================
+// Vectored Exception Handler — catches access violations (crashes) in DLL
+// code and logs them before the process dies. Without this, any crash in
+// saveState, SyncHash.capture, or other MBAACC-memory-reading code exits
+// SILENTLY (the OS kills the process via NtTerminateProcess, bypassing the
+// ExitProcess hook). This makes debugging impossible.
+// ============================================================================
+
+const veh = struct {
+    extern "kernel32" fn AddVectoredExceptionHandler(
+        first: u32,
+        handler: *const fn (exceptions: *anyopaque) callconv(.winapi) i32,
+    ) callconv(.winapi) ?*anyopaque;
+
+    const EXCEPTION_ACCESS_VIOLATION: u32 = 0xC0000005;
+    const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+    const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+
+    const EXCEPTION_POINTERS = extern struct {
+        exception_record: *ExceptionRecord,
+        context_record: *Context,
+    };
+
+    const ExceptionRecord = extern struct {
+        exception_code: u32,
+        exception_flags: u32,
+        exception_record: ?*ExceptionRecord,
+        exception_address: usize,
+        number_parameters: u32,
+        _unused: u32,
+        exception_information: [15]usize,
+    };
+
+    const Context = extern struct {
+        // Only the fields we need (x86 CONTEXT is 716 bytes; we only read Eip
+        // and Esp). The full struct layout isn't needed since we just cast.
+        _pad: [184]u8,
+        esp: u32,
+        _pad2: [60]u8,
+        eip: u32,
+    };
+
+    /// The actual handler. Logs the crash, then continues search (lets the
+    /// default handler kill the process — but at least we get a log line).
+    fn handler(exceptions: *anyopaque) callconv(.winapi) i32 {
+        const ep: *EXCEPTION_POINTERS = @ptrCast(@alignCast(exceptions));
+        const rec = ep.exception_record;
+        if (rec.exception_code == EXCEPTION_ACCESS_VIOLATION) {
+            // Access violation: rec.exception_information[0] is 0 (read) or 1 (write),
+            // rec.exception_information[1] is the faulting address.
+            const op = if (rec.exception_information[0] == 0) "read" else "write";
+            const fault_addr = rec.exception_information[1];
+            const eip = ep.context_record.eip;
+            // Log to file (can't use the normal logger from an exception handler
+            // — it might be in a bad state). Write directly to a crash file.
+            crashLog(op, fault_addr, eip, rec.exception_address);
+        }
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    /// Write crash info to a file immediately. Can't use the normal logger
+    /// because it might be mid-write or corrupted.
+    fn crashLog(op: []const u8, fault_addr: usize, eip: u32, exception_addr: usize) void {
+        const win32_file = struct {
+            extern "kernel32" fn CreateFileA(
+                lpFileName: [*:0]const u8,
+                dwDesiredAccess: u32,
+                dwShareMode: u32,
+                lpSecurityAttributes: ?*anyopaque,
+                dwCreationDisposition: u32,
+                dwFlagsAndAttributes: u32,
+                hTemplateFile: ?*anyopaque,
+            ) callconv(.winapi) ?*anyopaque;
+            extern "kernel32" fn WriteFile(
+                hFile: ?*anyopaque,
+                lpBuffer: [*]const u8,
+                nNumberOfBytesToWrite: u32,
+                lpNumberOfBytesWritten: *u32,
+                lpOverlapped: ?*anyopaque,
+            ) callconv(.winapi) i32;
+            extern "kernel32" fn CloseHandle(hObject: ?*anyopaque) callconv(.winapi) i32;
+        };
+        var buf: [256]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "CRASH: Access violation ({s}) at addr=0x{X:0>8} EIP=0x{X:0>8} exc_addr=0x{X:0>8}\r\n", .{
+            op, fault_addr, eip, exception_addr,
+        }) catch return;
+        const pid = win32.GetCurrentProcessId();
+        var path_buf: [64]u8 = undefined;
+        const path = std.fmt.bufPrintZ(&path_buf, "zzcaster/dll_{d}_crash.log", .{pid}) catch return;
+        const GENERIC_WRITE: u32 = 0x40000000;
+        const CREATE_ALWAYS: u32 = 2;
+        const h = win32_file.CreateFileA(path.ptr, GENERIC_WRITE, 0, null, CREATE_ALWAYS, 0, null) orelse return;
+        var written: u32 = 0;
+        _ = win32_file.WriteFile(h, msg.ptr, @intCast(msg.len), &written, null);
+        _ = win32_file.CloseHandle(h);
+    }
+};
+
+fn installCrashHandler() void {
+    if (builtin.os.tag != .windows) return;
+    _ = veh.AddVectoredExceptionHandler(1, &veh.handler);
+}
 const alive_flag_addr = state.alive_flag_addr;
 const app_io_backend = &state.app_io_backend;
 const writeInput = state.writeInput;
@@ -684,6 +787,7 @@ fn lazyInit() void {
     _ = win32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002 | 0x00000004);
 
     connectPipe();
+    installCrashHandler(); // Catch access violations before the process dies silently
     asm_hacks.applyPreLoadHacks();
 
     // Non-blocking: returns immediately if the launcher hasn't sent config

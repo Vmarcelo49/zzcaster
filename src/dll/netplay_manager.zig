@@ -187,6 +187,15 @@ const max_rollback: u8 = 15;
 const heartbeat_timeout_ms: i64 = 120000; // 120s — no packet → peer is dead
 const input_wait_timeout_ms: i64 = 10000; // 10s — no remote input → timed out
 
+// RTT EMA time constant: ~10 seconds at 60fps (ported from ggpo-x).
+// alpha = 2 / (N + 1) where N = 10000ms / 16.6ms ≈ 602 frames.
+const rtt_ema_alpha: f64 = 2.0 / (1.0 + 10_000.0 / 16.6);
+
+// Time-sync constants (ported from ggpo-x).
+const max_frame_advantage: f32 = 30.0; // clamp for sleep recommendation
+const min_frame_advantage: f32 = 3.0; // ignore drift below this (avoids micro-stutter)
+const max_per_frame_sleep_ms: f32 = 4.0; // cap per-frame sleep at 4ms (~24% of 16.6ms frame)
+
 pub const NetplayState = enum {
     pre_initial,
     initial,
@@ -472,6 +481,10 @@ pub const NetplayManager = struct {
     rollback_timer: u8 = 0,
     min_rollback_spacing: u8 = 2,
     fast_fwd_stop_frame: u32 = 0,
+
+    // RTT EMA for time-sync (ported from ggpo-x).
+    rtt_ema_ms: f64 = 0,
+    rtt_ema_initialized: bool = false,
 
     round_over_timer: i32 = -1,
 
@@ -1191,7 +1204,18 @@ pub const NetplayManager = struct {
     }
 
     pub fn setLocalInput(self: *NetplayManager, input: u16) void {
-        const frame = self.indexed_frame.frame + self.config.delay;
+        // Use rollback_delay during re-runs, delay otherwise — matches
+        // CCCaster's getDelay() (DllNetplayManager.hpp:118):
+        //   return ( isInRollback() ? config.rollbackDelay : config.delay );
+        // During a rollback re-run, we want minimal input lag so the
+        // re-simulation catches up quickly. rollback_delay is typically 0
+        // (re-run inputs are immediate), while delay is typically 1 (normal
+        // play has 1 frame of input lag for network transit).
+        const effective_delay: u8 = if (self.isRerunning())
+            self.config.rollback_delay
+        else
+            self.config.delay;
+        const frame = self.indexed_frame.frame + effective_delay;
         self.local_inputs.set(self.indexed_frame.index, frame, input);
     }
 
@@ -1338,7 +1362,12 @@ pub const NetplayManager = struct {
         // Send the last num_inputs frames of local input, up to frame+delay.
         // Wire format (after sendInputs prepends 0x01 tag):
         //   [4 start_frame][4 index][N × 2 inputs]
-        const last_frame = self.indexed_frame.frame + self.config.delay;
+        // Use rollback_delay during re-runs (matches setLocalInput).
+        const effective_delay: u8 = if (self.isRerunning())
+            self.config.rollback_delay
+        else
+            self.config.delay;
+        const last_frame = self.indexed_frame.frame + effective_delay;
         const start_frame: u32 = if (last_frame + 1 < num_inputs)
             0
         else
@@ -2323,6 +2352,59 @@ pub const NetplayManager = struct {
             log.err("  {s} seq_state: {d} vs {d}", .{ label, a.seq_state, b.seq_state });
         if (a.chara != b.chara) log.err("  {s} chara: {d} vs {d}", .{ label, a.chara, b.chara });
         if (a.moon != b.moon) log.err("  {s} moon: {d} vs {d}", .{ label, a.moon, b.moon });
+    }
+
+    // ================================================================
+    // RTT tracking + time-sync (ported from ggpo-x).
+    //
+    // updateRttEma reads ENet's peer.roundTripTime and applies an EMA with
+    // a 10-second time constant. The smoothed value feeds the remote-frame
+    // estimate and per-frame sleep recommendation.
+    //
+    // recommendPerFrameSleepMs returns a small sleep (0-4ms) that the faster
+    // peer applies each frame to slow down and let the slower peer catch up.
+    // This is cooperative time-sync: sleeping delays the game's frame, which
+    // slows world_timer, which slows indexed_frame.frame.
+    // ================================================================
+
+    pub fn updateRttEma(self: *NetplayManager) void {
+        if (self.enet_peer == null or !self.enet_connected) return;
+        const instant: f64 = @as(f64, @floatFromInt(self.enet_peer.?.roundTripTime));
+        if (instant == 0) return;
+        if (!self.rtt_ema_initialized) {
+            self.rtt_ema_ms = instant;
+            self.rtt_ema_initialized = true;
+        } else {
+            self.rtt_ema_ms = instant * rtt_ema_alpha + self.rtt_ema_ms * (1.0 - rtt_ema_alpha);
+        }
+    }
+
+    pub fn rttMs(self: *const NetplayManager) f64 {
+        return self.rtt_ema_ms;
+    }
+
+    pub fn remoteFrameEstimate(self: *const NetplayManager) f32 {
+        if (self.remote_inputs.getEndIndex() == 0) return 0;
+        const last_received: f32 = @as(f32, @floatFromInt(
+            self.remote_inputs.getEndFrame(self.indexed_frame.index),
+        ));
+        const single_trip_ms = self.rtt_ema_ms / 2.0;
+        const single_trip_frames = @as(f32, @floatCast(single_trip_ms * 60.0 / 1000.0));
+        return last_received + single_trip_frames + 0.5;
+    }
+
+    pub fn localFrameAdvantage(self: *const NetplayManager) f32 {
+        return self.remoteFrameEstimate() - @as(f32, @floatFromInt(self.indexed_frame.frame));
+    }
+
+    pub fn recommendPerFrameSleepMs(self: *const NetplayManager) u32 {
+        if (!self.rtt_ema_initialized) return 0;
+        const advantage = self.localFrameAdvantage();
+        if (advantage >= -min_frame_advantage) return 0;
+        const ahead = -advantage;
+        const sleep_ms = @min(ahead * 1.0, max_per_frame_sleep_ms);
+        if (sleep_ms < 1.0) return 0;
+        return @intFromFloat(sleep_ms);
     }
 
     fn onEnterInGame(self: *NetplayManager) void {

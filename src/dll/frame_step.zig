@@ -113,6 +113,26 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     n.pollAndDispatch(3);
 
+    // Update RTT EMA every frame (reads ENet's peer.roundTripTime).
+    // Feeds the time-sync recommendation below.
+    n.updateRttEma();
+
+    // Cooperative time-sync: if we're ahead of the remote peer, sleep a
+    // small amount to slow the game down. This lets the remote catch up
+    // and reduces the frequency of rollbacks. The sleep is capped at 4ms
+    // (~24% of the 16.6ms frame budget) to stay within vsync.
+    //
+    // Only applies during in_game (not during loading/menus) and not during
+    // a rollback re-run (we're catching up, not slowing down).
+    if (n.state == .in_game and !n.isRerunning()) {
+        const sleep_ms = n.recommendPerFrameSleepMs();
+        if (sleep_ms > 0) {
+            std.Io.sleep(state.app_io_backend.io(), .{
+                .nanoseconds = sleep_ms * std.time.ns_per_ms,
+            }, .real) catch {};
+        }
+    }
+
     n.maybeSendSyncHash();
     n.checkSyncHashDesync();
     if (n.desync_detected) {

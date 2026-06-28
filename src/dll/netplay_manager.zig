@@ -1,4 +1,6 @@
 const std = @import("std");
+const wire = @import("wire.zig");
+
 const logging = @import("common").logging;
 const rollback = @import("rollback.zig");
 const sfx_dedup = @import("sfx_dedup.zig");
@@ -649,6 +651,11 @@ pub const NetplayManager = struct {
         self.min_rollback_spacing = if (cfg.rollback > 0) @max(@min(cfg.rollback, 4), 2) else 2;
         self.rollback_timer = self.min_rollback_spacing;
         if (self.sfx_dedup) |*sd| sd.setLogger(self.log);
+        // Propagate our role to the SpectatorManager so onNewPeer uses the
+        // right cap (max_spectators for chain links, max_root_spectators for
+        // root host/client). Mirrors CCCaster's SHOULD_REDIRECT_SPECTATORS
+        // macro (DllMain.cpp:59-61). See docs/spectator-study.md §3.3 P2.
+        if (self.spectators) |*sm| sm.is_spectator_role = cfg.is_spectator;
         self.log.info("NetplayManager: delay={d} rollback={d} host={} spectator={}", .{
             cfg.delay, cfg.rollback, cfg.is_host, cfg.is_spectator,
         });
@@ -827,8 +834,29 @@ pub const NetplayManager = struct {
         switch (msg_type) {
             0x01 => {
                 // HELLO from spectator — promote to active.
-                const start_index: u32 = if (data.len >= 5) std.mem.readInt(u32, data[1..5], .little) else 0;
+                // start_index=0 means "host decides" (spectator-study.md §3.1 P1).
+                // The host uses its current `indexed_frame.index` as the
+                // spectator's start index — mirrors CCCaster's
+                // `getSpectateStartIndex()` (DllSpectatorManager.cpp:58).
+                const requested: u32 = if (data.len >= 5) std.mem.readInt(u32, data[1..5], .little) else 0;
+                const start_index: u32 = if (requested == 0) self.indexed_frame.index else requested;
                 self.spectators.?.activateSpectator(peer, start_index);
+
+                // Send InitialGameState so the spectator's MBAACC instance
+                // knows which (index, frame) to start at, what state the host
+                // is in (CharaSelect / InGame / etc.), and whether it's a
+                // training match. Mirrors CCCaster's `pushSpectator`
+                // (DllSpectatorManager.cpp:87: `newSocket->send(new InitialGameState(...))`).
+                // Without this, the spectator has no coordinate to anchor
+                // its local InputBuffer lookups, causing `getSpectatorInputs`
+                // to return 0,0 forever.
+                self.spectators.?.sendInitialState(
+                    peer,
+                    @intFromEnum(self.state),
+                    self.config.is_training,
+                    start_index,
+                    0, // start_frame — host's frame at the spectator's start index
+                );
 
                 // Send the host's cached RNG state to the newly-activated
                 // spectator, mirroring CCCaster's `SpectatorManager::pushSpectator`
@@ -855,7 +883,7 @@ pub const NetplayManager = struct {
                 };
 
                 var rng_buf: [1 + 4 + 4 + 4 + 4 + rng_state3_size]u8 = undefined;
-                rng_buf[0] = 0x02; // RNG state
+                rng_buf[0] = wire.MSG_RNG_STATE; // 0x16 RNG state (CCCaster MsgType::RngState)
                 if (self.getCachedRngState(rng_lookup_index, rng_buf[1..])) {
                     if (peer) |p| {
                         const pkt = enet.enet_packet_create(&rng_buf, rng_buf.len, enet.ENET_PACKET_FLAG_RELIABLE);
@@ -871,6 +899,9 @@ pub const NetplayManager = struct {
                     // broadcast tick once the host captures+sends RNG.
                     self.log.info("No cached RNG for spectator at activation (index={d}) — will send on next broadcast", .{rng_lookup_index});
                 }
+
+                self.log.info("Spectator activated: start_index={d} (requested={d}, host_index={d})",
+                    .{ start_index, requested, self.indexed_frame.index });
             },
             else => {
                 self.log.warn("Unknown spectator message type: 0x{x}", .{msg_type});
@@ -956,6 +987,19 @@ pub const NetplayManager = struct {
                     self.sendVersionConfig();
                 }
 
+                // Spectator: send HELLO so the host can activate us and send
+                // back InitialGameState + cached RNG. Without this, the
+                // spectator sits in `pending` state for 20s and is then
+                // disconnected by `checkPendingTimeouts`. Mirrors CCCaster's
+                // spectator connect flow (DllMain.cpp:1420 case IpAddrPort),
+                // where the spectator sends its ctrl-socket address to the host
+                // — we use a simpler `HELLO` message with start_index=0
+                // ("host decides") instead of the full IpAddrPort handshake
+                // (see docs/spectator-study.md §3.1 P1).
+                if (self.enet_connected and self.config.is_spectator) {
+                    self.sendSpectatorHello();
+                }
+
                 return null;
             },
             else => return null,
@@ -967,33 +1011,38 @@ pub const NetplayManager = struct {
     fn handleMessage(self: *NetplayManager, msg: []const u8) void {
         if (msg.len < 1) return;
         switch (msg[0]) {
-            0x01 => { // Player inputs
+            0x15 => { // PlayerInputs (CCCaster MsgType::PlayerInputs = 0x15)
                 if (msg.len >= 8) self.setRemoteInputs(msg[1..]);
             },
-            0x02 => { // RNG state
+            0x16 => { // RngState (CCCaster MsgType::RngState = 0x16)
                 self.applyRemoteRng(msg);
             },
-            0x03 => { // TransitionIndex
+            0x21 => { // TransitionIndex (CCCaster MsgType::TransitionIndex = 0x21)
                 if (msg.len >= 5) {
                     const idx = std.mem.readInt(u32, msg[1..5], .little);
                     self.setRemoteIndex(idx);
                 }
             },
-            0x04 => { // SyncHash (desync detection)
+            0x1B => { // SyncHash (CCCaster MsgType::SyncHash = 0x1B) — desync detection
                 self.applyRemoteSyncHash(msg[1..]);
             },
-            0x05 => { // RNG_ACK (peer confirms it applied the host's RNG state)
+            0x05 => { // RNG_ACK (zzcaster extension — peer confirms it applied the host's RNG state)
                 if (msg.len >= 5) {
                     const idx = std.mem.readInt(u32, msg[1..5], .little);
                     self.confirmRngAck(idx);
                 }
             },
-            0x20 => { // BothInputs (spectator broadcast from host)
+            0x02 => { // BothInputs (CCCaster MsgType::BothInputs = 0x02) — spectator broadcast from host
                 if (self.config.is_spectator) {
                     self.applyBothInputsPacket(msg[1..]);
                 }
             },
-            0x07 => { // VersionConfig — version compatibility check
+            0x0A => { // InitialGameState (CCCaster MsgType::InitialGameState = 0x0A) — spectator: host tells us where to start
+                if (self.config.is_spectator) {
+                    self.applyInitialGameState(msg);
+                }
+            },
+            0x1F => { // VersionConfig (CCCaster MsgType::VersionConfig = 0x1F) — version compatibility check
                 if (msg.len >= 5) {
                     const remote_ver = std.mem.readInt(u32, msg[1..5], .little);
                     if (remote_ver != protocol_version) {
@@ -1008,7 +1057,7 @@ pub const NetplayManager = struct {
                     }
                 }
             },
-            0x06 => { // ErrorMessage — peer reports an error before disconnect
+            0x07 => { // ErrorMessage (CCCaster MsgType::ErrorMessage = 0x07) — peer reports an error before disconnect
                 if (msg.len >= 2) {
                     const err_len = @min(msg.len - 1, 128);
                     self.log.err("Remote error: {s}", .{msg[1 .. 1 + err_len]});
@@ -1048,6 +1097,47 @@ pub const NetplayManager = struct {
         }
     }
 
+    /// Spectator: apply the host's `InitialGameState` (0x10) message.
+    /// Sets our local `indexed_frame` to the host-provided start coordinate
+    /// so `getSpectatorInputs()` looks up inputs at the right (index, frame).
+    /// Mirrors CCCaster's `netMan.initial = msg->getAs<InitialGameState>()`
+    /// (DllMain.cpp:1498) + the subsequent state transition to `Initial`.
+    ///
+    /// Body (zzcaster wire format — see docs/spectator-study.md §3.4 P3 for
+    /// the CCCaster-compatible format):
+    ///   [1 byte type=0x10]
+    ///   [1 byte netplay_state]
+    ///   [1 byte is_training]
+    ///   [4 bytes start_index LE]
+    ///   [4 bytes start_frame LE]
+    pub fn applyInitialGameState(self: *NetplayManager, msg: []const u8) void {
+        if (msg.len < 11) return;
+        const state_byte = msg[1];
+        const is_training = msg[2] != 0;
+        const start_index = std.mem.readInt(u32, msg[3..7], .little);
+        const start_frame = std.mem.readInt(u32, msg[7..11], .little);
+
+        // Anchor our indexed_frame to the host-provided start coordinate.
+        // MBAACC's `world_timer` will keep advancing in real-time, but our
+        // `indexed_frame.frame` is relative to `start_world_time` which we
+        // reset here so future `updateFrame()` calls compute the right value.
+        self.indexed_frame.index = start_index;
+        self.indexed_frame.frame = start_frame;
+        self.start_world_time = world_timer_addr.* -% start_frame;
+
+        // Apply the host's netplay state directly (skip the natural state
+        // machine). CCCaster calls `netplayStateChanged(NetplayState::Initial)`
+        // and then lets the natural state machine take over — we do the same
+        // by just setting `state` directly.
+        if (state_byte <= @intFromEnum(NetplayState.retry_menu)) {
+            self.state = @enumFromInt(state_byte);
+        }
+        _ = is_training; // already set via config
+
+        self.log.info("Applied InitialGameState: index={d} frame={d} state={d}",
+            .{ start_index, start_frame, state_byte });
+    }
+
     /// Spectator: get both inputs for the current frame.
     pub fn getSpectatorInputs(self: *const NetplayManager) struct { p1: u16, p2: u16 } {
         return .{
@@ -1059,7 +1149,7 @@ pub const NetplayManager = struct {
     pub fn sendInputs(self: *NetplayManager, inputs: []const u8) void {
         if (self.enet_peer == null or !self.enet_connected) return;
 
-        var tagged: [1 + 128]u8 = .{0x01} ++ .{0} ** 128;
+        var tagged: [1 + 128]u8 = .{wire.MSG_PLAYER_INPUTS} ++ .{0} ** 128;
         const copy_len = @min(inputs.len, tagged.len - 1);
         @memcpy(tagged[1..][0..copy_len], inputs[0..copy_len]);
         const packet = enet.enet_packet_create(&tagged, 1 + copy_len, 0); // unreliable
@@ -1394,7 +1484,7 @@ pub const NetplayManager = struct {
         //   [1 byte type=0x02][4 bytes index][4+4+4+220 bytes RNG state]
         const payload_len: usize = 1 + 4 + 4 + 4 + 4 + rng_state3_size;
         var rng_buf: [1 + 4 + 4 + 4 + 4 + rng_state3_size]u8 = undefined;
-        rng_buf[0] = 0x02;
+        rng_buf[0] = wire.MSG_RNG_STATE;
         std.mem.writeInt(u32, rng_buf[1..5], self.indexed_frame.index, .little);
         std.mem.writeInt(u32, rng_buf[5..9], rng_state0_addr.*, .little);
         std.mem.writeInt(u32, rng_buf[9..13], rng_state1_addr.*, .little);
@@ -1522,10 +1612,33 @@ pub const NetplayManager = struct {
     fn sendRngAck(self: *NetplayManager, rng_index: u32) void {
         if (self.enet_peer == null or !self.enet_connected) return;
         var buf: [5]u8 = undefined;
-        buf[0] = 0x05; // RNG_ACK
+        buf[0] = wire.MSG_RNG_ACK; // 0x05 RNG_ACK (zzcaster extension)
         std.mem.writeInt(u32, buf[1..5], rng_index, .little);
         self.sendReliable(&buf);
         self.log.info("Sent RNG_ACK (index={d})", .{rng_index});
+    }
+
+    /// Spectator → host: announce we're ready. The host responds with
+    /// `InitialGameState` (0x10) + the cached RNG for our start index, then
+    /// starts broadcasting `BothInputs` (0x20) every `frameStepSpectators`
+    /// tick. Without this, the spectator sits in `pending` state for 20s
+    /// and is then disconnected by `checkPendingTimeouts`.
+    ///
+    /// Body: `[1 byte type=0x01 HELLO][4 bytes desired_start_index LE]`
+    /// `desired_start_index = 0` means "host decides" — the host uses its
+    /// current `indexed_frame.index` (mirrors CCCaster's
+    /// `NetplayManager::getSpectateStartIndex`, DllSpectatorManager.cpp:58).
+    /// A non-zero value lets a chain-forwarding spectator request a specific
+    /// start index (used by P2 redirect chain when the upstream spectator
+    /// already has a position).
+    pub fn sendSpectatorHello(self: *NetplayManager) void {
+        if (self.enet_peer == null or !self.enet_connected) return;
+        if (!self.config.is_spectator) return;
+        var buf: [5]u8 = undefined;
+        buf[0] = wire.MSG_HELLO; // 0x01 HELLO (zzcaster extension)
+        std.mem.writeInt(u32, buf[1..5], 0, .little); // host decides start index
+        self.sendReliable(&buf);
+        self.log.info("Sent spectator HELLO (start_index=0, host decides)", .{});
     }
 
     /// Send our protocol version to the peer for compatibility checking.
@@ -1534,7 +1647,7 @@ pub const NetplayManager = struct {
         if (self.enet_peer == null or !self.enet_connected) return;
         if (self.version_confirmed or self.version_mismatch) return; // already sent
         var buf: [5]u8 = undefined;
-        buf[0] = 0x07; // VersionConfig
+        buf[0] = wire.MSG_VERSION_CONFIG; // 0x1F VersionConfig (CCCaster MsgType::VersionConfig)
         std.mem.writeInt(u32, buf[1..5], protocol_version, .little);
         self.sendReliable(&buf);
         self.log.info("Sent VersionConfig (version={d})", .{protocol_version});
@@ -1545,7 +1658,7 @@ pub const NetplayManager = struct {
     pub fn sendErrorMessage(self: *NetplayManager, message: []const u8) void {
         if (self.enet_peer == null or !self.enet_connected) return;
         var buf: [129]u8 = undefined;
-        buf[0] = 0x06; // ErrorMessage
+        buf[0] = wire.MSG_ERROR_MESSAGE; // 0x07 ErrorMessage (CCCaster MsgType::ErrorMessage)
         const len = @min(message.len, 128);
         @memcpy(buf[1 .. 1 + len], message[0..len]);
         self.sendReliable(buf[0 .. 1 + len]);
@@ -1994,7 +2107,7 @@ pub const NetplayManager = struct {
 
         if (self.enet_connected and !self.config.is_spectator and self.config.is_netplay) {
             var buf: [5]u8 = undefined;
-            buf[0] = 0x03; // TransitionIndex
+            buf[0] = wire.MSG_TRANSITION_INDEX; // 0x21 TransitionIndex (CCCaster MsgType::TransitionIndex)
             std.mem.writeInt(u32, buf[1..5], self.indexed_frame.index, .little);
             self.sendReliable(&buf);
         }
@@ -2075,7 +2188,7 @@ pub const NetplayManager = struct {
 
         // Wire format: [1 type=0x04][136 SyncHash body].
         var buf: [1 + 136]u8 = undefined;
-        buf[0] = 0x04; // SyncHash
+        buf[0] = wire.MSG_SYNC_HASH; // 0x1B SyncHash (CCCaster MsgType::SyncHash)
         _ = sh.serialize(buf[1..137]);
         self.sendReliable(buf[0..137]);
 
@@ -2449,7 +2562,7 @@ pub const NetplayManager = struct {
     /// Format: [1 type=0x20][4 start_frame][4 start_index][N × 4 (P1:u16, P2:u16)]
     pub fn fillBothInputsForBroadcast(self: *NetplayManager, index: u32, frame: u32, out: []u8) usize {
         if (out.len < 1 + 8 + num_inputs * 4) return 0;
-        out[0] = 0x20;
+        out[0] = wire.MSG_BOTH_INPUTS; // 0x02 BothInputs (CCCaster MsgType::BothInputs)
         std.mem.writeInt(u32, out[1..5], frame, .little);
         std.mem.writeInt(u32, out[5..9], index, .little);
         var i: u32 = 0;

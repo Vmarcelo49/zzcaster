@@ -407,6 +407,32 @@ pub fn build(b: *std.Build) void {
     });
     const run_simulation_tests = b.addRunArtifact(simulation_tests);
 
+    // Spectator + wire-format tests (pure Zig, host-testable).
+    //
+    // We CAN'T import spectator_manager.zig directly here because it
+    // transitively imports `net` (for enet_transport), which pulls in
+    // ws2_32 + wininet — Windows-only libraries not available on Linux.
+    //
+    // So this test module only exercises wire.zig (which is pure std +
+    // std.crypto.hash.Md5). The SpectatorManager state machine is tested
+    // via the cross-compiled hook.dll running on Windows (manual smoke
+    // test, see docs/spectator-study.md §4.4).
+    //
+    // To verify the SpectatorManager constants + struct layout at compile
+    // time without dragging in the net module, wire.zig re-declares the
+    // tag constants and the tests check them against the documented
+    // CCCaster values.
+    const spectator_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/dll/wire_test.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const spectator_tests = b.addTest(.{
+        .root_module = spectator_test_mod,
+    });
+    const run_spectator_tests = b.addRunArtifact(spectator_tests);
+
     const test_step = b.step("test", "Run unit tests (host)");
     test_step.dependOn(&run_common_tests.step);
     test_step.dependOn(&run_net_protocol_tests.step);
@@ -415,6 +441,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_conn_detector_tests.step);
     test_step.dependOn(&run_air_dash_tests.step);
     test_step.dependOn(&run_simulation_tests.step);
+    test_step.dependOn(&run_spectator_tests.step);
 
     // Rollback micro-benchmark: measures save/load throughput for both
     // pre- and post-coalesced region layouts. Cross-compiled to the same

@@ -1,4 +1,6 @@
 const std = @import("std");
+const wire = @import("wire.zig");
+
 const logging = @import("common").logging;
 const net = @import("net").enet_transport;
 
@@ -43,8 +45,22 @@ pub const SpectatorManager = struct {
     spectators: std.ArrayList(Spectator),
     enet_host: ?*enet.ENetHost = null, // borrowed from NetplayManager
 
+    // True if this SpectatorManager belongs to a spectator-mode client
+    // (i.e. we're a chain-forwarding link, not the root host). When true,
+    // the direct-spectator cap is `max_spectators` (15) instead of
+    // `max_root_spectators` (1). Mirrors CCCaster's
+    // `SHOULD_REDIRECT_SPECTATORS` macro (DllMain.cpp:59-61), which uses
+    // `clientMode.isSpectate()` to pick the cap.
+    is_spectator_role: bool = false,
+
     // Round-robin broadcast position (legacy iterates spectators in order).
     broadcast_pos: usize = 0,
+
+    // Round-robin redirect-pick position (advances each redirect call so
+    // load is distributed evenly across spectator links — mirrors CCCaster's
+    // `_spectatorMapPos` walking in `getRandomSpectatorAddress`
+    // DllSpectatorManager.cpp:127-134 + 209-235).
+    redirect_pick_pos: usize = 0,
 
     // The minimum spectator pos.index — used to know how long to preserve
     // input history before garbage collecting.
@@ -90,73 +106,118 @@ pub const SpectatorManager = struct {
     /// Called when ENet delivers a CONNECT event for a NEW peer that is NOT
     /// the main game peer. The host decides whether to accept (as spectator)
     /// or redirect (chain-forwarding).
+    ///
+    /// Mirrors CCCaster's `socketAccepted` (DllMain.cpp:1280-1330) +
+    /// `SHOULD_REDIRECT_SPECTATORS` macro (DllMain.cpp:59-61):
+    ///   - Root host/client (is_spectator_role=false): cap at max_root_spectators (1)
+    ///   - Spectator chain link (is_spectator_role=true): cap at max_spectators (15)
+    /// Beyond the cap, redirect to an existing spectator's address.
     pub fn onNewPeer(self: *SpectatorManager, peer: ?*enet.ENetPeer, now_ms: i64) void {
-        // If we're at capacity, redirect to a random existing spectator.
-        if (self.spectators.items.len >= max_spectators) {
+        // Pick the cap based on our role. A root host/client only accepts 1
+        // direct spectator; a spectator chain link accepts up to 15.
+        const cap: usize = if (self.is_spectator_role) max_spectators else max_root_spectators;
+        if (self.spectators.items.len >= cap) {
             self.sendRedirectAndDisconnect(peer);
             return;
         }
 
-        // Unconditionally cap direct spectators at max_root_spectators (1).
-        // NOTE: diverges from CCCaster, which only applies this cap to root
-        // hosts (ClientMode::Host/Client) and lets chain spectators
-        // (Spectate) accept up to MAX_SPECTATORS (15). The clientMode check
-        // is missing — see CCCaster DllMain.cpp:59 SHOULD_REDIRECT_SPECTATORS.
-        if (self.spectators.items.len >= max_root_spectators) {
-            self.sendRedirectAndDisconnect(peer);
-            return;
+        // Capture the new peer's external address up-front so it's
+        // available for redirect advertisement even before activation
+        // (CCCaster captures this from the IpAddrPort handshake message
+        // — we use the ENet peer's remote address as a best-effort until
+        // P3 wire-format parity adds the proper IpAddrPort exchange).
+        var redirect_addr: [64]u8 = [_]u8{0} ** 64;
+        var redirect_port: u16 = 0;
+        if (peer) |p| {
+            const a = p.address;
+            _ = std.fmt.bufPrint(&redirect_addr, "{d}.{d}.{d}.{d}", .{
+                (a.host >> 0) & 0xFF,
+                (a.host >> 8) & 0xFF,
+                (a.host >> 16) & 0xFF,
+                (a.host >> 24) & 0xFF,
+            }) catch {};
+            redirect_port = a.port;
         }
 
         self.spectators.append(self.allocator, .{
             .peer = peer,
             .state = .pending,
             .accepted_at_ms = now_ms,
+            .redirect_addr = redirect_addr,
+            .redirect_port = redirect_port,
         }) catch {
             self.log.err("SpectatorManager: failed to allocate spectator slot", .{});
             return;
         };
 
         const addr = if (peer) |p| p.address else std.mem.zeroes(enet.ENetAddress);
-        self.log.info("Spectator connected from {d}.{d}.{d}.{d}:{d} (pending)", .{
+        self.log.info("Spectator connected from {d}.{d}.{d}.{d}:{d} (pending, role={s})", .{
             (addr.host >> 0) & 0xFF,
             (addr.host >> 8) & 0xFF,
             (addr.host >> 16) & 0xFF,
             (addr.host >> 24) & 0xFF,
             addr.port,
+            if (self.is_spectator_role) "chain" else "root",
         });
     }
 
     fn sendRedirectAndDisconnect(self: *SpectatorManager, peer: ?*enet.ENetPeer) void {
         if (peer == null) return;
 
-        // Pick a random spectator's address from the full list (any state).
-        // NOTE: CCCaster uses round-robin via _spectatorMapPos, not random.
-        var redirect_buf: [80]u8 = undefined;
-        redirect_buf[0] = 0xFE; // ZZCaster-specific REDIRECT tag (0xFE); does NOT match CCCaster, which sends IpAddrPort (0x0B).
-        redirect_buf[1] = 0x01;
-
-        // If we have at least one spectator, advertise its address; else
-        // just disconnect (the client will retry or give up).
+        // Pick a spectator's address via round-robin (advances
+        // `redirect_pick_pos` each call so load is distributed evenly —
+        // mirrors CCCaster's `_spectatorMapPos` walk in
+        // `getRandomSpectatorAddress` DllSpectatorManager.cpp:209-235).
+        // We skip entries with `redirect_port == 0` (defensive — should
+        // not happen since we populate on connect, but matches CCCaster's
+        // DEBUG-only safety check at DllSpectatorManager.cpp:220-230).
         if (self.spectators.items.len > 0) {
-            const idx = self.prng.random().intRangeLessThan(usize, 0, self.spectators.items.len);
-            const s = self.spectators.items[idx];
-            const addr_len = std.mem.indexOfScalar(u8, &s.redirect_addr, 0) orelse s.redirect_addr.len;
-            const total_len = 2 + addr_len + 1 + 2;
-            if (total_len <= redirect_buf.len) {
-                @memcpy(redirect_buf[2 .. 2 + addr_len], s.redirect_addr[0..addr_len]);
-                redirect_buf[2 + addr_len] = 0; // null-terminator
-                std.mem.writeInt(u16, redirect_buf[3 + addr_len .. 5 + addr_len][0..2], s.redirect_port, .little);
-                const packet = enet.enet_packet_create(&redirect_buf, 5 + addr_len, enet.ENET_PACKET_FLAG_RELIABLE);
-                if (packet != null) {
-                    _ = enet.enet_peer_send(peer, 0, packet);
-                    enet.enet_host_flush(self.enet_host);
+            var picked: ?Spectator = null;
+            var tries: usize = 0;
+            while (tries < self.spectators.items.len) : (tries += 1) {
+                if (self.redirect_pick_pos >= self.spectators.items.len) {
+                    self.redirect_pick_pos = 0;
+                }
+                const candidate = self.spectators.items[self.redirect_pick_pos];
+                self.redirect_pick_pos += 1;
+                if (candidate.redirect_port != 0) {
+                    picked = candidate;
+                    break;
                 }
             }
+
+            if (picked) |s| {
+                // Send the redirect message.
+                // Wire format (zzcaster): [0xFE tag][0x01 marker][addr\0][port LE]
+                // See docs/spectator-study.md §3.4 P3 for the CCCaster-compatible
+                // IpAddrPort (0x0B) format — we'll switch to it in P3.
+                var redirect_buf: [80]u8 = undefined;
+                redirect_buf[0] = wire.MSG_IP_ADDR_PORT; // 0x0B IpAddrPort (CCCaster MsgType::IpAddrPort — replaces zzcaster's 0xFE REDIRECT)
+                redirect_buf[1] = 0x01;
+                const addr_len = std.mem.indexOfScalar(u8, &s.redirect_addr, 0) orelse s.redirect_addr.len;
+                const total_len = 2 + addr_len + 1 + 2;
+                if (total_len <= redirect_buf.len) {
+                    @memcpy(redirect_buf[2 .. 2 + addr_len], s.redirect_addr[0..addr_len]);
+                    redirect_buf[2 + addr_len] = 0; // null-terminator
+                    std.mem.writeInt(u16, redirect_buf[3 + addr_len .. 5 + addr_len][0..2], s.redirect_port, .little);
+                    const packet = enet.enet_packet_create(&redirect_buf, 5 + addr_len, enet.ENET_PACKET_FLAG_RELIABLE);
+                    if (packet != null) {
+                        _ = enet.enet_peer_send(peer, 0, packet);
+                        enet.enet_host_flush(self.enet_host);
+                    }
+                    self.log.info("Spectator redirected to {s}:{d} (capacity reached)", .{
+                        s.redirect_addr[0..addr_len], s.redirect_port,
+                    });
+                }
+            } else {
+                self.log.warn("Spectator redirect: no spectator with a valid redirect_addr available — disconnecting", .{});
+            }
+        } else {
+            self.log.info("Spectator redirected but no spectators to redirect to — disconnecting", .{});
         }
 
         enet.enet_peer_disconnect_later(peer.?, 0);
         enet.enet_host_flush(self.enet_host);
-        self.log.info("Spectator redirected (capacity reached)", .{});
     }
 
     /// Called when a spectator disconnects (or times out).
@@ -231,7 +292,10 @@ pub const SpectatorManager = struct {
         fill_inputs: *const fn (index: u32, frame: u32, out: []u8) usize,
         get_cached_rng: *const fn (index: u32, out: []u8) bool,
     ) void {
-        _ = current_index;
+        // `current_frame` is the host's current indexed_frame.frame — used by
+        // `fill_inputs` (via `fillBothInputsCallback` →
+        // `fillBothInputsForBroadcast`) to look up the right inputs. We don't
+        // use it directly here.
         _ = current_frame;
 
         if (self.spectators.items.len == 0) {
@@ -266,6 +330,22 @@ pub const SpectatorManager = struct {
                 continue;
             }
 
+            // Advance the spectator's pos_index when the host has moved to a
+            // new transition index. Without this, the spectator's pos is
+            // stuck at its start_index forever and `fillBothInputsForBroadcast`
+            // returns inputs from the wrong (stale) round. The spectator's
+            // `pos.index` is just a cursor for what to send next — it doesn't
+            // have to match the spectator's local indexed_frame. Mirrors
+            // CCCaster's behavior: `spectator.pos.parts.index` advances when
+            // `getBothInputs` returns inputs for a higher index (because the
+            // host's `local_inputs`/`remote_inputs` buffers have advanced).
+            // See docs/spectator-study.md §3.1 P1 (B12).
+            if (current_index > s.pos_index) {
+                s.pos_index = current_index;
+                s.pos_frame = 0;
+                s.sent_rng_state = false; // new round → re-send RNG
+            }
+
             // Record the spectator's index BEFORE advancing pos, so we can
             // detect an index advance (new round) and reset sent_rng_state.
             const old_index = s.pos_index;
@@ -278,7 +358,7 @@ pub const SpectatorManager = struct {
             // would diverge from the actual match within seconds.
             if (!s.sent_rng_state) {
                 var rng_buf: [1 + 4 + 4 + 4 + 4 + 220]u8 = undefined;
-                rng_buf[0] = 0x02; // RNG state (same type as host→client)
+                rng_buf[0] = wire.MSG_RNG_STATE; // 0x16 RNG state (same type as host→client)
                 if (get_cached_rng(old_index, rng_buf[1..])) {
                     if (s.peer != null) {
                         const packet = enet.enet_packet_create(&rng_buf, rng_payload_len, enet.ENET_PACKET_FLAG_RELIABLE);
@@ -343,7 +423,7 @@ pub const SpectatorManager = struct {
     pub fn sendInitialState(self: *SpectatorManager, peer: ?*enet.ENetPeer, state_byte: u8, is_training: bool, start_index: u32, start_frame: u32) void {
         if (peer == null) return;
         var buf: [11]u8 = undefined;
-        buf[0] = 0x10; // INITIAL_GAME_STATE (CCCaster MsgType::InitialGameState = 0x0A; Zig uses 0x10 — diverges. CCCaster's InitialGameState also carries stage/chara/moon/color fields.)
+        buf[0] = wire.MSG_INITIAL_GAME_STATE; // 0x0A InitialGameState (CCCaster MsgType::InitialGameState — was zzcaster's 0x10)
         buf[1] = state_byte;
         buf[2] = if (is_training) 1 else 0;
         std.mem.writeInt(u32, buf[3..7], start_index, .little);

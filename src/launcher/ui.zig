@@ -347,8 +347,12 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
         }
     }
 
-    // Gamepad list
-    const num_joy = c.SDL_NumJoysticks();
+    // Gamepad list — polled once here, then refreshed periodically while the
+    // user is on the Controller Mapper page so that newly connected or
+    // disconnected gamepads appear without restarting the launcher.
+    var num_joy: c_int = c.SDL_NumJoysticks();
+    var last_joy_poll_ms: i64 = 0;
+    const joy_poll_interval_ms: i64 = 1500; // refresh device list every 1.5 s
 
     var quit = false;
     while (!quit) {
@@ -356,6 +360,23 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
         while (c.SDL_PollEvent(&event) != 0) {
             _ = zgui.backend.processEvent(&event);
             if (event.type == c.SDL_QUIT) quit = true;
+            // SDL fires these immediately on hotplug; we still re-poll the
+            // count on a timer below as a fallback in case the platform
+            // delays or coalesces the events.
+            if (event.type == c.SDL_JOYDEVICEADDED or event.type == c.SDL_JOYDEVICEREMOVED) {
+                num_joy = c.SDL_NumJoysticks();
+            }
+        }
+
+        // While browsing the Controller Mapper page, periodically refresh the
+        // connected-joystick count so the device combo auto-updates.
+        if (ui_state == .idle and current_page == .controllers) {
+            const now_ms = std.Io.Clock.now(.real, io).toMilliseconds();
+            if (last_joy_poll_ms == 0 or now_ms - last_joy_poll_ms >= joy_poll_interval_ms) {
+                last_joy_poll_ms = now_ms;
+                _ = c.SDL_JoystickUpdate();
+                num_joy = c.SDL_NumJoysticks();
+            }
         }
 
         zgui.backend.newFrame(1024, 768);

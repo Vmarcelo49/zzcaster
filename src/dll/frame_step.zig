@@ -307,31 +307,11 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     }
 
     // Only save rollback states in-game — matches CCCaster (DllMain.cpp:206-207,
-    // "Only save rollback states in-game"). Additionally, only save when the
-    // remote input for this frame is CONFIRMED (not predicted).
-    //
-    // Option C: States saved with predicted (unconfirmed) remote inputs are
-    // "tentative" — they may be wrong. If a rollback later loads such a state,
-    // the re-run starts from a wrong baseline → cascading desync.
-    //
-    // By only saving when the remote input is confirmed, every state in the
-    // pool represents a "truth" state. Rollbacks always load a correct baseline.
-    // The tradeoff: during heavy prediction (high latency), fewer states are
-    // saved, so the rollback window may be shorter. But every saved state is
-    // guaranteed correct.
-    //
-    // We check if the remote input for the current frame has been received:
-    //   end_frame > current_frame means we have the remote's input for this
-    //   frame (end_frame is exclusive — it's the next frame the remote will
-    //   send, so end_frame > frame means frame's input is confirmed).
+    // "Only save rollback states in-game").
     if (n.state == .in_game) {
-        const remote_end_frame = n.remote_inputs.getEndFrame(n.indexed_frame.index);
-        const is_confirmed = remote_end_frame > n.indexed_frame.frame;
-        if (is_confirmed) {
-            _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
-            // Snapshot SFX filter into history ring (for future rollback dedup).
-            if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
-        }
+        _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
+        // Snapshot SFX filter into history ring (for future rollback dedup).
+        if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
     }
 
     n.writeGameInputs();

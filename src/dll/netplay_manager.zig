@@ -576,6 +576,7 @@ pub const NetplayManager = struct {
     // matching the legacy Variable::RoundStart change-monitor in
     // DllMain.cpp:1266-1270. last_round_start is the last-seen value.
     last_round_start: u32 = 0,
+    round_start_waiting_logged: bool = false,
 
     // Input resend
     resend_timer_active: bool = false,
@@ -1831,26 +1832,32 @@ pub const NetplayManager = struct {
         const current = asm_hacks.round_start_counter;
         if (current == self.last_round_start) return;
 
-        const prev = self.last_round_start;
-        self.last_round_start = current;
-
         if (self.state == .skippable or self.state == .chara_intro) {
             // For chara_intro→in_game, wait until the remote has reached
             // our transition index (prevents frame-0 state divergence).
             if (self.state == .chara_intro) {
                 const remote_end_index = self.remote_inputs.getEndIndex();
                 if (remote_end_index <= self.indexed_frame.index) {
-                    self.log.info("Round start (counter {d} -> {d}) — chara_intro but remote behind (remote_end_index={d}, our_index={d}), waiting", .{
-                        prev, current, remote_end_index, self.indexed_frame.index,
-                    });
+                    if (!self.round_start_waiting_logged) {
+                        self.round_start_waiting_logged = true;
+                        self.log.info("Round start (counter {d} -> {d}) — chara_intro but remote behind (remote_end_index={d}, our_index={d}), waiting", .{
+                            self.last_round_start, current, remote_end_index, self.indexed_frame.index,
+                        });
+                    }
                     return;
                 }
             }
+            self.round_start_waiting_logged = false;
+            const prev = self.last_round_start;
+            self.last_round_start = current;
             self.log.info("Round start (counter {d} -> {d}) — {s} -> InGame", .{
                 prev, current, @tagName(self.state),
             });
             self.transitionTo(.in_game);
         } else {
+            self.round_start_waiting_logged = false;
+            const prev = self.last_round_start;
+            self.last_round_start = current;
             self.log.info("Round start counter {d} -> {d} (state={s}, no transition)", .{
                 prev, current, @tagName(self.state),
             });
@@ -1935,7 +1942,9 @@ pub const NetplayManager = struct {
             // the prior chara_select transition (line below) and syncRngState
             // silently no-ops every frame. Rounds 2+ are handled separately
             // by checkIntroDone when game_state == 99.
-            self.intro_rng_enabled = true;
+            if (new == .chara_select or !self.first_in_game_completed) {
+                self.intro_rng_enabled = true;
+            }
 
             // Mark first in_game as completed so that checkIntroDone knows
             // to enable intro_done RNG sync for subsequent rounds (2+).
@@ -1965,11 +1974,9 @@ pub const NetplayManager = struct {
             }
         }
 
-        // Loading still clears intro_rng_enabled — Loading is between
-        // chara_select and chara_intro/in_game and we don't want stale
-        // RNG sync state lingering from a previous match. CharaSelect no
-        // longer clears it because we WANT chara_select to be armed.
-        if (new == .loading) {
+        // Loading and Skippable clear intro_rng_enabled so we don't want stale
+        // RNG sync state lingering from a previous round/match.
+        if (new == .loading or new == .skippable) {
             self.intro_rng_enabled = false;
         }
 
@@ -2342,7 +2349,8 @@ pub const NetplayManager = struct {
 
         const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);
         if (loaded == null) {
-            self.remote_inputs.clearLastChanged();
+            // Do NOT clear last changed frame! Let's keep it so it retries on subsequent frames.
+            // Matches CCCaster: DllMain.cpp:620
             self.log.err("ROLLBACK FAILED: no saved state for frame {d} (rollback history exceeded, pool size is {d})", .{ lcf_frame, self.state_pool.num_states });
             return false;
         }

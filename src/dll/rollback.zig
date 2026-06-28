@@ -660,6 +660,17 @@ pub const StatePool = struct {
             self.loadState(slot);
             return .{ .frame = best_frame, .netplay_state = best_nps, .start_world_time = best_swt };
         }
+
+        // Fallback: in production (non-test), load the oldest state if available
+        // to prevent rollback failures (matches CCCaster's RELEASE fallback).
+        if (!builtin.is_test and self.saved_states.items.len > 0) {
+            const oldest = self.saved_states.items[0];
+            if (oldest.index == target_index) {
+                self.loadState(0);
+                return .{ .frame = oldest.frame, .netplay_state = oldest.netplay_state, .start_world_time = oldest.start_world_time };
+            }
+        }
+
         return null;
     }
 

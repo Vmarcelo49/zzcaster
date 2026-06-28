@@ -61,6 +61,11 @@ const MockPeer = struct {
     remote_end_frame: u32 = 0,
     remote_end_index: u32 = 0,
 
+    // Round start
+    last_round_start: u32 = 0,
+    round_start_waiting_logged: bool = false,
+    round_start_counter: u32 = 0,
+
     // Rollback StatePool Mock
     saved_states: [60]SavedState = [_]SavedState{.{}} ** 60,
     saved_states_count: usize = 0,
@@ -261,6 +266,31 @@ const MockPeer = struct {
     
     pub fn isRerunning(self: *const MockPeer) bool {
         return self.fast_fwd_stop_frame != 0;
+    }
+
+    pub fn checkRoundStart(self: *MockPeer) void {
+        const current = self.round_start_counter;
+        if (current == self.last_round_start) return;
+
+        if (self.state == .skippable or self.state == .chara_intro) {
+            if (self.state == .chara_intro) {
+                const remote_idx = if (self.remote_end_index > 0) self.remote_end_index - 1 else 0;
+                if (remote_idx <= self.index) {
+                    if (!self.round_start_waiting_logged) {
+                        self.round_start_waiting_logged = true;
+                    }
+                    return;
+                }
+            }
+            self.round_start_waiting_logged = false;
+            const prev = self.last_round_start;
+            self.last_round_start = current;
+            _ = prev;
+            self.state = .in_game;
+        } else {
+            self.round_start_waiting_logged = false;
+            self.last_round_start = current;
+        }
     }
 
     // Mock SyncHash queue implementation
@@ -1177,6 +1207,34 @@ test "Mock Rollback Out-of-Bounds Canceled" {
     // 5. Verify the frame remains unchanged (18) and last_changed_frame is cleared
     try expectEqual(@as(u32, 18), peer.frame);
     try expect(peer.last_changed_frame == null);
+}
+
+test "checkRoundStart deadlock regression test" {
+    var peer = MockPeer.init("Peer", false, 0, 0);
+    peer.state = .chara_intro;
+    peer.index = 2;
+    peer.last_round_start = 0;
+    peer.round_start_counter = 0;
+
+    // 1. Remote is behind (remote_end_index is 2, meaning remote_idx = 1 <= peer.index of 2).
+    peer.remote_end_index = 2;
+    
+    // Increment counter to 1
+    peer.round_start_counter = 1;
+    
+    // 2. Call checkRoundStart — should return early without transitioning
+    peer.checkRoundStart();
+    try expectEqual(NetplayState.chara_intro, peer.state);
+    
+    // 3. Remote catches up (remote_end_index becomes 4, so remote_idx = 3 > peer.index of 2).
+    peer.remote_end_index = 4;
+    
+    // 4. Call checkRoundStart again.
+    // With the fix: last_round_start was NOT updated to 1 during the early return,
+    // so checkRoundStart will run and transition us to .in_game!
+    peer.checkRoundStart();
+    try expectEqual(NetplayState.in_game, peer.state);
+    try expectEqual(@as(u32, 1), peer.last_round_start);
 }
 
 // Import the desync tests so they run as part of the same test binary.

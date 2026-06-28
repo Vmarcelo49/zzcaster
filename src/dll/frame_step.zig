@@ -179,6 +179,14 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     // peer catches up. 30s timeout only fires after the remote reaches our
     // transition index but stops sending frames (crash/packet loss).
     if (!n.isRemoteInputReady()) {
+        {
+            const end_frame = n.remote_inputs.getEndFrame(n.indexed_frame.index);
+            const max_ahead: u8 = if (n.isInRollback()) n.config.rollback else 0;
+            state.log.?.info("isRemoteInputReady=false — blocking (index={d}, frame={d}, end_index={d}, end_frame={d}, max_ahead={d}, is_rollback={})", .{
+                n.indexed_frame.index, n.indexed_frame.frame,
+                n.remote_inputs.getEndIndex(), end_frame, max_ahead, n.isInRollback(),
+            });
+        }
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
         var connected_since: i64 = 0; // 0 = not yet connected
         var last_resend = wait_start;
@@ -263,8 +271,11 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             }
 
             if (!warned and now - wait_start > 5000) {
-                state.log.?.warn("Waiting for remote input... (5s elapsed, enet_connected={}, remote_end_index={d}, local_index={d})", .{
+                const end_frame = n.remote_inputs.getEndFrame(n.indexed_frame.index);
+                const max_ahead: u8 = if (n.isInRollback()) n.config.rollback else 0;
+                state.log.?.warn("Waiting for remote input... (5s elapsed, enet_connected={}, remote_end_index={d}, local_index={d}, local_frame={d}, end_frame={d}, max_ahead={d}, is_rollback={})", .{
                     n.enet_connected, remote_end_index, n.indexed_frame.index,
+                    n.indexed_frame.frame, end_frame, max_ahead, n.isInRollback(),
                 });
                 warned = true;
             }

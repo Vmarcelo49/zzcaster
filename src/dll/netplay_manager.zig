@@ -1372,6 +1372,13 @@ pub const NetplayManager = struct {
         // (needed for rollback to trigger; harmless for delay-based since
         // checkRollback returns false when rollback=0).
         self.remote_inputs.setRemote(index, start_frame, inputs_buf[0..n], true);
+
+        // Diagnostic: log received PlayerInputs so we can see if packets arrive.
+        self.log.info("recvRemoteInputs: index={d} start_frame={d} count={d} (end_index now {d}, end_frame[{d}]={d})", .{
+            index, start_frame, n,
+            self.remote_inputs.getEndIndex(),
+            index, self.remote_inputs.getEndFrame(index),
+        });
     }
 
     pub fn getRemoteInput(self: *const NetplayManager) u16 {
@@ -2388,12 +2395,19 @@ pub const NetplayManager = struct {
     }
 
     fn onEnterInGame(self: *NetplayManager) void {
-        self.local_inputs.reset();
-        self.remote_inputs.reset();
+        // CCCaster does NOT reset the input containers when entering InGame.
+        // The inputs from chara_select/loading (TransitionIndex + PlayerInputs)
+        // are preserved and used for the in_game phase. Clearing them here
+        // causes both peers to lose the inputs they already exchanged, creating
+        // a deadlock where neither side can proceed past the rollback prediction
+        // window (max_frames_ahead = config.rollback = 4 frames).
+        //
+        // The old zzcaster code had `self.local_inputs.reset()` and
+        // `self.remote_inputs.reset()` here — that was the root cause of the
+        // "stuck at in_game entry" hang. Removing them matches CCCaster's
+        // behavior (DllNetplayManager.cpp:733-743 — only captures RNG state).
 
         // Defensive reset of the retry-menu sync gate.
-        //
-        //
         self.retry_menu_waiting_for_peer = false;
         self.retry_menu_wait_start_ms = 0;
         self.input_wait_remote_at_index_since_ms = 0;

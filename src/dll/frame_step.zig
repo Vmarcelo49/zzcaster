@@ -70,36 +70,49 @@ fn frameStepSpectator(n: *netman.NetplayManager) void {
 }
 
 fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
-    // Read local input
-    const raw_input: u16 = blk: {
-        if (state.reader) |*r| {
-            r.update();
-            if (r.hasGamepad()) break :blk r.readInput();
-        }
-        break :blk keyboard.readInput();
-    };
+    // During a rollback re-run, the local input for each re-simulated frame is
+    // already correct in the InputBuffer (stored during the original run, with
+    // the air-dash macro already expanded). Re-reading the CURRENT physical
+    // input and re-running the STATEFUL macro here would overwrite the buffer
+    // with wrong values (the macro's state machine has advanced past this
+    // frame) → writeGameInputs writes corrupted inputs → desync. So the entire
+    // input-acquisition + macro + setLocalInput + sendLocalInputs block is
+    // skipped during a re-run; writeGameInputs (below) replays the stored
+    // inputs instead.
+    if (!n.isRerunning()) {
+        // Read local input
+        const raw_input: u16 = blk: {
+            if (state.reader) |*r| {
+                r.update();
+                if (r.hasGamepad()) break :blk r.readInput();
+            }
+            break :blk keyboard.readInput();
+        };
 
-    var local_input: u16 = n.getNetplayInput(raw_input);
+        var local_input: u16 = n.getNetplayInput(raw_input);
 
-    // Air Dash Macro runs after state filtering and before setLocalInput, so
-    // the expanded sequence is what enters the InputBuffer / goes to the peer.
-    if (n.state == .in_game) {
-        const r = n.air_dash_macro.step(local_input);
-        if (r.triggered) {
-            state.log.?.info("AirDashMacro: {d}AB -> jump {d} + dash {d}AB at frame {d}", .{
-                r.output, r.output, n.air_dash_macro.dash_dir, n.indexed_frame.frame,
-            });
+        // Air Dash Macro runs after state filtering and before setLocalInput,
+        // so the expanded sequence is what enters the InputBuffer / goes to the
+        // peer. Skipped during re-runs (see the guard above) — the macro is
+        // stateful and must not be re-applied to already-expanded inputs.
+        if (n.state == .in_game) {
+            const r = n.air_dash_macro.step(local_input);
+            if (r.triggered) {
+                state.log.?.info("AirDashMacro: {d}AB -> jump {d} + dash {d}AB at frame {d}", .{
+                    r.output, r.output, n.air_dash_macro.dash_dir, n.indexed_frame.frame,
+                });
+            }
+            local_input = r.output;
+        } else {
+            n.air_dash_macro.reset();
         }
-        local_input = r.output;
-    } else {
-        n.air_dash_macro.reset();
+
+        n.setLocalInput(local_input);
+
+        n.sendLocalInputs();
     }
 
     n.updateFrame();
-
-    n.setLocalInput(local_input);
-
-    n.sendLocalInputs();
 
     n.syncRngState();
 

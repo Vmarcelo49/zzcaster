@@ -137,13 +137,11 @@ const game_state_intro_done: u32 = 99; // CC_GAME_STATE_INTRO_DONE
 // to 0 so the re-run doesn't re-trigger intro logic.
 const pre_game_intro_frames: u32 = 224;
 
-/// Minimum number of frames that must elapse in in_game before rollback can
-/// fire. During the first few frames, the saved state at frame 0 may differ
-/// between peers (both enter in_game at slightly different absolute
-/// world_timer values). Rolling back to frame 0 loads a divergent state →
-/// desync. This delay lets both peers build up converged saved states
-/// before any rollback is attempted. Set to `delay + rollback + 2` so we
-/// have at least `rollback` states to re-simulate from.
+/// Minimum frame number before rollback can load a state. States at frames
+/// 0-7 may differ between peers (both enter in_game at slightly different
+/// absolute world_timer values). Rolling back to those frames loads a
+/// divergent state → desync. The lcf is kept (not cleared) so the
+/// misprediction is corrected once we're past this delay.
 const rollback_min_frame_delay: u32 = 8;
 
 // Protocol version for compatibility checking. Increment when the wire format
@@ -1181,35 +1179,14 @@ pub const NetplayManager = struct {
                 return 0;
             },
             .chara_intro => {
-                // CC_INTRO_STATE_ADDR values:
-                //   2 = character intro animation (players can't move yet)
-                //   1 = pre-game: characters are on the arena, players CAN
-                //       move (jumps, dashes, attacks all work), but the
-                //       round timer hasn't started.
-                //   0 = "Fight!" — round timer starts.
-                //
+                // Filter to Confirm/Cancel only — matches CCCaster's
+                // getSkippableInput (DllNetplayManager.cpp:158-179).
                 // checkRoundStart transitions to .in_game when round_start_counter
-                // fires (at intro_state==1, pre-game). So we should only be in
-                // .chara_intro while intro_state==2 (intro animation).
-                //
-                // FILTER ALL INPUTS to Confirm/Cancel only — matches CCCaster's
-                // getSkippableInput (DllNetplayManager.cpp:158-179). CCCaster
-                // does NOT pass movement inputs through during CharaIntro, even
-                // during pre-game (intro_state==1). This prevents movement-input
-                // correction debt from accumulating during the chara_intro phase
-                // (where we don't save rollback states), which would discharge
-                // as a desync when transitioning to in_game.
-                //
-                // The previous zzcaster "enhancement" of letting players move
-                // during pre-game caused 50% desync rates when players mashed
-                // directions and dashes — the movement inputs entered the
-                // InputBuffer, differed from prediction, and caused rollbacks
-                // that couldn't be resolved (no saved states to roll back to).
+                // fires (at intro_state==1, pre-game).
                 if (self.shouldCatchUp()) {
-                    // If remote is ahead, mash Confirm EVERY frame to catch up.
                     return button_confirm << 4;
                 }
-                return raw_input & 0xC000; // keep only Confirm + Cancel bits
+                return raw_input & 0xC000; // Confirm + Cancel only
             },
             .skippable => {
                 // If remote is ahead, mash Confirm to catch up.
@@ -1862,16 +1839,10 @@ pub const NetplayManager = struct {
     }
 
     pub fn checkIntroDone(self: *NetplayManager) void {
-        // Track the intro-done edge so we enable RNG exactly once per round.
-        // (game_state_addr isn't a simple monotonic flag — it cycles through
-        // several values — so we watch for the 99 value with a one-shot.)
-        //
-        // Only arm RNG sync at intro_done for rounds 2+ (after the first
-        // in_game has completed). For round 1, RNG is already synced at
-        // chara_select entry and in_game entry. Arming at intro_done for
-        // round 1 causes the host to send advanced RNG (advanced during
-        // chara_intro) which the client applies early → ~750 frame
-        // mismatch → desync on the next match.
+        // Arm RNG sync at intro_done (game_state==99) for rounds 2+ only.
+        // For round 1, RNG is already synced at chara_select + in_game entry.
+        // The chara_intro → in_game transition itself is handled by
+        // checkRoundStart() via round_start_counter (fires at pre-game).
         if (!self.intro_rng_enabled and game_state_addr.* == game_state_intro_done and self.first_in_game_completed) {
             self.intro_rng_enabled = true;
             self.should_sync_rng = true;
@@ -1881,22 +1852,6 @@ pub const NetplayManager = struct {
             self.rng_send_count = 0;
             self.log.info("Intro done (game_state=99) — RNG sync enabled (round 2+)", .{});
         }
-
-        // chara_intro → in_game transition is now handled by checkRoundStart()
-        // via the round_start_counter (which fires at intro_state==1, pre-game).
-        // This matches CCCaster's Variable::RoundStart handler.
-        //
-        // The old intro_state==0 trigger is REMOVED — transitioning at "Fight!"
-        // (intro_state==0) caused the "huge rollback at Fight!" because rollback
-        // was inactive for the entire 224-frame pre-game phase.
-        //
-        // The hijackIntroState ASM hack (applied in applyPostLoadHacks when
-        // rollback is enabled) disables the game's natural intro_state 1→0
-        // progression, so rollback can safely load states with intro_state==1
-        // without the game re-firing intro logic → no desync.
-        //
-        // We keep the INTRO_DONE RNG sync arming above (game_state==99) for
-        // rounds 2+, but do NOT transition state here anymore.
     }
 
     pub fn checkRoundOver(self: *NetplayManager) void {
@@ -2075,8 +2030,8 @@ pub const NetplayManager = struct {
         _ = self.isValidNext(new);
         self.state = new;
         self.onStateTransition(old, new);
-        self.round_over_timer = -1; // leaving in-game re-arms the timer
-        self.log.info("Round over -> {s}", .{@tagName(new)});
+        self.round_over_timer = -1;
+        self.log.info("{s} -> {s}", .{ @tagName(old), @tagName(new) });
         if (self.sfx_dedup) |*sd| sd.clearPerFrame();
     }
 

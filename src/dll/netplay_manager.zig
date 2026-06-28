@@ -1109,14 +1109,16 @@ pub const NetplayManager = struct {
                 //   2 = character intro animation (players can't move yet)
                 //   1 = pre-game: characters are on the arena, players CAN
                 //       move (jumps, dashes, attacks all work), but the
-                //       round timer hasn't started.
-                //   0 = "Fight!" — round timer starts.
-                //
-                // checkIntroDone transitions to .in_game when intro_state <= 1
-                // (pre-game), so we should only be in .chara_intro while
-                // intro_state == 2 (intro animation). If intro_state is 1 or 0
-                // here, checkIntroDone will transition us this frame — pass
-                // input through so the player can move immediately.
+                //       round timer hasn't started. We pass input through
+                //       here so the player can warm up / test inputs before
+                //       "Round 1 Fight" fires. The FSM stays in .chara_intro
+                //       until intro_state drops to 0 (the actual round start),
+                //       keeping the invariant `state == .in_game ⇒
+                //       intro_state == 0` intact (rollback won't load a state
+                //       with intro_state != 0).
+                //   0 = already at the in-game threshold; checkIntroDone
+                //       will transition to .in_game this frame (or already
+                //       did).
                 if (intro_state_addr.* != 2) {
                     return raw_input;
                 }
@@ -1747,44 +1749,41 @@ pub const NetplayManager = struct {
             self.log.info("Intro done (game_state=99) — RNG sync enabled (round 2+)", .{});
         }
 
-        // chara_intro → in_game: transition when the pre-game phase starts
-        // (intro_state drops to 1 or 0), NOT when "Fight!" fires.
+        // chara_intro → in_game: requires BOTH signals to fire.
         //
-        // CC_INTRO_STATE_ADDR values:
-        //   2 = character intro animation (players can't move yet)
-        //   1 = pre-game: characters are on the arena, players CAN move
-        //   0 = "Fight!" — round timer starts
+        //   1. intro_state_addr.* == 0: the game itself confirms "Fight!"
+        //      fired and the round timer started. This is REQUIRED to preserve
+        //      the invariant that `state == .in_game` implies `intro_state == 0`.
+        //      Without this invariant, rollback could load a state with
+        //      intro_state != 0, and clearIntroStateDuringRollback only fires
+        //      past frame 224 — so early-frame rollbacks would corrupt the
+        //      game's intro-state code path → desync.
         //
-        // The pre-game (intro_state == 1) IS gameplay — players can move,
-        // jump, dash, attack. The game is fully simulating. Transitioning to
-        // in_game here means the netcode sync (RNG, lockstep, rollback setup)
-        // happens during pre-game, where a brief resync is unnoticeable.
-        // If we wait until "Fight!" (intro_state == 0), the sync happens right
-        // when players start attacking — causing a huge, noticeable rollback
-        // that eats inputs.
+        //      Attempted transitioning at intro_state <= 1 (pre-game) to move
+        //      the sync earlier, but this caused desyncs because the game's
+        //      behavior differs between intro_state 1 and 0, and rollback
+        //      loading a state with intro_state==1 corrupts the gameplay path.
         //
-        // Requires BOTH signals:
-        //   1. intro_state <= 1: players can move (pre-game or Fight!)
-        //   2. remote_inputs.getEndIndex() > indexed_frame.index: remote peer
-        //      has reached our transition index (lockstep gate)
-        if (self.state == .chara_intro and intro_state_addr.* <= 1) {
+        //   2. remote_inputs.getEndIndex() > indexed_frame.index: the remote
+        //      peer has reached our current transition index. This makes the
+        //      faster peer wait during chara_intro for the slower peer to
+        //      catch up before both enter in_game.
+        if (self.state == .chara_intro and intro_state_addr.* == 0) {
             const remote_end_index = self.remote_inputs.getEndIndex();
             if (remote_end_index > self.indexed_frame.index) {
                 const old = self.state;
                 _ = self.isValidNext(.in_game);
                 self.state = .in_game;
                 self.onStateTransition(old, .in_game);
-                self.log.info("CharaIntro -> InGame (intro_state={d}, remote caught up at index {d})", .{
-                    intro_state_addr.*, self.indexed_frame.index,
-                });
+                self.log.info("CharaIntro -> InGame (intro_state=0, remote caught up at index {d})", .{self.indexed_frame.index});
                 if (self.sfx_dedup) |*sd| sd.clearPerFrame();
             } else {
-                // Faster peer: pre-game started but remote is still behind.
-                // Keep state == .chara_intro so getNetplayInput still
-                // suppresses direction/action buttons, and the next frame's
-                // checkIntroDone will re-evaluate.
-                self.log.info("CharaIntro intro_state={d} but remote behind (remote_end_index={d}, our_index={d}) — waiting", .{
-                    intro_state_addr.*, remote_end_index, self.indexed_frame.index,
+                // Faster peer: chara_intro finished visually but remote is
+                // still behind. Keep state == .chara_intro so getNetplayInput
+                // still suppresses direction/action buttons, and the next
+                // frame's checkIntroDone will re-evaluate.
+                self.log.info("CharaIntro intro_state=0 but remote behind (remote_end_index={d}, our_index={d}) — waiting", .{
+                    remote_end_index, self.indexed_frame.index,
                 });
             }
         }

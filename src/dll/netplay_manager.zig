@@ -1109,26 +1109,24 @@ pub const NetplayManager = struct {
                 //   2 = character intro animation (players can't move yet)
                 //   1 = pre-game: characters are on the arena, players CAN
                 //       move (jumps, dashes, attacks all work), but the
-                //       round timer hasn't started. We pass input through
-                //       here so the player can warm up / test inputs before
-                //       "Round 1 Fight" fires. The FSM stays in .chara_intro
-                //       until intro_state drops to 0 (the actual round start),
-                //       keeping the invariant `state == .in_game ⇒
-                //       intro_state == 0` intact (rollback won't load a state
-                //       with intro_state != 0).
-                //   0 = already at the in-game threshold; checkIntroDone
-                //       will transition to .in_game this frame (or already
-                //       did).
+                //       round timer hasn't started.
+                //   0 = "Fight!" — round timer starts.
+                //
+                // checkRoundStart transitions to .in_game when round_start_counter
+                // fires (at intro_state==1, pre-game). So we should only be in
+                // .chara_intro while intro_state==2 (intro animation). If
+                // intro_state is 1 or 0 here, checkRoundStart will transition us
+                // this frame — pass input through so the player can move.
                 if (intro_state_addr.* != 2) {
                     return raw_input;
                 }
                 // Still in character intro animation: only allow Confirm/Cancel.
-                // If remote is ahead, mash Confirm to catch up.
+                // If remote is ahead, mash Confirm EVERY frame to catch up.
+                // Using every-other-frame (frame % 2) can cause a race when
+                // peers are at different frame counts — the skip happens at
+                // different game-internal frames, causing desync.
                 if (self.shouldCatchUp()) {
-                    if (self.indexed_frame.frame % 2 == 0) {
-                        return button_confirm << 4;
-                    }
-                    return 0;
+                    return button_confirm << 4;
                 }
                 return raw_input & 0xC000; // keep only Confirm + Cancel bits
             },

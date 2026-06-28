@@ -297,8 +297,8 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             // this timeout does NOT fire — we keep waiting. The slower peer
             // will eventually finish loading, send TransitionIndex for InGame,
             // and then the 10s countdown begins.
-            if (remote_at_index_since != 0 and now - remote_at_index_since > 10000) {
-                state.log.?.err("Timed out waiting for remote input (10s after remote reached index {d}) — forcing exit", .{
+            if (remote_at_index_since != 0 and now - remote_at_index_since > 30000) {
+                state.log.?.err("Timed out waiting for remote input (30s after remote reached index {d}) — forcing exit", .{
                     n.indexed_frame.index,
                 });
                 state.alive_flag_addr.* = 0;

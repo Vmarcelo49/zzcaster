@@ -923,7 +923,12 @@ pub const NetplayManager = struct {
             },
             enet.ENET_EVENT_TYPE_CONNECT => {
                 if (peer_opt) |peer| {
-                    enet.enet_peer_timeout(peer, 0, 10000, 120000);
+                    // Increase ENet timeout for slow connections. The default
+                    // 10s minimum is too short for online play with high latency
+                    // or slow machines — during loading screens, a slow peer may
+                    // not send packets for 10+ seconds, causing ENet to disconnect.
+                    // 30s minimum, 120s maximum gives enough headroom.
+                    enet.enet_peer_timeout(peer, 0, 30000, 120000);
                 }
                 // Mark the main peer connected. For host the first CONNECT
                 // is the player-2 peer; subsequent ones are spectators.

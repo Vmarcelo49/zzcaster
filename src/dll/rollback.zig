@@ -1,6 +1,7 @@
 const std = @import("std");
 const logging = @import("common").logging;
 const builtin = @import("builtin");
+const rb_regions = @import("rollback_regions.zig");
 
 pub const InputBuffer = struct {
     allocator: std.mem.Allocator,
@@ -233,6 +234,11 @@ pub const StatePool = struct {
     /// what the docs/dll-optimization-plan.md calls "coalesced" regions.
     coalesced_regions: std.ArrayList(MemoryRegion) = .empty,
     saved_states: std.ArrayList(SavedState),
+    /// True when the coalesced regions include the effects array. Only then
+    /// do we save/load the effects pointer-followed chain data. Set in
+    /// `allocate` by checking if any coalesced region contains the effects
+    /// array address.
+    has_effects: bool = false,
 
     pub fn init(allocator: std.mem.Allocator) StatePool {
         return .{
@@ -435,8 +441,25 @@ pub const StatePool = struct {
         if (region_size == 0) {
             // No regions loaded — use a default size
             self.state_size = 4096;
+            self.has_effects = false;
         } else {
-            self.state_size = region_size;
+            // Check if the effects array is present in the coalesced regions.
+            // Only then do we need the effects pointer-followed chain data.
+            self.has_effects = false;
+            for (self.coalesced_regions.items) |r| {
+                if (r.addr <= rb_regions.CC_EFFECTS_ARRAY_ADDR and
+                    rb_regions.CC_EFFECTS_ARRAY_ADDR + rb_regions.CC_EFFECT_ELEMENT_SIZE <= r.addr + r.size)
+                {
+                    self.has_effects = true;
+                    break;
+                }
+            }
+            // Include the effects pointer-followed chain data (12 bytes × 1000
+            // effects) only when the effects array is present.
+            self.state_size = if (self.has_effects)
+                region_size + rb_regions.CC_EFFECT_PTR_DATA_SIZE
+            else
+                region_size;
         }
         self.num_states = num_states;
         self.pool = try self.allocator.alloc(u8, num_states * self.state_size);
@@ -519,6 +542,14 @@ pub const StatePool = struct {
             return null;
         }
 
+        // Save effects pointer-followed chain data (12 bytes × 1000 effects).
+        // Appended after the coalesced regions in the buffer. Ported from
+        // CCCaster's MemDumpPtr chain (Generator.cpp:291-297).
+        // Only called when the effects array is present (has_effects flag).
+        if (self.has_effects) {
+            saveEffectsPtrData(dst[pos..]);
+        }
+
         // Save FPU control state (cw + MXCSR only — see SavedFpu doc).
         // saveFpu() handles the arch guard internally: on non-x86 hosts
         // (e.g. x86_64 unit-test runners) it writes benign defaults and
@@ -576,6 +607,16 @@ pub const StatePool = struct {
             // Don't free subsequent states — the restore was incomplete,
             // and freeing would lose history we might need for diagnosis.
             return;
+        }
+
+        // Restore effects pointer-followed chain data. MUST be called AFTER
+        // the coalesced regions are restored, because the pointer at
+        // effect+0x320 (which is part of the flat effect struct) must be
+        // restored before we can follow it. Ported from CCCaster's
+        // MemDumpPtr::loadDump (MemDump.cpp:37-50).
+        // Only called when the effects array is present (has_effects flag).
+        if (self.has_effects) {
+            loadEffectsPtrData(src[pos..]);
         }
 
         // Free all states after this one (they're invalidated)
@@ -692,7 +733,7 @@ fn saveFpu(out: *SavedFpu) void {
 fn restoreFpu(env: *const SavedFpu) void {
     if (builtin.cpu.arch != .x86) return;
     var cw_buf: u16 = env.cw;
-    var mxcsr_buf: u32 = env.mxcsr & 0xFFC0; // mask status bits + reserved
+    var mxcsr_buf: u32 = env.mxcsr; // restore full MXCSR — matches CCCaster's fesetenv
     const cw_ptr: *const u16 = &cw_buf;
     const mxcsr_ptr: *const u32 = &mxcsr_buf;
     asm volatile ("fldcw (%[ptr])"
@@ -703,4 +744,122 @@ fn restoreFpu(env: *const SavedFpu) void {
         :
         : [ptr] "r" (mxcsr_ptr),
     );
+}
+
+// ============================================================================
+// Effects pointer-followed chain save/restore.
+//
+// Ported from CCCaster's MemDump/MemDumpPtr system (Generator.cpp:291-297,
+// MemDump.cpp:20-50). Each of the 1000 effects has a 3-level pointer-deref
+// chain starting at offset 0x320. CCCaster saves 12 extra bytes per effect
+// (4 per level) that capture the state at the dereferenced heap addresses.
+//
+// If any pointer in the chain is NULL, all descendants save zeros (on save)
+// and skip the write (on load, but still advance the buffer).
+// ============================================================================
+
+/// Save the 3-level pointer-followed chain for all 1000 effects.
+/// `dst` must be at least CC_EFFECT_PTR_DATA_SIZE (12,000) bytes.
+/// Called after the flat coalesced regions are copied into the snapshot.
+fn saveEffectsPtrData(dst: []u8) void {
+    const effects_base: usize = rb_regions.CC_EFFECTS_ARRAY_ADDR;
+    const count: usize = rb_regions.CC_EFFECTS_ARRAY_COUNT;
+    const elem_size: usize = rb_regions.CC_EFFECT_ELEMENT_SIZE;
+    const ptr_off: usize = rb_regions.CC_EFFECT_PTR_OFFSET;
+
+    var offset: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const effect_addr = effects_base + i * elem_size;
+
+        // L1: read pointer at effect + 0x320, target = ptr + 0x38
+        const ptr1: u32 = @as(*const u32, @ptrFromInt(effect_addr + ptr_off)).*;
+        const l1_addr: u32 = if (ptr1 != 0) ptr1 + 0x38 else 0;
+        if (l1_addr != 0) {
+            const src: [*]const u8 = @ptrFromInt(l1_addr);
+            @memcpy(dst[offset .. offset + 4], src[0..4]);
+        } else {
+            @memset(dst[offset .. offset + 4], 0);
+        }
+        offset += 4;
+
+        // L2: read pointer at l1_addr + 0, target = ptr + 0
+        const ptr2: u32 = if (l1_addr != 0)
+            @as(*const u32, @ptrFromInt(l1_addr)).*
+        else
+            0;
+        const l2_addr: u32 = if (ptr2 != 0) ptr2 else 0;
+        if (l2_addr != 0) {
+            const src: [*]const u8 = @ptrFromInt(l2_addr);
+            @memcpy(dst[offset .. offset + 4], src[0..4]);
+        } else {
+            @memset(dst[offset .. offset + 4], 0);
+        }
+        offset += 4;
+
+        // L3: read pointer at l2_addr + 0, target = ptr + 0
+        const ptr3: u32 = if (l2_addr != 0)
+            @as(*const u32, @ptrFromInt(l2_addr)).*
+        else
+            0;
+        const l3_addr: u32 = if (ptr3 != 0) ptr3 else 0;
+        if (l3_addr != 0) {
+            const src: [*]const u8 = @ptrFromInt(l3_addr);
+            @memcpy(dst[offset .. offset + 4], src[0..4]);
+        } else {
+            @memset(dst[offset .. offset + 4], 0);
+        }
+        offset += 4;
+    }
+}
+
+/// Restore the 3-level pointer-followed chain for all 1000 effects.
+/// `src` must be at least CC_EFFECT_PTR_DATA_SIZE (12,000) bytes.
+/// MUST be called AFTER the flat coalesced regions are restored, so the
+/// pointer at effect+0x320 has its saved value before we follow it.
+fn loadEffectsPtrData(src: []const u8) void {
+    const effects_base: usize = rb_regions.CC_EFFECTS_ARRAY_ADDR;
+    const count: usize = rb_regions.CC_EFFECTS_ARRAY_COUNT;
+    const elem_size: usize = rb_regions.CC_EFFECT_ELEMENT_SIZE;
+    const ptr_off: usize = rb_regions.CC_EFFECT_PTR_OFFSET;
+
+    var offset: usize = 0;
+    var i: usize = 0;
+    while (i < count) : (i += 1) {
+        const effect_addr = effects_base + i * elem_size;
+
+        // L1: read pointer at effect + 0x320 (just restored), target = ptr + 0x38
+        const ptr1: u32 = @as(*const u32, @ptrFromInt(effect_addr + ptr_off)).*;
+        const l1_addr: u32 = if (ptr1 != 0) ptr1 + 0x38 else 0;
+        if (l1_addr != 0) {
+            const dst: [*]u8 = @ptrFromInt(l1_addr);
+            @memcpy(dst[0..4], src[offset .. offset + 4]);
+        }
+        // If l1_addr == 0, skip the write but still advance the buffer.
+        offset += 4;
+
+        // L2: read pointer at l1_addr + 0, target = ptr + 0
+        const ptr2: u32 = if (l1_addr != 0)
+            @as(*const u32, @ptrFromInt(l1_addr)).*
+        else
+            0;
+        const l2_addr: u32 = if (ptr2 != 0) ptr2 else 0;
+        if (l2_addr != 0) {
+            const dst: [*]u8 = @ptrFromInt(l2_addr);
+            @memcpy(dst[0..4], src[offset .. offset + 4]);
+        }
+        offset += 4;
+
+        // L3: read pointer at l2_addr + 0, target = ptr + 0
+        const ptr3: u32 = if (l2_addr != 0)
+            @as(*const u32, @ptrFromInt(l2_addr)).*
+        else
+            0;
+        const l3_addr: u32 = if (ptr3 != 0) ptr3 else 0;
+        if (l3_addr != 0) {
+            const dst: [*]u8 = @ptrFromInt(l3_addr);
+            @memcpy(dst[0..4], src[offset .. offset + 4]);
+        }
+        offset += 4;
+    }
 }

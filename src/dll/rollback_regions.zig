@@ -150,9 +150,24 @@ const player_addrs = [_]Region{
 // The 1000 effect elements are contiguous in memory, so we save them as
 // a single large region rather than 1000 individual ones. This is both
 // faster (one memcpy instead of 1000) and avoids comptime branch limits.
-const CC_EFFECTS_ARRAY_ADDR = 0x67BDE8;
-const CC_EFFECTS_ARRAY_COUNT = 1000;
-const CC_EFFECT_ELEMENT_SIZE = 0x33C;
+pub const CC_EFFECTS_ARRAY_ADDR = 0x67BDE8;
+pub const CC_EFFECTS_ARRAY_COUNT = 1000;
+pub const CC_EFFECT_ELEMENT_SIZE = 0x33C;
+
+// Effects pointer-followed chain (ported from CCCaster's Generator.cpp:291-297).
+// Each effect has a 3-level pointer-deref chain starting at offset 0x320.
+// CCCaster saves 12 extra bytes per effect (4 per level) that zzcaster was
+// missing. These are saved/restored separately from the flat region because
+// the target addresses are runtime-determined (pointer dereferences).
+//
+// Chain layout (MemDumpPtr srcOffset, dstOffset, size):
+//   L1: *(effect+0x320) + 0x38 → 4 bytes
+//   L2: *(*(effect+0x320)+0x38) + 0 → 4 bytes
+//   L3: *(*(*(effect+0x320)+0x38)) + 0 → 4 bytes
+// If any pointer is NULL, all descendants save zeros.
+pub const CC_EFFECT_PTR_OFFSET = 0x320;
+pub const CC_EFFECT_PTR_DATA_SIZE_PER_EFFECT = 12; // 3 levels × 4 bytes
+pub const CC_EFFECT_PTR_DATA_SIZE = CC_EFFECTS_ARRAY_COUNT * CC_EFFECT_PTR_DATA_SIZE_PER_EFFECT;
 
 /// All memory regions to save/restore during rollback.
 /// Built at comptime by concatenating misc + 4× player + effects.

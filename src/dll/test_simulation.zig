@@ -1181,3 +1181,6 @@ test "Mock Rollback Out-of-Bounds Canceled" {
 
 // Import the desync tests so they run as part of the same test binary.
 pub const desync_tests = @import("rollback_desync_tests.zig");
+
+// Import the CCCaster parity tests (rollback-improvements branch fixes).
+pub const parity_tests = @import("rollback_parity_tests.zig");

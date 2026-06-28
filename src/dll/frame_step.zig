@@ -113,6 +113,26 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     n.pollAndDispatch(3);
 
+    // Update RTT EMA every frame (reads ENet's peer.roundTripTime).
+    // Feeds the time-sync recommendation below.
+    n.updateRttEma();
+
+    // Cooperative time-sync: if we're ahead of the remote peer, sleep a
+    // small amount to slow the game down. This lets the remote catch up
+    // and reduces the frequency of rollbacks. The sleep is capped at 4ms
+    // (~24% of the 16.6ms frame budget) to stay within vsync.
+    //
+    // Only applies during in_game (not during loading/menus) and not during
+    // a rollback re-run (we're catching up, not slowing down).
+    if (n.state == .in_game and !n.isRerunning()) {
+        const sleep_ms = n.recommendPerFrameSleepMs();
+        if (sleep_ms > 0) {
+            std.Io.sleep(state.app_io_backend.io(), .{
+                .nanoseconds = sleep_ms * std.time.ns_per_ms,
+            }, .real) catch {};
+        }
+    }
+
     n.maybeSendSyncHash();
     n.checkSyncHashDesync();
     if (n.desync_detected) {
@@ -122,7 +142,11 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     }
 
     if (n.was_connected and !n.enet_connected and n.config.is_netplay) {
-        state.log.?.err("Peer disconnected during game!", .{});
+        if (n.version_mismatch) {
+            state.log.?.err("Protocol version mismatch — force-exiting", .{});
+        } else {
+            state.log.?.err("Peer disconnected during game!", .{});
+        }
         state.alive_flag_addr.* = 0; // force exit
         return;
     }
@@ -136,54 +160,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
-    // Lockstep wait for the remote's input.
-    //
-    // CCCaster's wait loop (DllMain.cpp:540-581) runs unconditionally inside
-    // `frameStepNormal()` — it does NOT skip when the socket is disconnected.
-    // When the remote hasn't connected yet, `isRemoteInputReady()` returns
-    // false (the remote input container is empty), so the loop blocks the
-    // game's main thread until the remote connects AND sends its first
-    // `PlayerInputs` for the current transition index. This is the mechanism
-    // that prevents the "fast peer enters gameplay before slow peer" desync:
-    // the faster peer's game freezes on InGame frame 0.
-    //
-    // The previous zzcaster code short-circuited this with:
-    //   if (!n.enet_connected) { n.writeGameInputs(); return; }
-    // which let the game run at FULL SPEED with no synchronization whenever
-    // ENet hadn't connected yet. This was the root cause of the user's bug:
-    // the lazy ENet reconnect (frame_step.zig:18-36) takes up to 15s, and if
-    // either peer reached InGame frame 0 during that window, the game would
-    // advance without waiting for the remote peer — causing the match to
-    // terminate or desync immediately.
-    //
-    // The fix: enter the wait loop unconditionally. The loop already polls
-    // ENet via `pollAndDispatch(10)`, which processes CONNECT events and
-    // establishes the connection.
-    //
-    // TIMEOUT POLICY:
-    // The 10s hard timeout (matching CCCaster's MAX_WAIT_INPUTS_INTERVAL)
-    // only fires when the remote peer has ALREADY reached the same transition
-    // index as the local peer but isn't sending frames — this indicates a
-    // real connectivity problem (peer crashed, packet loss, etc.).
-    //
-    // If the remote peer is still in an EARLIER transition index (i.e., still
-    // loading while the local peer has already reached InGame), the timeout
-    // does NOT fire. The faster peer's game simply freezes on InGame frame 0
-    // and waits for the slower peer to finish loading and catch up. This is
-    // the behavior the user described: "the player that loaded first should
-    // have their thread paused until the other catches up". A slow machine
-    // can take 15-30s to load, and terminating the session in that window
-    // would be incorrect — the slower peer is still making progress, just
-    // hasn't reached InGame yet.
-    //
-    // We detect "remote is still in an earlier state" by checking whether
-    // `remote_inputs.getEndIndex()` (which reflects the highest transition
-    // index the remote has sent inputs for) is less than the local peer's
-    // current `indexed_frame.index`. When the remote sends its
-    // `TransitionIndex` for InGame, `setRemoteIndex` → `resizeOuter` bumps
-    // `end_index` to InGame+1, so this check correctly transitions from
-    // "still loading" to "at InGame, awaiting frames" when the remote
-    // finishes loading.
+    // Lockstep wait: block until the remote peer has sent input for the
+    // current frame. The faster peer's game freezes here until the slower
+    // peer catches up. 30s timeout only fires after the remote reaches our
+    // transition index but stops sending frames (crash/packet loss).
     if (!n.isRemoteInputReady()) {
         const wait_start = std.Io.Clock.now(.real, state.app_io_backend.io()).toMilliseconds();
         var connected_since: i64 = 0; // 0 = not yet connected
@@ -273,8 +253,8 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             // this timeout does NOT fire — we keep waiting. The slower peer
             // will eventually finish loading, send TransitionIndex for InGame,
             // and then the 10s countdown begins.
-            if (remote_at_index_since != 0 and now - remote_at_index_since > 10000) {
-                state.log.?.err("Timed out waiting for remote input (10s after remote reached index {d}) — forcing exit", .{
+            if (remote_at_index_since != 0 and now - remote_at_index_since > 30000) {
+                state.log.?.err("Timed out waiting for remote input (30s after remote reached index {d}) — forcing exit", .{
                     n.indexed_frame.index,
                 });
                 state.alive_flag_addr.* = 0;
@@ -326,9 +306,33 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         if (n.rollback_timer == 0) n.rollback_timer = n.min_rollback_spacing;
     }
 
-    _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
-    // Snapshot SFX filter into history ring (for future rollback dedup).
-    if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
+    // Only save rollback states in-game — matches CCCaster (DllMain.cpp:206-207,
+    // "Only save rollback states in-game"). Additionally, only save when the
+    // remote input for this frame is CONFIRMED (not predicted).
+    //
+    // Option C: States saved with predicted (unconfirmed) remote inputs are
+    // "tentative" — they may be wrong. If a rollback later loads such a state,
+    // the re-run starts from a wrong baseline → cascading desync.
+    //
+    // By only saving when the remote input is confirmed, every state in the
+    // pool represents a "truth" state. Rollbacks always load a correct baseline.
+    // The tradeoff: during heavy prediction (high latency), fewer states are
+    // saved, so the rollback window may be shorter. But every saved state is
+    // guaranteed correct.
+    //
+    // We check if the remote input for the current frame has been received:
+    //   end_frame > current_frame means we have the remote's input for this
+    //   frame (end_frame is exclusive — it's the next frame the remote will
+    //   send, so end_frame > frame means frame's input is confirmed).
+    if (n.state == .in_game) {
+        const remote_end_frame = n.remote_inputs.getEndFrame(n.indexed_frame.index);
+        const is_confirmed = remote_end_frame > n.indexed_frame.frame;
+        if (is_confirmed) {
+            _ = n.state_pool.saveState(n.indexed_frame.frame, n.indexed_frame.index, @intFromEnum(n.state), n.start_world_time);
+            // Snapshot SFX filter into history ring (for future rollback dedup).
+            if (n.sfx_dedup) |*sd| sd.snapshotToHistory(n.indexed_frame.frame);
+        }
+    }
 
     n.writeGameInputs();
 

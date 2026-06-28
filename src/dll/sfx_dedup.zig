@@ -86,18 +86,16 @@ pub const SfxDedup = struct {
     /// NOTE: the Zig implementation below iterates [loaded_frame, current_frame]
     /// inclusive, which includes both endpoints — diverging from the legacy.
     pub fn applyRollbackFilter(self: *SfxDedup, loaded_frame: u32, current_frame: u32) void {
-        // OR together all snapshots from loaded_frame..current_frame (inclusive).
-        // LEGACY NOTE: the legacy iterates (loaded_frame, current_frame) exclusive
-        // of both endpoints — it skips the loaded frame and the current frame
-        // (the latter because sfxFilterArray already holds current-frame state).
-        // The Zig code below includes both endpoints, which is a behavioral divergence.
-        var frame: u32 = loaded_frame;
-        while (true) {
+        // OR together all snapshots from (loaded_frame+1, current_frame) exclusive
+        // of both endpoints — matches CCCaster (DllRollbackManager.cpp:210).
+        // The loaded frame's snapshot is already in the restored state; the
+        // current frame's snapshot is already in sfxFilterArray.
+        var frame: u32 = loaded_frame + 1;
+        while (frame < current_frame) {
             const slot = frame % self.history_size;
             for (0..sfx_array_len) |j| {
                 sfx_filter_array[j] |= self.history[slot][j];
             }
-            if (frame == current_frame) break;
             frame +%= 1;
         }
 

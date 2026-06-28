@@ -128,6 +128,12 @@ fn drawHeaderBar() void {
         ui_theme.drawLogo(wp[0] + ui_theme.CONTENT_PAD, wp[1] + logo_y);
         // Reserve the line so subsequent items (if any) don't overlap.
         zgui.dummy(.{ .w = 0, .h = logo_h });
+
+        // Version label in the top-right corner of the header.
+        const ver_text = "v" ++ config.version_string;
+        const ver_w = zgui.calcTextSize(ver_text, .{})[0];
+        zgui.setCursorPos(.{ 1024 - ver_w - ui_theme.CONTENT_PAD, logo_y });
+        ui_theme.textColored(ui_theme.COL_MUTED, "{s}", .{ver_text});
     }
     zgui.endChild();
 }

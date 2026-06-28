@@ -34,6 +34,69 @@ pub fn applyPreLoadHacks() void {
     state.log.?.info("Pre-load hacks applied", .{});
 }
 
+// hijackIntroState — NOPs 7 bytes at 0x45C1F2, disabling the game's natural
+// intro_state 1→0 progression ("Fight!" announcement). This lets us manually
+// control intro_state during rollback (via clearIntroStateDuringRollback)
+// without the game re-firing intro logic on loaded states.
+//
+// Ported from CCCaster's DllAsmHacks.hpp:502-503:
+//   static const Asm hijackIntroState = { ( void * ) 0x45C1F2, INLINE_NOP_SEVEN_TIMES };
+//
+// Applied conditionally on rollback being enabled (DllMain.cpp:1896-1907).
+// Without this hack, we CANNOT safely transition to in_game at intro_state==1
+// (pre-game) because rollback would load states with intro_state==1 and the
+// game's natural 1→0 progression would re-fire on the re-run → desync.
+const hijack_intro_state_addr: u32 = 0x45C1F2;
+
+pub fn applyHijackIntroState() void {
+    if (state.log == null) return;
+    const nops = [_]u8{0x90} ** 7;
+    writeBytes(hijack_intro_state_addr, &nops);
+    state.log.?.info("hijackIntroState applied (NOP 7 bytes @0x{x:0>8}) — intro_state progression disabled", .{hijack_intro_state_addr});
+}
+
+// ============================================================================
+// FPS limiter hacks (ported from CCCaster's DllAsmHacks.hpp:227-231).
+//
+// MBAACC has a built-in FPS limiter that uses QueryPerformanceFrequency
+// (stored at CC_PERF_FREQ_ADDR = 0x774A80). The game divides this frequency
+// by a target value to calculate how long to wait between frames.
+//
+// On high-refresh-rate monitors (144Hz, 180Hz, 240Hz), the game's vsync or
+// limiter can run faster than 60fps, causing world_timer to increment faster
+// than 60fps. This breaks netplay — one peer advances frames faster, causing
+// constant lockstep waits, stutter, and desyncs.
+//
+// CCCaster disables the game's limiter by writing 1 to CC_PERF_FREQ_ADDR
+// (making the game think the performance frequency is 1, so its wait
+// calculation produces ~0ms wait), then applies its OWN frame limiter using
+// QueryPerformanceCounter to enforce exactly 60fps.
+//
+// We do the same: disable the game's limiter, then enforce 60fps in
+// frameStep using QueryPerformanceCounter.
+// ============================================================================
+
+const perf_freq_addr: *u64 = @ptrFromInt(0x774A80);
+const fps_counter_nop_addr: u32 = 0x41FD43;
+
+pub fn applyDisableFpsLimit() void {
+    if (state.log == null) return;
+
+    // Disable the game's FPS limiter by setting CC_PERF_FREQ_ADDR to 1.
+    // The game uses QueryPerformanceFrequency / target_fps to calculate
+    // frame wait. Setting it to 1 makes the wait ~0ms, effectively
+    // disabling the game's limiter. We enforce 60fps ourselves in frameStep.
+    perf_freq_addr.* = 1;
+
+    // Disable the FPS counter display update code (NOP 3 bytes at 0x41FD43).
+    // The game updates CC_FPS_COUNTER_ADDR (0x774A70) based on its own
+    // (now broken) timing. NOP'ing this prevents a wrong FPS display.
+    const nops = [_]u8{ 0x90, 0x90, 0x90 };
+    writeBytes(fps_counter_nop_addr, &nops);
+
+    state.log.?.info("disableFpsLimit applied — game FPS limiter disabled, zzcaster will enforce 60fps", .{});
+}
+
 pub fn applyHookMainLoop() void {
     const callback_addr: u32 = @intCast(@intFromPtr(&state.zzcasterFrameCallback));
 

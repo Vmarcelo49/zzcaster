@@ -1902,6 +1902,27 @@ pub const NetplayManager = struct {
         // 1→0 progression — otherwise rollback loading a state with
         // intro_state==1 would desync.
         if (self.state == .skippable or self.state == .chara_intro) {
+            // For chara_intro → in_game, gate on the remote peer having reached
+            // our transition index. This ensures both peers enter in_game at the
+            // same logical moment (same indexed_frame), preventing the camera
+            // and entity positions from diverging at frame 0.
+            //
+            // Without this gate, the faster peer enters in_game alone, saves a
+            // state at frame 0 with their local camera position, then when the
+            // remote catches up and the first rollback fires, the loaded state
+            // has a different camera position than the remote's → desync.
+            //
+            // The skippable → in_game transition (round 2+) doesn't need this
+            // gate because both peers are already synchronized from round 1.
+            if (self.state == .chara_intro) {
+                const remote_end_index = self.remote_inputs.getEndIndex();
+                if (remote_end_index <= self.indexed_frame.index) {
+                    self.log.info("Round start detected (counter {d} -> {d}) — chara_intro but remote behind (remote_end_index={d}, our_index={d}), waiting", .{
+                        prev, current, remote_end_index, self.indexed_frame.index,
+                    });
+                    return;
+                }
+            }
             self.log.info("Round start detected (counter {d} -> {d}) — {s} -> InGame", .{
                 prev, current, @tagName(self.state),
             });

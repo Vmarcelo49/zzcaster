@@ -65,6 +65,8 @@ const win32 = struct {
     extern "kernel32" fn SetThreadExecutionState(esFlags: u32) callconv(.winapi) u32;
     extern "kernel32" fn Sleep(dwMilliseconds: u32) callconv(.winapi) void;
     extern "kernel32" fn GetTempPathA(nBufferLength: u32, lpBuffer: [*]u8) callconv(.winapi) u32;
+    extern "kernel32" fn GetModuleHandleA(lpModuleName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn GetProcAddress(hModule: ?*anyopaque, lpProcName: [*:0]const u8) callconv(.winapi) ?*anyopaque;
 
     extern "kernel32" fn CreateThread(
         lpThreadAttributes: ?*anyopaque,
@@ -284,6 +286,87 @@ pub export fn DllMain(hModule: ?*anyopaque, fdwReason: u32, _: ?*anyopaque) call
     return .TRUE;
 }
 
+var original_exit_process_bytes: [5]u8 = undefined;
+var exit_process_hooked: bool = false;
+
+fn hookedExitProcess(uExitCode: u32) callconv(.winapi) noreturn {
+    if (state.log) |logger| {
+        logger.info("hookedExitProcess called with exit code {d} — cleaning up", .{uExitCode});
+    }
+
+    // 1. Clean up ENet if netplay is active
+    if (is_netplay and state.nm != null) {
+        state.nm.?.gracefulDisconnect();
+    }
+
+    // 2. Clean up IPC connection
+    if (ipc_connected.load(.acquire)) {
+        if (ipc_pipe) |p| _ = win32.CloseHandle(p);
+        ipc_pipe = null;
+        ipc_connected.store(false, .release);
+    }
+
+    // 3. Restore original bytes of ExitProcess
+    if (exit_process_hooked) {
+        if (win32.GetModuleHandleA("kernel32.dll")) |kernel32| {
+            if (win32.GetProcAddress(kernel32, "ExitProcess")) |exit_proc_addr| {
+                const exit_process_ptr: [*]u8 = @ptrCast(exit_proc_addr);
+                var old: u32 = 0;
+                const k32 = struct {
+                    extern "kernel32" fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpflOldProtect: *u32) callconv(.winapi) i32;
+                };
+                _ = k32.VirtualProtect(exit_process_ptr, 5, 0x40, &old);
+                @memcpy(exit_process_ptr[0..5], &original_exit_process_bytes);
+                _ = k32.VirtualProtect(exit_process_ptr, 5, old, &old);
+            }
+        }
+    }
+
+    // 4. Call the real ExitProcess
+    win32.ExitProcess(uExitCode);
+}
+
+fn installExitProcessHook() void {
+    if (builtin.os.tag != .windows) return;
+    if (exit_process_hooked) return;
+
+    const kernel32 = win32.GetModuleHandleA("kernel32.dll") orelse {
+        if (state.log) |logger| logger.err("Failed to get kernel32.dll handle", .{});
+        return;
+    };
+    const exit_proc_addr = win32.GetProcAddress(kernel32, "ExitProcess") orelse {
+        if (state.log) |logger| logger.err("Failed to find ExitProcess address", .{});
+        return;
+    };
+    const exit_process_ptr: [*]u8 = @ptrCast(exit_proc_addr);
+
+    // Save original bytes
+    @memcpy(&original_exit_process_bytes, exit_process_ptr[0..5]);
+
+    // Calculate relative jump offset: rel32 = target - (source + 5)
+    const source: u32 = @intCast(@intFromPtr(exit_proc_addr));
+    const target: u32 = @intCast(@intFromPtr(&hookedExitProcess));
+    const offset = target -% (source +% 5);
+
+    var patch_bytes: [5]u8 = undefined;
+    patch_bytes[0] = 0xE9; // JMP rel32
+    std.mem.writeInt(u32, patch_bytes[1..5], offset, .little);
+
+    // Write the patch
+    var old: u32 = 0;
+    const k32 = struct {
+        extern "kernel32" fn VirtualProtect(lpAddress: ?*anyopaque, dwSize: usize, flNewProtect: u32, lpflOldProtect: *u32) callconv(.winapi) i32;
+        extern "kernel32" fn FlushInstructionCache(hProcess: ?*anyopaque, lpBaseAddress: ?*const anyopaque, dwSize: usize) callconv(.winapi) i32;
+    };
+    _ = k32.VirtualProtect(exit_process_ptr, 5, 0x40, &old);
+    @memcpy(exit_process_ptr[0..5], &patch_bytes);
+    _ = k32.VirtualProtect(exit_process_ptr, 5, old, &old);
+    _ = k32.FlushInstructionCache(null, exit_process_ptr, 5);
+
+    exit_process_hooked = true;
+    if (state.log) |logger| logger.info("ExitProcess hook installed dynamically in kernel32.dll", .{});
+}
+
 fn connectPipe() void {
     if (state.log == null) return;
     const name = resolvePipeName();
@@ -467,6 +550,7 @@ fn applyPostLoadHacks() void {
             state.log.?.info("Stage animations disabled (rollback mode)", .{});
         }
     }
+    installExitProcessHook();
 }
 
 fn initSdlOnMainThread() void {

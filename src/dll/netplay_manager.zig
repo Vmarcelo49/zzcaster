@@ -693,6 +693,14 @@ pub const NetplayManager = struct {
         enet.enet_deinitialize();
     }
 
+    pub fn gracefulDisconnect(self: *NetplayManager) void {
+        if (self.enet_peer != null) {
+            self.log.info("Sending graceful disconnect to peer...", .{});
+            enet.enet_peer_disconnect(self.enet_peer, 0);
+            enet.enet_host_flush(self.enet_host);
+        }
+    }
+
     pub fn configure(self: *NetplayManager, cfg: NetplayConfig) void {
         self.config = cfg;
         self.min_rollback_spacing = if (cfg.rollback > 0) @max(@min(cfg.rollback, 4), 2) else 2;

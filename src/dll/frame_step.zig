@@ -7,6 +7,7 @@ const netman = @import("netplay_manager.zig");
 const keyboard = @import("keyboard.zig");
 const gamepad = @import("gamepad.zig");
 const state = @import("dll_state.zig");
+const builtin = @import("builtin");
 
 pub fn frameStepInGame(world_timer: u32, game_mode: u32) void {
     state.skip_frames_addr.* = 0;
@@ -218,6 +219,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             // throttles re-sends to ~300ms intervals inside this loop.
             n.syncRngState();
 
+            // Pump Windows messages to keep the window responsive and prevent OS hang detection
+            if (builtin.os.tag == .windows) {
+                var msg: win32.MSG = undefined;
+                while (win32.PeekMessageA(&msg, null, 0, 0, 1) != 0) {
+                    _ = win32.TranslateMessage(&msg);
+                    _ = win32.DispatchMessageA(&msg);
+                }
+            }
+
             if (n.was_connected and !n.enet_connected) {
                 state.log.?.err("Peer disconnected while waiting for input!", .{});
                 state.alive_flag_addr.* = 0;
@@ -238,27 +248,29 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
                 warned = true;
             }
 
-            // TIMEOUT: 10s after the remote peer reached our transition index
-            // without sending any inputs for the current frame. This matches
-            // CCCaster's MAX_WAIT_INPUTS_INTERVAL (10s).
-            //
-            // This timeout ONLY fires when the remote has confirmed it reached
-            // our index (via TransitionIndex → resizeOuter) but hasn't sent any
-            // PlayerInputs for this frame. That indicates a real problem:
-            //   - The remote's game crashed after entering InGame
-            //   - Severe packet loss preventing PlayerInputs from arriving
-            //   - The remote is stuck in a bad state
-            //
-            // If the remote is STILL LOADING (remote_end_index < local_index),
-            // this timeout does NOT fire — we keep waiting. The slower peer
-            // will eventually finish loading, send TransitionIndex for InGame,
-            // and then the 10s countdown begins.
-            if (remote_at_index_since != 0 and now - remote_at_index_since > 30000) {
-                state.log.?.err("Timed out waiting for remote input (30s after remote reached index {d}) — forcing exit", .{
-                    n.indexed_frame.index,
-                });
-                state.alive_flag_addr.* = 0;
-                return;
+            // TIMEOUT: 10s during active gameplay, 30s during loading screens.
+            // Helps prevent indefinite freezes when the remote peer crashes/terminates
+            // without sending a disconnect packet, while still allowing generous load times.
+            const is_in_game_active = (n.state == .in_game and n.indexed_frame.frame > 0);
+            const timeout_limit: i64 = if (is_in_game_active) 10000 else 30000;
+
+            if (is_in_game_active) {
+                if (now - wait_start > timeout_limit) {
+                    state.log.?.err("Timed out waiting for remote input ({}s elapsed in-game) — forcing exit", .{
+                        @divTrunc(timeout_limit, 1000),
+                    });
+                    state.alive_flag_addr.* = 0;
+                    return;
+                }
+            } else {
+                if (remote_at_index_since != 0 and now - remote_at_index_since > timeout_limit) {
+                    state.log.?.err("Timed out waiting for remote input ({}s after remote reached index {d}) — forcing exit", .{
+                        @divTrunc(timeout_limit, 1000),
+                        n.indexed_frame.index,
+                    });
+                    state.alive_flag_addr.* = 0;
+                    return;
+                }
             }
 
             // If the lazy reconnect gave up (connect_attempts_exhausted) and
@@ -392,3 +404,26 @@ comptime {
 // in chara-select/menus a 9AB press means nothing and would just corrupt
 // menu navigation if rewritten.
 const mode_in_game: u32 = 1;
+
+const win32 = struct {
+    const HWND = ?*anyopaque;
+    const UINT = u32;
+    const WPARAM = usize;
+    const LPARAM = usize;
+    const POINT = struct {
+        x: i32,
+        y: i32,
+    };
+    const MSG = struct {
+        hwnd: HWND,
+        message: UINT,
+        wParam: WPARAM,
+        lParam: LPARAM,
+        time: u32,
+        pt: POINT,
+    };
+
+    extern "user32" fn PeekMessageA(lpMsg: *MSG, hWnd: HWND, wMsgFilterMin: UINT, wMsgFilterMax: UINT, wRemoveMsg: UINT) callconv(.winapi) i32;
+    extern "user32" fn TranslateMessage(lpMsg: *const MSG) callconv(.winapi) i32;
+    extern "user32" fn DispatchMessageA(lpMsg: *const MSG) callconv(.winapi) isize;
+};

@@ -142,7 +142,11 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     }
 
     if (n.was_connected and !n.enet_connected and n.config.is_netplay) {
-        state.log.?.err("Peer disconnected during game!", .{});
+        if (n.version_mismatch) {
+            state.log.?.err("Protocol version mismatch — force-exiting", .{});
+        } else {
+            state.log.?.err("Peer disconnected during game!", .{});
+        }
         state.alive_flag_addr.* = 0; // force exit
         return;
     }

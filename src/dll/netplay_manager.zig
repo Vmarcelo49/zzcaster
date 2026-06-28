@@ -146,6 +146,10 @@ const pre_game_intro_frames: u32 = 224;
 /// have at least `rollback` states to re-simulate from.
 const rollback_min_frame_delay: u32 = 8;
 
+// Protocol version for compatibility checking. Increment when the wire format
+// or rollback state layout changes. Both peers must have the same version.
+const protocol_version: u32 = 2;
+
 // Game modes
 const mode_startup: u32 = 65535;
 const mode_opening: u32 = 3;
@@ -548,6 +552,10 @@ pub const NetplayManager = struct {
     /// Reset to false on new match chara_select.
     first_in_game_completed: bool = false,
 
+    // Version handshake state
+    version_confirmed: bool = false,
+    version_mismatch: bool = false,
+
     // Host-side cache of the RNG state captured for each transition index.
     // Populated by `syncRngState` when the host captures+sends RNG to the
     // client. Looked up by `getCachedRngState` so the SpectatorManager can
@@ -938,6 +946,13 @@ pub const NetplayManager = struct {
                 } else if (self.spectators != null) {
                     self.spectators.?.onNewPeer(peer_opt, std.Io.Clock.now(.real, self.io).toMilliseconds());
                 }
+
+                // Send version config for compatibility check immediately
+                // after connect. If versions don't match, we'll disconnect.
+                if (self.enet_connected and !self.config.is_spectator) {
+                    self.sendVersionConfig();
+                }
+
                 return null;
             },
             else => return null,
@@ -973,6 +988,27 @@ pub const NetplayManager = struct {
             0x20 => { // BothInputs (spectator broadcast from host)
                 if (self.config.is_spectator) {
                     self.applyBothInputsPacket(msg[1..]);
+                }
+            },
+            0x07 => { // VersionConfig — version compatibility check
+                if (msg.len >= 5) {
+                    const remote_ver = std.mem.readInt(u32, msg[1..5], .little);
+                    if (remote_ver != protocol_version) {
+                        self.log.err("Protocol version mismatch: local={d} remote={d} — disconnecting", .{
+                            protocol_version, remote_ver,
+                        });
+                        self.enet_connected = false;
+                        self.version_mismatch = true;
+                    } else {
+                        self.log.info("Protocol version match: {d}", .{protocol_version});
+                        self.version_confirmed = true;
+                    }
+                }
+            },
+            0x06 => { // ErrorMessage — peer reports an error before disconnect
+                if (msg.len >= 2) {
+                    const err_len = @min(msg.len - 1, 128);
+                    self.log.err("Remote error: {s}", .{msg[1 .. 1 + err_len]});
                 }
             },
             else => {
@@ -1197,7 +1233,13 @@ pub const NetplayManager = struct {
                         return 0; // suprime input
                     }
                 }
-                // Real input — game logic handles filtering.
+                // Real input. In netplay, strip the Start button to prevent
+                // pausing — pausing halts the game loop while the remote peer
+                // keeps simulating, causing an instant desync. Matches CCCaster
+                // (DllNetplayManager.cpp:240-265: input &= ~CC_BUTTON_START).
+                if (self.config.is_netplay and !self.config.is_spectator) {
+                    return raw_input & ~(button_start << 4); // strip Start
+                }
                 return raw_input;
             },
         }
@@ -1561,6 +1603,29 @@ pub const NetplayManager = struct {
         std.mem.writeInt(u32, buf[1..5], rng_index, .little);
         self.sendReliable(&buf);
         self.log.info("Sent RNG_ACK (index={d})", .{rng_index});
+    }
+
+    /// Send our protocol version to the peer for compatibility checking.
+    /// Called once when ENet connects. If versions don't match, disconnect.
+    pub fn sendVersionConfig(self: *NetplayManager) void {
+        if (self.enet_peer == null or !self.enet_connected) return;
+        if (self.version_confirmed or self.version_mismatch) return; // already sent
+        var buf: [5]u8 = undefined;
+        buf[0] = 0x07; // VersionConfig
+        std.mem.writeInt(u32, buf[1..5], protocol_version, .little);
+        self.sendReliable(&buf);
+        self.log.info("Sent VersionConfig (version={d})", .{protocol_version});
+    }
+
+    /// Send an error message to the peer before disconnecting, so the remote
+    /// knows WHY we disconnected. Matches CCCaster's ErrorMessage (Messages.hpp).
+    pub fn sendErrorMessage(self: *NetplayManager, message: []const u8) void {
+        if (self.enet_peer == null or !self.enet_connected) return;
+        var buf: [129]u8 = undefined;
+        buf[0] = 0x06; // ErrorMessage
+        const len = @min(message.len, 128);
+        @memcpy(buf[1 .. 1 + len], message[0..len]);
+        self.sendReliable(buf[0 .. 1 + len]);
     }
 
     /// Host: peer confirmed receipt of the RNG state. Flip rng_synced/rng_acked

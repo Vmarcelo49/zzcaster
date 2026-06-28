@@ -733,7 +733,7 @@ fn saveFpu(out: *SavedFpu) void {
 fn restoreFpu(env: *const SavedFpu) void {
     if (builtin.cpu.arch != .x86) return;
     var cw_buf: u16 = env.cw;
-    var mxcsr_buf: u32 = env.mxcsr & 0xFFC0; // mask status bits + reserved
+    var mxcsr_buf: u32 = env.mxcsr; // restore full MXCSR — matches CCCaster's fesetenv
     const cw_ptr: *const u16 = &cw_buf;
     const mxcsr_ptr: *const u32 = &mxcsr_buf;
     asm volatile ("fldcw (%[ptr])"

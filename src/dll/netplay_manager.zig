@@ -1250,41 +1250,41 @@ pub const NetplayManager = struct {
                 return 0;
             },
             .chara_intro => {
-                // Filter to Confirm/Cancel only — matches CCCaster's
-                // getSkippableInput (DllNetplayManager.cpp:158-179).
-                // checkRoundStart transitions to .in_game when round_start_counter
-                // fires (at intro_state==1, pre-game).
+                // ============================================================
+                // Suppress ALL inputs during chara_intro in netplay
+                // ============================================================
+                // MBAACC's chara_intro can be skipped by pressing Confirm.
+                // If one peer skips and the other watches the full intro,
+                // round_start_counter increments at different frames for
+                // each peer → both enter in_game at different frames →
+                // frame-0 state divergence → desync.
                 //
-                // CATCH-UP MASH GUARD (chara_intro):
-                // The catch-up mash (shouldCatchUp → button_confirm) skips the
-                // intro animation. This is ONLY safe if the remote peer has
-                // ALSO reached chara_intro (same index). If the remote is still
-                // in loading (behind our index), mashing Confirm would skip our
-                // intro while the remote watches the full intro → both peers
-                // enter in_game at different frames → frame-0 state divergence
-                // → RNG desync.
+                // CCCaster allows Confirm through during chara_intro
+                // (getSkippableInput returns raw_input & Confirm|Cancel),
+                // so CCCaster has the same bug. But CCCaster RELEASE doesn't
+                // detect desyncs (SyncHash handler is #ifndef RELEASE), so
+                // the divergence goes unnoticed.
                 //
-                // checkRoundStart already gates the chara_intro→in_game
-                // transition on remote_end_index > our_index, so the local peer
-                // won't transition to in_game before the remote catches up.
-                // But the catch-up mash itself would still skip the intro
-                // animation early, causing round_start_counter to increment at
-                // a different frame than the remote's.
+                // zzcaster detects desyncs, so we MUST prevent the divergence.
+                // The simplest correct fix: suppress ALL inputs during
+                // chara_intro. Both peers watch the full intro (a few seconds
+                // of character animation). The intro is deterministic — same
+                // animation, same length — so both peers reach "players can
+                // move" at the same relative frame. round_start_counter
+                // increments at the same frame for both. Both transition to
+                // in_game at the same frame.
                 //
-                // Fix: only mash Confirm if the remote has reached our index
-                // (i.e., remote_end_index > our_index). This ensures both peers
-                // are in chara_intro before either skips the intro.
-                if (self.shouldCatchUp()) {
-                    const remote_end_index = self.remote_inputs.getEndIndex();
-                    if (remote_end_index > self.indexed_frame.index) {
-                        // Remote is at or past our index — safe to skip intro.
-                        return button_confirm << 4;
-                    }
-                    // Remote is still behind (in loading) — don't skip intro yet.
-                    // Let the intro play normally; checkRoundStart will wait
-                    // for the remote before transitioning to in_game.
+                // This is a UX regression (can't skip intro) but correctness
+                // > convenience. A future improvement could sync the skip:
+                // when one peer presses Confirm, send a "skip intro" signal,
+                // and both skip at the same frame. That requires a new
+                // protocol message and is deferred for now.
+                //
+                // Spectators are exempt — they mash Confirm to fast-forward.
+                if (self.config.is_spectator) {
+                    return button_confirm << 4;
                 }
-                return raw_input & 0xC000; // Confirm + Cancel only
+                return 0;
             },
             .skippable => {
                 // If remote is ahead, mash Confirm to catch up.

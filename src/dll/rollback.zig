@@ -92,6 +92,44 @@ pub const InputBuffer = struct {
                         }
                         // else: new_index < lcf_index → stale, ignore.
                     }
+
+                    // ============================================================
+                    // BREAK after first misprediction (matches CCCaster)
+                    // ============================================================
+                    // CCCaster's InputsContainer::set (InputsContainer.hpp:73-81)
+                    // does `break` after detecting the first changed input in
+                    // a batch. zzcaster was continuing to check all remaining
+                    // frames in the batch, which could detect additional
+                    // mispredictions at later frames and overwrite lcf with a
+                    // LATER frame (defeating the "earliest frame" logic).
+                    //
+                    // The break is correct because:
+                    // 1. Once a misprediction is found at frame F, rollback
+                    //    will target frame F and re-simulate from there. Any
+                    //    mispredictions at frames F+1, F+2, ... will be
+                    //    naturally corrected by the re-run (the re-run uses
+                    //    the corrected inputs from the remote).
+                    // 2. Recording a later misprediction would cause rollback
+                    //    to target a later frame, leaving the earlier
+                    //    misprediction uncorrected.
+                    //
+                    // We still need to store the remaining inputs (the loop
+                    // continues to the put/updateMeta calls below) — we only
+                    // break out of the check_changes logic.
+                    //
+                    // After storing this frame's input, skip check_changes
+                    // for the rest of the batch.
+                    self.inputs.put(key, input) catch {};
+                    self.updateMeta(index, frame, input);
+
+                    // Store remaining inputs WITHOUT check_changes.
+                    for (inputs[i + 1 ..], i + 1..) |later_input, j| {
+                        const later_frame = start_frame + @as(u32, @intCast(j));
+                        const later_key = makeKey(index, later_frame);
+                        self.inputs.put(later_key, later_input) catch {};
+                        self.updateMeta(index, later_frame, later_input);
+                    }
+                    return;
                 }
             }
             self.inputs.put(key, input) catch {};

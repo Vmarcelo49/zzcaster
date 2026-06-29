@@ -2412,6 +2412,56 @@ pub const NetplayManager = struct {
             return false;
         }
 
+        // ============================================================
+        // Frame-0 misprediction suppression (zzcaster addition)
+        // ============================================================
+        // CCCaster does NOT have this guard — it would roll back to frame 0
+        // if lcf_frame == 0. However, CCCaster in RELEASE build does not
+        // detect desyncs at all (SyncHash handler is #ifndef RELEASE), so
+        // even if a frame-0 rollback caused divergence, CCCaster wouldn't
+        // report it.
+        //
+        // WHY WE SUPPRESS FRAME-0 ROLLBACKS:
+        //
+        // The state at frame 0 of in_game is the state captured at the
+        // chara_intro → in_game transition. Even with the race fix (commit
+        // 5a5c13c, hijackIntroState applied before waitForConfig), the
+        // absolute world_timer at the transition may differ slightly
+        // between peers. The saved state for frame 0 may therefore carry
+        // a slightly divergent state.
+        //
+        // Rolling back to frame 0 loads this potentially-divergent state
+        // and re-simulates from it, which can cause RNG divergence (the
+        // determinism root). This was observed in online testing:
+        //   - Rollback to frame 0 → re-run → RNG hash mismatch at frame 149
+        //   - Subsequent rollbacks fall back to frame 0 (state pool erosion)
+        //   - Divergence accumulates with each frame-0 reload
+        //
+        // Additionally, frame-0 mispredictions are often FALSE POSITIVES
+        // caused by InputBuffer.get's cross-index fallback: when the local
+        // peer reads remote input for frame 0 of a new index, get() falls
+        // back to last_inputs from the previous index (e.g. chara_intro
+        // inputs). If the player was holding a button during chara_intro,
+        // the stale fallback differs from the actual frame-0 remote input
+        // (which is typically 0 or neutral), triggering a false misprediction.
+        //
+        // SUPPRESSION STRATEGY:
+        //   - Clear lcf (so the false misprediction doesn't persist)
+        //   - Apply the remote input (it's already stored in the buffer)
+        //   - Do NOT rollback (avoid loading a potentially-divergent state)
+        //   - Log for observability
+        //
+        // This is a targeted fix for the frame-0 case only. Rollbacks to
+        // frame 1+ are allowed (they load states captured after the
+        // transition, which should be deterministic).
+        if (lcf_frame == 0) {
+            self.log.info("ROLLBACK to frame 0 SUPPRESSED — clearing lcf (false misprediction or divergent state risk). current frame={d}", .{
+                self.indexed_frame.frame,
+            });
+            self.remote_inputs.clearLastChanged();
+            return false;
+        }
+
         // Guard disabled (default, matches CCCaster): log early-frame
         // rollbacks so we can detect if the frame-0 state divergence
         // returns. If these log lines appear followed by a desync, the

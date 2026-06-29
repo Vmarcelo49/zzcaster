@@ -620,7 +620,28 @@ pub const StatePool = struct {
             loadEffectsPtrData(src[pos..]);
         }
 
-        // Free all states after this one (they're invalidated)
+        // Free all states after this one (they're invalidated by the rollback).
+        // This is correct behavior — states after the loaded frame were saved
+        // with predicted (possibly wrong) inputs and must not be reused.
+        //
+        // WARNING: This means rolling back to an early frame (e.g. frame 0)
+        // erases ALL subsequent states. The re-run does NOT save intermediate
+        // states (matching CCCaster). So after a rollback to frame 0, the pool
+        // only has [frame_0, frame_at_rerun_end]. A second rollback targeting
+        // a frame between them will fall back to frame 0.
+        //
+        // The root cause of state pool erosion is false mispredictions at early
+        // frames (e.g. frame 0), which trigger unnecessary rollbacks. Fixing
+        // InputBuffer.get's cross-index fallback (which causes these false
+        // mispredictions) is the proper solution.
+        if (self.saved_states.items.len > slot + 1) {
+            const erased = self.saved_states.items.len - slot - 1;
+            if (erased > 5) {
+                // Log when a large number of states are erased — this indicates
+                // a rollback to an early frame, which erodes the pool.
+                std.log.warn("StatePool: erasing {d} states after slot {d} (frame {d}) — pool erosion risk", .{ erased, slot, self.saved_states.items[slot].frame });
+            }
+        }
         while (self.saved_states.items.len > slot + 1) {
             const removed = self.saved_states.pop() orelse break;
             // Return slot to free stack

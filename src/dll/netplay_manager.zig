@@ -2468,20 +2468,22 @@ pub const NetplayManager = struct {
         return self.fast_fwd_stop_frame != 0;
     }
 
-    /// Force CC_INTRO_STATE_ADDR to 0 during a rollback re-run that has
-    /// advanced past the pre-game intro window (CC_PRE_GAME_INTRO_FRAMES).
-    /// Ported from DllMain.cpp:975-976:
-    ///   if ( isInRollback() && getFrame() > CC_PRE_GAME_INTRO_FRAMES
-    ///                            && *CC_INTRO_STATE_ADDR )
-    ///       *CC_INTRO_STATE_ADDR = 0;
+    /// Force CC_INTRO_STATE_ADDR to 0 after the pre-game intro window.
     ///
-    /// A loaded state from before the intro finished may carry a non-zero
-    /// intro flag; re-running that state would re-trigger intro-only logic
-    /// (e.g. the guard-bar masking in readCharaHash) and desync the re-run.
-    /// Clearing it once we're past frame 224 keeps the re-run on the
-    /// gameplay path.
+    /// hijackIntroState (applied in all netplay modes) disables the game's
+    /// natural intro_state 1→0 progression. Without this manual clear,
+    /// intro_state stays at 1 forever → game stuck in pre-game (can move
+    /// but cannot attack).
+    ///
+    /// In rollback mode, this also clears intro_state loaded from a saved
+    /// state that was captured before the intro finished — re-running that
+    /// state would re-trigger intro-only logic and desync.
+    ///
+    /// Runs in ALL netplay player modes (delay + rollback), because
+    /// hijackIntroState is applied in all netplay player modes.
     pub fn clearIntroStateDuringRollback(self: *NetplayManager) void {
-        if (!self.isInRollback()) return;
+        if (!self.config.is_netplay or self.config.is_spectator) return;
+        if (self.state != .in_game) return;
         if (self.indexed_frame.frame <= pre_game_intro_frames) return;
         if (intro_state_addr.* == 0) return;
         intro_state_addr.* = 0;

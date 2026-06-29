@@ -303,6 +303,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
                 return;
             }
         }
+
+        // We blocked inside the wait loop for at least one pollAndDispatch
+        // (10ms) iteration. Tell the frame limiter to reset its qpc_prev
+        // baseline to "now" so the next frame is timed from the
+        // post-lockstep moment rather than from the pre-lockstep previous
+        // frame — this prevents the limiter's internal clock from drifting
+        // against the wall clock by the (variable) lockstep pause duration.
+        // See dll_state.frame_limiter_needs_reset for the full rationale.
+        state.frame_limiter_needs_reset = true;
     }
 
     if (n.checkRollback()) {

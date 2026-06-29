@@ -125,7 +125,15 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
     //
     // Only applies during in_game (not during loading/menus) and not during
     // a rollback re-run (we're catching up, not slowing down).
-    if (n.state == .in_game and !n.isRerunning()) {
+    //
+    // SKIP during chara_intro/skippable/retry_menu: those states have
+    // inputs suppressed and the per-frame lockstep in isRemoteInputReady
+    // already gates frame advancement. Adding cooperative sleep here
+    // injects extra latency that interacts badly with the lockstep wait
+    // and has been linked to the small-drift desync (RNG matches but
+    // camera/P1.x diverge by ~161/250 units at frame 149). See
+    // docs/cccaster-vs-zzcaster-diffs.md "Próxima investigação".
+    if (n.state == .in_game and !n.isRerunning() and !n.isInAnimationState()) {
         const sleep_ms = n.recommendPerFrameSleepMs();
         if (sleep_ms > 0) {
             std.Io.sleep(state.app_io_backend.io(), .{

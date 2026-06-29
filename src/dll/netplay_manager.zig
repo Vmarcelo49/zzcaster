@@ -2598,6 +2598,23 @@ pub const NetplayManager = struct {
         return self.fast_fwd_stop_frame != 0;
     }
 
+    /// Returns true when the FSM is in a "deterministic animation" state
+    /// where inputs are suppressed and the game's progression is purely
+    /// time-driven (chara_intro, skippable, retry_menu). In these states
+    /// there is no input-prediction / rollback happening, and both peers
+    /// are gated by the per-frame lockstep in isRemoteInputReady — so
+    /// time-sync machinery (cooperative sleep, RTT EMA, frame limiter
+    /// compensation) does not need to run, and running it adds timing
+    /// variability that has been linked to the small-drift desync
+    /// documented in docs/rollback-desync-investigation.md and
+    /// docs/cccaster-vs-zzcaster-diffs.md.
+    pub fn isInAnimationState(self: *const NetplayManager) bool {
+        return switch (self.state) {
+            .chara_intro, .skippable, .retry_menu => true,
+            else => false,
+        };
+    }
+
     /// Force CC_INTRO_STATE_ADDR to 0 after the pre-game intro window.
     ///
     /// hijackIntroState (applied in all netplay modes) disables the game's

@@ -1428,13 +1428,25 @@ pub const NetplayManager = struct {
         // peers then watch the intro from the same starting point and
         // reach "players can move" at the same relative frame.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .retry_menu => return true,
-            .chara_intro, .skippable => {
+            .pre_initial, .initial, .loading => return true,
+            .chara_intro, .skippable, .retry_menu => {
                 // Block until remote reaches our transition index.
-                // This prevents the fast peer from advancing the intro /
-                // victory-screen animation frames while the slow peer is
-                // still in the previous state. Same reasoning for both —
-                // see the chara_intro comment above.
+                // This prevents the fast peer from advancing animation/menu
+                // frames while the slow peer is still in the previous state.
+                //
+                // chara_intro: intro animation (round 1 start)
+                // skippable: victory screen (inter-round)
+                // retry_menu: post-match "Rematch / Character Select" screen
+                //
+                // All three have skip/advance mechanics that desync if peers
+                // are at different points. The lockstep block freezes the
+                // local game loop until the remote catches up, ensuring both
+                // peers enter the state at the same time.
+                //
+                // For retry_menu, the existing retry_menu_waiting_for_peer
+                // gate (in getNetplayInput) provides a secondary input-level
+                // suppression with a 10s safety timeout. The lockstep block
+                // here is the primary mechanism; the gate is a fallback.
                 if (self.config.is_netplay and !self.config.is_spectator) {
                     const remote_end_index = self.remote_inputs.getEndIndex();
                     if (remote_end_index <= self.indexed_frame.index) {

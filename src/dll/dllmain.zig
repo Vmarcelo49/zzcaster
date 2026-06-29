@@ -534,20 +534,35 @@ fn applyPostLoadHacks() void {
             is_netplay = false;
         };
 
-        // Rollback-specific ASM hacks (ported from CCCaster DllMain.cpp:1896-1907).
+        // Netplay ASM hacks (ported from CCCaster DllMain.cpp:1896-1907).
         // hijackIntroState disables the game's natural intro_state 1→0 progression
-        // so we can manually control it during rollback. Required for the
-        // chara_intro → in_game transition to fire at pre-game (intro_state==1)
-        // instead of at "Fight!" (intro_state==0) — which eliminates the huge
-        // rollback at the start of gameplay.
-        if (state.nm.?.config.rollback > 0) {
+        // so we can manually control the chara_intro → in_game transition.
+        //
+        // REQUIRED IN ALL NETPLAY MODES, not just rollback. Without it, the
+        // transition fires at "Fight!" (intro_state==0) on each peer at whatever
+        // frame that peer's intro animation happened to reach. Because loading
+        // time + intro playback differ between peers, the in_game frame 0
+        // state diverges: characters start at different positions on each side.
+        //
+        // In rollback mode, the divergence is corrected by re-simulating from
+        // a saved state. In delay-based mode there is no correction — the
+        // offset bakes in at frame 0 and persists until the sync-hash check
+        // catches it (~150 frames in), manifesting as a camera_x / chara.x
+        // desync with matching RNG.
+        //
+        // Verified empirically: desync log from a delay=1 rollback=0 online
+        // match showed camera_x=-7775 vs -8050, P1.x=-31934 vs -32484
+        // (constant offset, RNG hash matched) at indexed_frame=0x400000095.
+        // The offset was present from frame 0 — i.e. the transition timing
+        // asymmetry, not a per-frame simulation divergence.
+        if (state.nm.?.config.is_netplay and !state.nm.?.config.is_spectator) {
             asm_hacks.applyHijackIntroState();
             // Disable stage animations — matches CCCaster (DllMain.cpp:1902-1906).
             // Stage animations can use non-deterministic data (wall-clock timing,
             // different RNG draws), causing position drift between peers during
             // pre-game. CC_STAGE_ANIMATION_OFF_ADDR = 0x554124.
             stage_animation_off_addr.* = 1;
-            state.log.?.info("Stage animations disabled (rollback mode)", .{});
+            state.log.?.info("Stage animations disabled (netplay mode)", .{});
         }
     }
     installExitProcessHook();

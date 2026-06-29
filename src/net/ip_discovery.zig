@@ -1,4 +1,5 @@
 const std = @import("std");
+const ws2_32 = @import("ws2_32.zig");
 
 // ============================================================================
 // IP address discovery — used by the launcher's "Host Game" screen so the
@@ -31,19 +32,6 @@ const wininet = struct {
 
     const OPEN_TYPE_PRECONFIG: u32 = 0;
     const FLAG_RELOAD: u32 = 0x80000000;
-};
-
-const ws2_32 = struct {
-    extern "ws2_32" fn gethostname(name: [*]u8, namelen: c_int) callconv(.winapi) c_int;
-    extern "ws2_32" fn gethostbyname(name: [*:0]const u8) callconv(.winapi) ?*Hostent;
-
-    const Hostent = extern struct {
-        h_name: ?[*:0]const u8,
-        h_aliases: ?[*]?[*:0]const u8,
-        h_addrtype: i16,
-        h_length: i16,
-        h_addr_list: ?[*]?[*]u8,
-    };
 };
 
 /// Look up the machine's public IP via a small HTTP GET (api.ipify.org).

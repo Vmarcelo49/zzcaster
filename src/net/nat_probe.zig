@@ -34,78 +34,7 @@ const relay_config = @import("relay_config.zig");
 // ws2_32 bindings — minimal subset for UDP probing.
 // ============================================================================
 
-const ws2_32 = struct {
-    extern "ws2_32" fn WSAStartup(wVersionRequested: u16, lpWSAData: *WSAData) callconv(.winapi) c_int;
-    extern "ws2_32" fn WSACleanup() callconv(.winapi) c_int;
-    extern "ws2_32" fn socket(af: c_int, sock_type: c_int, protocol: c_int) callconv(.winapi) c_int;
-    extern "ws2_32" fn closesocket(s: c_int) callconv(.winapi) c_int;
-    extern "ws2_32" fn sendto(
-        s: c_int,
-        buf: [*]const u8,
-        len: c_int,
-        flags: c_int,
-        to: ?*const sockaddr_in,
-        tolen: c_int,
-    ) callconv(.winapi) c_int;
-    extern "ws2_32" fn recvfrom(
-        s: c_int,
-        buf: [*]u8,
-        len: c_int,
-        flags: c_int,
-        from: ?*sockaddr_in,
-        fromlen: ?*c_int,
-    ) callconv(.winapi) c_int;
-    extern "ws2_32" fn bind(
-        s: c_int,
-        addr: ?*const sockaddr_in,
-        namelen: c_int,
-    ) callconv(.winapi) c_int;
-    extern "ws2_32" fn getsockname(
-        s: c_int,
-        name: ?*sockaddr_in,
-        namelen: ?*c_int,
-    ) callconv(.winapi) c_int;
-    extern "ws2_32" fn setsockopt(
-        s: c_int,
-        level: c_int,
-        optname: c_int,
-        optval: [*]const u8,
-        optlen: c_int,
-    ) callconv(.winapi) c_int;
-    extern "ws2_32" fn inet_addr(cp: ?[*:0]const u8) callconv(.winapi) u32;
-    extern "ws2_32" fn gethostbyname(name: [*:0]const u8) callconv(.winapi) ?*hostent;
-
-    const WSAData = extern struct {
-        wVersion: u16,
-        wHighVersion: u16,
-        szDescription: [257]u8,
-        szSystemStatus: [129]u8,
-        iMaxSockets: u16,
-        iMaxUdpDg: u16,
-        lpVendorInfo: ?*u8,
-    };
-
-    const hostent = extern struct {
-        h_name: ?[*:0]const u8,
-        h_aliases: ?[*]?[*:0]const u8,
-        h_addrtype: i16,
-        h_length: i16,
-        h_addr_list: ?[*]?[*]u8,
-    };
-
-    const AF_INET: c_int = 2;
-    const SOCK_DGRAM: c_int = 2;
-    const SOL_SOCKET: c_int = 0xFFFF;
-    const SO_REUSEADDR: c_int = 0x0004;
-    const SO_RCVTIMEO: c_int = 0x1006;
-
-    const sockaddr_in = extern struct {
-        family: u16 = AF_INET,
-        port: u16 = 0, // network byte order
-        addr: u32 = 0, // network byte order
-        zero: [8]u8 = [_]u8{0} ** 8,
-    };
-};
+const ws2_32 = @import("ws2_32.zig");
 
 // ============================================================================
 // NAT types
@@ -268,32 +197,19 @@ fn sendProbe(fd: c_int, dest_ip_nbo: u32, dest_port: u16) ?protocol.StunReply {
 // ============================================================================
 // WSAStartup / cleanup
 // ============================================================================
+//
+// initWinsock() / deinitWinsock() live in the shared ws2_32 module. They are
+// re-exported here as `pub const` so existing callers that imported
+// `nat_probe.initWinsock` continue to work, and so that `detectNatType`
+// remains callable standalone (with the documented precondition that the
+// caller has called initWinsock first).
+//
+// Only the launcher's main() actually calls initWinsock — the DLL goes
+// through ENet, which calls WSAStartup internally.
 
-/// Initialize Winsock. Must be called once at app start before any
-/// ws2_32 socket operations.
-///
-/// Returns true on success. Safe to call multiple times — Winsock
-/// itself refcounts internally, so extra calls are no-ops as long as
-/// WSACleanup is called the same number of times.
-///
-/// In zzcaster, this is called from the launcher's main() before any
-/// networking starts. The DLL (hook.dll) calls ENet's enet_initialize
-/// which itself calls WSAStartup, so the DLL doesn't need to call this.
-pub fn initWinsock() bool {
-    var wsa_data: ws2_32.WSAData = undefined;
-    // Request version 2.2.
-    const version_req: u16 = 0x0202;
-    if (ws2_32.WSAStartup(version_req, &wsa_data) != 0) {
-        return false;
-    }
-    return true;
-}
+pub const initWinsock = ws2_32.initWinsock;
+pub const deinitWinsock = ws2_32.deinitWinsock;
 
-/// Cleanup Winsock. Must be called once at app shutdown, paired with
-/// each successful initWinsock() call.
-pub fn deinitWinsock() void {
-    _ = ws2_32.WSACleanup();
-}
 
 // ============================================================================
 // Public API — detect NAT type

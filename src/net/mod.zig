@@ -1,4 +1,5 @@
 // Net module — network transport shared by launcher and DLL.
+pub const ws2_32 = @import("ws2_32.zig");
 pub const enet_transport = @import("enet_transport.zig");
 pub const ip_discovery = @import("ip_discovery.zig");
 pub const relay_protocol = @import("relay_protocol.zig");

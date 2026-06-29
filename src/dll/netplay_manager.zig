@@ -1428,44 +1428,38 @@ pub const NetplayManager = struct {
         // peers then watch the intro from the same starting point and
         // reach "players can move" at the same relative frame.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .retry_menu => return true,
-            .chara_intro, .skippable => {
-                // Block until remote reaches our transition index.
-                // This prevents the fast peer from advancing the intro /
-                // victory-screen animation frames while the slow peer is
-                // still in the previous state.
-                //
-                // NOTE: We use INDEX-based blocking (not per-frame lockstep)
-                // for chara_intro and skippable. Per-frame lockstep was tried
-                // (commit d6a93b6) but caused a regression: the per-frame
-                // network round-trip during animation frames introduced timing
-                // drift that caused small position divergences over ~150
-                // frames (observed with delay=2: camera_x Δ161, P1.x Δ250 at
-                // frame 149, RNG matching).
-                //
-                // Index-based blocking is sufficient for the intro/victory
-                // desync because:
-                // 1. Inputs are suppressed (return 0) during these states —
-                //    there's no input-based divergence to correct.
-                // 2. The animation is deterministic — both peers play the
-                //    same frames at the same rate (60fps, enforced by
-                //    limitFrameRate).
-                // 3. The only risk is one peer STARTING the animation before
-                //    the other, which index-based blocking prevents.
-                //
-                // The second-match desync (after rematch) that prompted the
-                // per-frame lockstep attempt needs a different fix — likely
-                // state reset on rematch (last_round_start, intro_rng_enabled,
-                // etc.) rather than tighter lockstep.
-                if (self.config.is_netplay and !self.config.is_spectator) {
-                    const remote_end_index = self.remote_inputs.getEndIndex();
-                    if (remote_end_index <= self.indexed_frame.index) {
-                        return false;
-                    }
-                }
-                return true;
-            },
-            .chara_select, .in_game => {},
+            .pre_initial, .initial, .loading => return true,
+            // chara_intro, skippable, retry_menu, chara_select, and in_game
+            // all use the per-frame lockstep logic below (fall through to the
+            // generic check that verifies remote has sent input for the
+            // current frame).
+            //
+            // Originally tried index-based blocking for chara_intro/skippable
+            // (commits 0e4760c, 0dc28ab, e4a8ba5), then per-frame lockstep
+            // (commit d6a93b6), then reverted to index-based (commit d1899e8),
+            // then reverted back to per-frame lockstep (this commit).
+            //
+            // The revert to index-based (d1899e8) was a mistake. Diagnostic
+            // logs showed the remote was 30 frames ahead at the start of
+            // chara_intro (remote_end_frame=30 while local frame=0). With
+            // index-based blocking, the local peer advanced freely because
+            // remote_end_index (4) > our_index (3), even though the remote
+            // was 30 frames ahead in the animation. Both peers reached
+            // "players can move" at different frames → massive divergence
+            // (camera Δ19613, P1.x Δ45227, RNG mismatch).
+            //
+            // Per-frame lockstep (d6a93b6) had a minor regression: small
+            // position drift over ~150 frames (camera Δ161, P1.x Δ250) with
+            // RNG matching. This is MUCH better than the massive divergence
+            // from index-based blocking. The small drift needs separate
+            // investigation (possibly the cooperative sleep / RTT EMA
+            // interacting with the lockstep during animation).
+            //
+            // The per-frame check (getEndFrame(our_index) > our_frame)
+            // guarantees the remote has actually advanced to our frame, not
+            // just reached our index. Both peers advance one frame at a time,
+            // each waiting for the other's input before proceeding.
+            .chara_intro, .skippable, .retry_menu, .chara_select, .in_game => {},
         }
 
         if (!self.config.is_netplay or self.config.is_spectator) return true;

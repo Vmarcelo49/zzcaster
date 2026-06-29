@@ -241,3 +241,46 @@ Próximos passos:
 1. Analisar os logs diagnósticos (commit `6495b94`) para confirmar se `world_timer` difere na transição para `chara_intro`
 2. Se confirmado, investigar uma abordagem híbrida: lockstep index-based para prevenir avance prematuro, mas com sincronização de frame 0 garantida
 3. Considerar portar `numLoadedColors` para melhor sincronização de loading
+
+---
+
+## Atualização: logs diagnósticos confirmaram a causa
+
+Após testar com os logs `DIAG:` (commit `6495b94`), os dados confirmaram a hipótese:
+
+```
+DIAG: transition to chara_intro at world_timer=1068 (index=3)
+DIAG: lockstep passed for chara_intro (frame=0, index=3, remote_end_frame=30)
+DIAG: lockstep passed for chara_intro (frame=1, index=3, remote_end_frame=30)
+...
+DIAG: lockstep passed for chara_intro (frame=29, index=3, remote_end_frame=31)
+```
+
+O remote estava **30 frames à frente** desde o frame 0 do chara_intro. O remote entrou em chara_intro 30 frames antes do host (loading mais rápido). Com lockstep index-based, o host avançava livremente porque `remote_end_index (4) > our_index (3)`, mesmo com o remote 30 frames à frente na animação.
+
+Resultado: o remote atingiu "players can move" (frame ~247) e transicionou para in_game **30 frames antes do host**. O remote simulou 30 frames de in_game enquanto o host ainda estava em chara_intro. Quando o host finalmente transicionou, os game states eram completamente diferentes.
+
+### Comparação dos dois approaches
+
+| Lockstep | Desync | RNG | Magnitude |
+|---|---|---|---|
+| Index-based (commit d1899e8) | ✗ Massive | **Mismatch** | camera Δ19613, P1.x Δ45227 |
+| Per-frame (commit d6a93b6) | ✗ Small drift | **Match** | camera Δ161, P1.x Δ250 |
+
+O per-frame lockstep causa um desync **muito menor** com RNG batendo. O index-based causa divergência massiva com RNG corrompido. O per-frame é claramente melhor.
+
+### Decisão
+
+Revertido ao per-frame lockstep (este commit). O small drift é aceitável por enquanto — é muito melhor que a alternativa. O drift precisa de investigação separada (possivelmente o cooperative sleep / RTT EMA interagindo com o lockstep durante a animação).
+
+### Próxima investigação: o small drift do per-frame lockstep
+
+O per-frame lockstep causa um small drift (camera Δ161, P1.x Δ250) com RNG batendo. Possíveis causas:
+
+1. **Cooperative sleep** (`recommendPerFrameSleepMs` em `frame_step.zig:128-135`) — pode estar adicionando latência extra durante chara_intro/skippable, onde o jogo não precisa de time-sync (inputs são suprimidos)
+
+2. **RTT EMA** — alimentado por `updateRttEma` que roda durante chara_intro/skippable, pode estar com valores stale
+
+3. **Frame rate limiter** — o busy-wait pode se comportar diferente quando o lockstep pausa o frameStep
+
+Possível fix: desabilitar o cooperative sleep e o RTT EMA durante chara_intro/skippable (esses estados não precisam de time-sync porque inputs são suprimidos e a animação é determinística).

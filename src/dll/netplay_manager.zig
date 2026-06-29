@@ -1429,33 +1429,26 @@ pub const NetplayManager = struct {
         // reach "players can move" at the same relative frame.
         switch (self.state) {
             .pre_initial, .initial, .loading => return true,
-            .chara_intro, .skippable, .retry_menu => {
-                // Block until remote reaches our transition index.
-                // This prevents the fast peer from advancing animation/menu
-                // frames while the slow peer is still in the previous state.
-                //
-                // chara_intro: intro animation (round 1 start)
-                // skippable: victory screen (inter-round)
-                // retry_menu: post-match "Rematch / Character Select" screen
-                //
-                // All three have skip/advance mechanics that desync if peers
-                // are at different points. The lockstep block freezes the
-                // local game loop until the remote catches up, ensuring both
-                // peers enter the state at the same time.
-                //
-                // For retry_menu, the existing retry_menu_waiting_for_peer
-                // gate (in getNetplayInput) provides a secondary input-level
-                // suppression with a 10s safety timeout. The lockstep block
-                // here is the primary mechanism; the gate is a fallback.
-                if (self.config.is_netplay and !self.config.is_spectator) {
-                    const remote_end_index = self.remote_inputs.getEndIndex();
-                    if (remote_end_index <= self.indexed_frame.index) {
-                        return false;
-                    }
-                }
-                return true;
-            },
-            .chara_select, .in_game => {},
+            // chara_intro, skippable, retry_menu, chara_select, and in_game
+            // all use the per-frame lockstep logic below (fall through to the
+            // generic check that verifies remote has sent input for the
+            // current frame).
+            //
+            // Previously, chara_intro/skippable/retry_menu only checked if the
+            // remote reached the same INDEX (getEndIndex > our_index). This was
+            // insufficient: the remote sends TransitionIndex BEFORE blocking,
+            // so the fast peer would see remote_end_index > our_index and NOT
+            // block, advancing frames freely while the slow peer was still
+            // blocked at frame 0. Both peers ended up at different frames of
+            // the intro/victory animation → round_start_counter incremented at
+            // different frames → frame-0 state divergence → desync.
+            //
+            // The fix: use the same per-frame lockstep as in_game. This checks
+            // getEndFrame(our_index) > our_frame, which guarantees the remote
+            // has actually advanced to our frame (not just reached our index).
+            // Both peers now advance one frame at a time, each waiting for the
+            // other's input before proceeding. This is true lockstep.
+            .chara_intro, .skippable, .retry_menu, .chara_select, .in_game => {},
         }
 
         if (!self.config.is_netplay or self.config.is_spectator) return true;

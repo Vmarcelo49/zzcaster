@@ -212,7 +212,28 @@ pub const WindowsLauncher = struct {
         self.process_handle = pi.hProcess;
         self.pid = pi.dwProcessId;
 
-        // Read PE header to find entry point
+        // Parse the PE header to log the entry point. This is diagnostic
+        // only (it identifies the MBAACC build, useful when debugging
+        // "wrong version" crashes) and validates that we attached to a
+        // real PE image — the patches below write to hardcoded addresses
+        // and would silently corrupt a non-PE target.
+        //
+        // INTENTIONAL DIVERGENCE FROM CCCaster (tools/Launcher.cpp:57-183):
+        // CCCaster saves the original 2 bytes at the entry point, writes
+        // `lock_code = 0xfeeb` (EB FE = JMP -2 = infinite loop) there,
+        // busy-loops ResumeThread/Sleep/SuspendThread/GetThreadContext
+        // until EIP == entry_point (main thread trapped on the loop),
+        // injects the DLL + applies patches, then restores the original
+        // bytes and FlushInstructionCache before the final ResumeThread.
+        //
+        // zzcaster achieves the same ordering guarantee (DLL loaded +
+        // patches applied before the main thread executes any of its
+        // entry-point code) more simply: CREATE_SUSPENDED pauses the main
+        // thread before it runs at all, injectDllW blocks on
+        // WaitForSingleObject(remote_thread, 10s) so DllMain completes
+        // before we ResumeThread. No entry-point manipulation needed, so
+        // no orig_bytes save/restore either. The PE parse below is kept
+        // purely for the diagnostic log line + PE-signature early-fail.
         var dos_header: [0x40]u8 = undefined;
         if (win32.ReadProcessMemory(pi.hProcess, @ptrFromInt(image_base), &dos_header, dos_header.len, null) == 0) {
             log.err("Failed to read DOS header", .{});
@@ -234,14 +255,6 @@ pub const WindowsLauncher = struct {
         const entry_rva = std.mem.readInt(u32, pe_header[40..][0..4], .little);
         const entry_point = image_base + entry_rva;
         log.info("Entry point: 0x{x:0>8}", .{entry_point});
-
-        // Save original 2 bytes at the entry point so we can restore them
-        // after the DLL has patched everything in.
-        var orig_bytes: [2]u8 = undefined;
-        if (win32.ReadProcessMemory(pi.hProcess, @ptrFromInt(entry_point), &orig_bytes, 2, null) == 0) {
-            return error.ReadMemoryFailed;
-        }
-        log.info("Orig bytes: {x:0>2} {x:0>2}", .{ orig_bytes[0], orig_bytes[1] });
 
         log.info("Injecting {s}...", .{cfg.dll_path});
 

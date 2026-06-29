@@ -284,9 +284,28 @@ pub fn run(allocator: std.mem.Allocator, io: std.Io, cfg: *config.Config, log: *
     var play_msg_len: usize = 0;
     var play_msg_is_error: bool = false;
 
-    // Text input buffers for config
-    var wincount_buf = [_:0]u8{ '2' } ++ [_]u8{0} ** 6;
-    var rollback_buf = [_:0]u8{ '4' } ++ [_]u8{0} ** 6;
+    // Text input buffers for config.
+    // Initialize from the loaded config so the UI reflects what's in
+    // config.ini (matches CCCaster MainUi.cpp:1186, which sets the
+    // rollback prompt's initial value from _config.getInteger(
+    // "defaultRollback")). Previously these were hardcoded to '2' and
+    // '4', so the UI always showed 4 even when config.ini had
+    // defaultRollback=0 — confusing because the DLL received the
+    // config-correct value while the UI showed a wrong one.
+    //
+    // u8 max is 255 (3 digits) + sentinel = 4 bytes; a 7-byte buffer
+    // can never overflow, so bufPrintZ cannot fail here.
+    var wincount_buf: [7:0]u8 = undefined;
+    var rollback_buf: [7:0]u8 = undefined;
+    _ = std.fmt.bufPrintZ(&wincount_buf, "{d}", .{cfg.versus_win_count}) catch {
+        // Unreachable for any u8 (max 3 digits); kept defensive.
+        wincount_buf[0] = '2';
+        wincount_buf[1] = 0;
+    };
+    _ = std.fmt.bufPrintZ(&rollback_buf, "{d}", .{cfg.default_rollback}) catch {
+        rollback_buf[0] = '4';
+        rollback_buf[1] = 0;
+    };
     // Delay override buffer for the host confirmation screen
     var delay_buf = [_:0]u8{0} ** 3;
     var delay_override_active: bool = false;

@@ -534,35 +534,20 @@ fn applyPostLoadHacks() void {
             is_netplay = false;
         };
 
-        // Netplay ASM hacks (ported from CCCaster DllMain.cpp:1896-1907).
-        // hijackIntroState disables the game's natural intro_state 1→0 progression
-        // so we can manually control the chara_intro → in_game transition.
+        // hijackIntroState + stage_animation_off were pre-applied in lazyInit
+        // BEFORE waitForConfig() to eliminate the race where the game reaches
+        // chara_intro before config arrives (see lazyInit comment).
         //
-        // REQUIRED IN ALL NETPLAY MODES, not just rollback. Without it, the
-        // transition fires at "Fight!" (intro_state==0) on each peer at whatever
-        // frame that peer's intro animation happened to reach. Because loading
-        // time + intro playback differ between peers, the in_game frame 0
-        // state diverges: characters start at different positions on each side.
-        //
-        // In rollback mode, the divergence is corrected by re-simulating from
-        // a saved state. In delay-based mode there is no correction — the
-        // offset bakes in at frame 0 and persists until the sync-hash check
-        // catches it (~150 frames in), manifesting as a camera_x / chara.x
-        // desync with matching RNG.
-        //
-        // Verified empirically: desync log from a delay=1 rollback=0 online
-        // match showed camera_x=-7775 vs -8050, P1.x=-31934 vs -32484
-        // (constant offset, RNG hash matched) at indexed_frame=0x400000095.
-        // The offset was present from frame 0 — i.e. the transition timing
-        // asymmetry, not a per-frame simulation divergence.
-        if (state.nm.?.config.is_netplay and !state.nm.?.config.is_spectator) {
-            asm_hacks.applyHijackIntroState();
-            // Disable stage animations — matches CCCaster (DllMain.cpp:1902-1906).
-            // Stage animations can use non-deterministic data (wall-clock timing,
-            // different RNG draws), causing position drift between peers during
-            // pre-game. CC_STAGE_ANIMATION_OFF_ADDR = 0x554124.
-            stage_animation_off_addr.* = 1;
-            state.log.?.info("Stage animations disabled (netplay mode)", .{});
+        // Now that config has arrived, we know the session mode. Revert the
+        // hacks if this is NOT a netplay player session (offline training or
+        // spectator). For netplay player sessions, the hacks are already in
+        // place — nothing to do.
+        if (state.nm != null and state.nm.?.config.is_netplay and !state.nm.?.config.is_spectator) {
+            state.log.?.info("hijackIntroState + stage_animation_off confirmed (netplay mode)", .{});
+        } else {
+            asm_hacks.revertHijackIntroState();
+            stage_animation_off_addr.* = 0;
+            state.log.?.info("Reverted hijackIntroState + stage_animation_off (offline/spectator)", .{});
         }
     }
     installExitProcessHook();
@@ -700,6 +685,27 @@ fn lazyInit() void {
 
     connectPipe();
     asm_hacks.applyPreLoadHacks();
+
+    // CRITICAL: Apply hijackIntroState + stage_animation_off BEFORE
+    // waitForConfig(). These hacks must be in place before the game reaches
+    // chara_intro, because the chara_intro → in_game transition timing must
+    // be deterministic (both peers must enter in_game at the same frame).
+    //
+    // RACE CONDITION: waitForConfig() blocks until the launcher sends the
+    // netplay config, which requires a network handshake with the remote
+    // peer. Meanwhile, the game's main loop is already running (hookMainLoop
+    // was applied in applyPreLoadHacks) and auto-mashing through menus.
+    // On fast machines or slow networks, the game can reach chara_intro
+    // BEFORE config arrives. If hijackIntroState isn't applied yet, the
+    // game's intro_state progresses naturally (1→0) at a non-deterministic
+    // frame → both peers enter in_game at different intro-animation points
+    // → characters start at different positions → constant position offset
+    // → desync detected ~150 frames later.
+    //
+    // We apply unconditionally here (we don't know if it's netplay yet) and
+    // revert in applyPostLoadHacks if the session is offline/spectator.
+    asm_hacks.applyHijackIntroState();
+    stage_animation_off_addr.* = 1;
 
     // Non-blocking: returns immediately if the launcher hasn't sent config
     // yet (frameStep will retry). If it's already here, apply post-load hacks now.

@@ -36,23 +36,48 @@ pub fn applyPreLoadHacks() void {
 
 // hijackIntroState — NOPs 7 bytes at 0x45C1F2, disabling the game's natural
 // intro_state 1→0 progression ("Fight!" announcement). This lets us manually
-// control intro_state during rollback (via clearIntroStateDuringRollback)
-// without the game re-firing intro logic on loaded states.
+// control the chara_intro → in_game transition timing via checkRoundStart,
+// ensuring both peers enter in_game at the same frame.
 //
 // Ported from CCCaster's DllAsmHacks.hpp:502-503:
 //   static const Asm hijackIntroState = { ( void * ) 0x45C1F2, INLINE_NOP_SEVEN_TIMES };
 //
-// Applied conditionally on rollback being enabled (DllMain.cpp:1896-1907).
-// Without this hack, we CANNOT safely transition to in_game at intro_state==1
-// (pre-game) because rollback would load states with intro_state==1 and the
-// game's natural 1→0 progression would re-fire on the re-run → desync.
+// CRITICAL: This hack MUST be applied before the game reaches chara_intro.
+// If applied after, the game's intro_state has already progressed naturally
+// (1→0) at a non-deterministic frame, and both peers enter in_game at
+// different points in the intro animation → characters start at different
+// positions → constant position offset → desync detected ~150 frames later.
+//
+// To eliminate the race between config arrival (network handshake) and the
+// game reaching chara_intro, this hack is pre-applied in lazyInit BEFORE
+// waitForConfig(). If the session turns out to be offline/spectator,
+// revertHijackIntroState() restores the original bytes in applyPostLoadHacks.
 const hijack_intro_state_addr: u32 = 0x45C1F2;
+
+var original_intro_state_bytes: [7]u8 = undefined;
+var intro_state_saved: bool = false;
 
 pub fn applyHijackIntroState() void {
     if (state.log == null) return;
+    // Save original bytes before NOPing (for potential revert in post-load)
+    if (!intro_state_saved) {
+        const ptr: [*]u8 = @ptrFromInt(hijack_intro_state_addr);
+        @memcpy(&original_intro_state_bytes, ptr[0..7]);
+        intro_state_saved = true;
+    }
     const nops = [_]u8{0x90} ** 7;
     writeBytes(hijack_intro_state_addr, &nops);
     state.log.?.info("hijackIntroState applied (NOP 7 bytes @0x{x:0>8}) — intro_state progression disabled", .{hijack_intro_state_addr});
+}
+
+/// Restore the original 7 bytes at hijack_intro_state_addr. Used to revert
+/// the hack in applyPostLoadHacks when the session is offline or spectator.
+/// No-op if applyHijackIntroState was never called.
+pub fn revertHijackIntroState() void {
+    if (state.log == null) return;
+    if (!intro_state_saved) return;
+    writeBytes(hijack_intro_state_addr, &original_intro_state_bytes);
+    state.log.?.info("hijackIntroState reverted — original 7 bytes restored @0x{x:0>8}", .{hijack_intro_state_addr});
 }
 
 // ============================================================================

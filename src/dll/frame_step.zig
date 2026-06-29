@@ -116,7 +116,19 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
 
     // Update RTT EMA every frame (reads ENet's peer.roundTripTime).
     // Feeds the time-sync recommendation below.
-    n.updateRttEma();
+    //
+    // SKIP during chara_intro/skippable/retry_menu: ENet's roundTripTime
+    // is computed from input-ack packets, but in animation states inputs
+    // are suppressed (local sends 0, remote also sends 0). Stale or noisy
+    // RTT samples collected during these states pollute the EMA, which
+    // then drives recommendPerFrameSleepMs once we re-enter .in_game —
+    // producing a wrong sleep recommendation for the first few in_game
+    // frames after the intro/victory screen. This is suspect #2 of the
+    // small-drift desync investigation. See docs/cccaster-vs-zzcaster-diffs.md
+    // "Próxima investigação" item 2.
+    if (!n.isInAnimationState()) {
+        n.updateRttEma();
+    }
 
     // Cooperative time-sync: if we're ahead of the remote peer, sleep a
     // small amount to slow the game down. This lets the remote catch up

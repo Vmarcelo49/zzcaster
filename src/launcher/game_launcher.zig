@@ -496,9 +496,16 @@ pub fn launchNetplayPeerImpl(allocator: std.mem.Allocator, io: std.Io, cfg: *con
     config_buf[3] = cfg.versus_win_count;
     config_buf[4] = 1;
     std.mem.writeInt(u16, config_buf[5..7], port, .little);
-    const addr_copy_len = @min(peer_addr.len, 248);
-    @memcpy(config_buf[7 .. 7 + addr_copy_len], peer_addr[0..addr_copy_len]);
-    const msg_len = 7 + addr_copy_len;
+    // local_udp_port = 0 (direct connection, no relay handoff). The DLL's
+    // waitForConfig() requires a 9-byte header when the netplay flag (0x02)
+    // is set — without the local_udp_port field it falls through to the
+    // offline branch and the game silently starts without a NetplayManager.
+    // Matches the 9-byte layout used by launchNetplayImpl (GUI direct
+    // spectator) and launchGameAfterHandshake (GUI post-handshake).
+    std.mem.writeInt(u16, config_buf[7..9], 0, .little);
+    const addr_copy_len = @min(peer_addr.len, 247);
+    @memcpy(config_buf[9 .. 9 + addr_copy_len], peer_addr[0..addr_copy_len]);
+    const msg_len = 9 + addr_copy_len;
 
     _ = ipc_server.send(config_buf[0..msg_len]);
     log.info("Config sent ({s} -> {s}:{d})", .{
@@ -616,6 +623,12 @@ pub fn runCliNetplay(
     log.info("DLL connected via IPC", .{});
 
     // Build config buffer (same layout as launchGameAfterHandshake).
+    // 9-byte header: [flags][delay][rollback][win_count][host_player]
+    // [u16 peer_port][u16 local_udp_port][N peer_addr]
+    // The DLL's waitForConfig() requires read >= 9 when the netplay flag
+    // (0x02) is set — a 7-byte header silently falls through to the offline
+    // branch. snap.local_udp_port is 0 for direct CLI connections (no relay
+    // handoff), which tells the DLL to bind ENet to any port.
     var config_buf: [256]u8 = undefined;
     config_buf[0] = 0x02 | (if (snap.is_host) @as(u8, 0x04) else 0);
     config_buf[1] = snap.delay;
@@ -623,13 +636,14 @@ pub fn runCliNetplay(
     config_buf[3] = snap.win_count;
     config_buf[4] = snap.host_player;
     std.mem.writeInt(u16, config_buf[5..7], snap.peer_port, .little);
+    std.mem.writeInt(u16, config_buf[7..9], snap.local_udp_port, .little);
 
-    var msg_len: usize = 7;
+    var msg_len: usize = 9;
     if (!snap.is_host) {
         const addr_slice = std.mem.sliceTo(&snap.peer_addr, 0);
-        const addr_copy_len = @min(addr_slice.len, 248);
-        @memcpy(config_buf[7 .. 7 + addr_copy_len], addr_slice[0..addr_copy_len]);
-        msg_len = 7 + addr_copy_len;
+        const addr_copy_len = @min(addr_slice.len, 247);
+        @memcpy(config_buf[9 .. 9 + addr_copy_len], addr_slice[0..addr_copy_len]);
+        msg_len = 9 + addr_copy_len;
     }
 
     _ = ipc_server.send(config_buf[0..msg_len]);

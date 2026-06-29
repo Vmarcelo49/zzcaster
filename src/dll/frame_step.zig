@@ -290,6 +290,16 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
+    // DIAGNOSTIC: log when lockstep unblocks for chara_intro/skippable.
+    // This helps identify if one peer is advancing frames while the other
+    // is still blocked, causing the intro/victory animation to diverge.
+    if (n.state == .chara_intro or n.state == .skippable) {
+        state.log.?.info("DIAG: lockstep passed for {s} (frame={d}, index={d}, remote_end_frame={d})", .{
+            @tagName(n.state), n.indexed_frame.frame, n.indexed_frame.index,
+            n.remote_inputs.getEndFrame(n.indexed_frame.index),
+        });
+    }
+
     if (n.isRerunning()) {
         // During a rollback re-run, the game still reads inputs from its
         // input buffer each frame. We MUST write the corrected local +

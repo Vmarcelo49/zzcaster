@@ -2010,8 +2010,8 @@ pub const NetplayManager = struct {
             self.round_start_waiting_logged = false;
             const prev = self.last_round_start;
             self.last_round_start = current;
-            self.log.info("Round start (counter {d} -> {d}) — {s} -> InGame", .{
-                prev, current, @tagName(self.state),
+            self.log.info("Round start (counter {d} -> {d}) — {s} -> InGame (frame={d}, world_timer={d})", .{
+                prev, current, @tagName(self.state), self.indexed_frame.frame, world_timer_addr.*,
             });
             self.transitionTo(.in_game);
         } else {
@@ -2066,6 +2066,17 @@ pub const NetplayManager = struct {
         self.indexed_frame.index += 1;
         self.start_world_time = world_timer_addr.*;
         self.indexed_frame.frame = 0;
+
+        // DIAGNOSTIC: log absolute world_timer at each transition to identify
+        // frame-level divergence between peers (especially on second match
+        // after rematch). If both peers log the same world_timer at the same
+        // transition, they're synchronized. If they differ, the intro/victory
+        // animation started at different times.
+        if (new == .chara_intro or new == .in_game or new == .skippable) {
+            self.log.info("DIAG: transition to {s} at world_timer={d} (index={d})", .{
+                @tagName(new), self.start_world_time, self.indexed_frame.index,
+            });
+        }
 
         // Arm RNG sync when entering `.in_game` (round 1 entry from
         // chara_intro, training mode direct entry) AND when entering

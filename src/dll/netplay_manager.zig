@@ -188,9 +188,23 @@ const pre_game_intro_frames: u32 = 224;
 /// Minimum frame number before rollback can load a state. States at frames
 /// 0-7 may differ between peers (both enter in_game at slightly different
 /// absolute world_timer values). Rolling back to those frames loads a
-/// divergent state → desync. The lcf is kept (not cleared) so the
-/// misprediction is corrected once we're past this delay.
+/// divergent state → desync.
+///
+/// NOTE: This guard is a zzcaster addition — CCCaster has NO such guard
+/// and will roll back to frame 0 if needed. The guard was originally added
+/// to work around the intro-animation-timing race that caused frame-0 state
+/// divergence. The race fix (commit 5a5c13c, hijackIntroState applied
+/// before waitForConfig) should have eliminated that divergence.
+///
+/// DEFAULT: false (match CCCaster behavior — no guard, rollback corrects
+/// early-frame mispredictions immediately).
+///
+/// If early-frame rollbacks cause the "state at frame 0 differs" desync to
+/// return, set this to true and investigate the frame-0 divergence
+/// separately. The log line "ROLLBACK to early frame" will indicate whether
+/// early-frame rollbacks are happening.
 const rollback_min_frame_delay: u32 = 8;
+const enable_rollback_min_frame_delay_guard: bool = false;
 
 // Protocol version for compatibility checking. Increment when the wire format
 // or rollback state layout changes. Both peers must have the same version.
@@ -2386,21 +2400,26 @@ pub const NetplayManager = struct {
         }
         if (lcf_frame >= self.indexed_frame.frame) return false;
 
-        // Don't rollback to early frames (0-7). The state at frame 0 may
-        // differ between peers because both peers enter in_game at slightly
-        // different absolute world_timer values. Rolling back to frame 0 or 1
-        // loads a divergent state → desync.
-        //
-        // However, we only skip the rollback — we do NOT clear the lcf.
-        // This means the misprediction is still tracked. On the next frame,
-        // if we're past the delay window, the rollback will fire and correct
-        // it. This prevents the "wrong RNG persists uncorrected" problem
-        // while still avoiding loading divergent early states.
-        if (lcf_frame < rollback_min_frame_delay)
+        // Early-frame rollback guard (zzcaster addition, CCCaster has none).
+        // See enable_rollback_min_frame_delay_guard documentation above.
+        if (enable_rollback_min_frame_delay_guard and lcf_frame < rollback_min_frame_delay)
         {
-            // Can't safely rollback to early frames — but DON'T clear lcf.
-            // The misprediction will be corrected once we're past the delay.
+            // Guard enabled: skip the rollback but keep lcf so it can be
+            // corrected later (once we're past the delay window).
+            self.log.warn("ROLLBACK SKIPPED (guard): lcf_frame={d} < min={d} (current frame={d})", .{
+                lcf_frame, rollback_min_frame_delay, self.indexed_frame.frame,
+            });
             return false;
+        }
+
+        // Guard disabled (default, matches CCCaster): log early-frame
+        // rollbacks so we can detect if the frame-0 state divergence
+        // returns. If these log lines appear followed by a desync, the
+        // intro-animation-timing fix didn't fully solve the frame-0 issue.
+        if (lcf_frame < rollback_min_frame_delay) {
+            self.log.info("ROLLBACK to early frame {d} (current={d}, lcf_index={d}) — guard disabled, proceeding", .{
+                lcf_frame, self.indexed_frame.frame, lcf_index,
+            });
         }
 
         const loaded = self.state_pool.loadStateForFrame(lcf_frame, lcf_index);

@@ -193,11 +193,15 @@ fn resolveHost(host: []const u8) u32 {
     const he = ws2_32.gethostbyname(&host_buf) orelse return 0;
     const addr_list = he.h_addr_list orelse return 0;
     const first_addr_ptr = addr_list[0] orelse return 0;
-    // hostent.h_addr_list[0] points to 4 bytes in network byte order.
-    // Read them as a u32 without swapping — the in-memory bytes are
-    // preserved, which is what sockaddr_in expects.
-    const a: [*]u8 = first_addr_ptr;
-    return std.mem.readInt(u32, a[0..4], .little);
+    // gethostbyname returns addresses in network byte order (big-endian),
+    // same as inet_addr. Copy the raw bytes into a u32 so the result
+    // matches inet_addr's return value on any platform endianness.
+    // (The previous std.mem.readInt(..., .little) was correct only on
+    // little-endian targets like x86-windows-gnu — same fix as
+    // relay_client.zig resolveHost, commit f96c6e9.)
+    var result: u32 = undefined;
+    @memcpy(std.mem.asBytes(&result), @as([*]u8, first_addr_ptr)[0..4]);
+    return result;
 }
 
 /// Build a sockaddr_in for the given IPv4 (network byte order) + port.

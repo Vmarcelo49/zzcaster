@@ -50,6 +50,22 @@ pub var air_dash_macro_p2: air_dash.AirDashMacro = .{};
 /// Counter for periodic input-value logging in frameStepOffline.
 pub var input_log_frame: u32 = 0;
 
+/// Flag set by frame_step.frameStepNetplay when the lockstep wait loop
+/// blocked for any non-trivial time during the just-finished frameStep.
+/// `dllmain.limitFrameRate` reads and clears it: when set, the limiter
+/// resets its `qpc_prev` baseline to "now" instead of using the
+/// previous frame's exit timestamp.
+///
+/// Why: during chara_intro/skippable/retry_menu the lockstep wait can
+/// pause frameStep for tens of milliseconds. Without a reset, the
+/// limiter's `qpc_prev` gets pinned to the post-lockstep moment, which
+/// shifts each peer's frame-clock by a different amount (variable
+/// network latency → variable lockstep pause). The result is the
+/// small-drift desync documented in docs/cccaster-vs-zzcaster-diffs.md.
+/// Resetting qpc_prev after a lockstep pause re-pins both peers to the
+/// wall clock, eliminating the drift source.
+pub var frame_limiter_needs_reset: bool = false;
+
 // init_single_threaded: no cross-thread Io; the DLL runs in the game process.
 pub var app_io_backend: std.Io.Threaded = .init_single_threaded;
 

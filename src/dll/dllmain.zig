@@ -760,6 +760,23 @@ fn limitFrameRate() void {
         return;
     }
 
+    // If the just-finished frameStep blocked inside the lockstep wait loop
+    // (frame_step.frameStepNetplay), reset our qpc_prev baseline to "now"
+    // so the next frame is timed from the post-lockstep moment. Without
+    // this, qpc_prev stays pinned to the previous frame's exit timestamp,
+    // and the variable lockstep pause duration shifts the limiter's
+    // internal clock away from the wall clock by a different amount on
+    // each peer — which is one of the three suspects behind the
+    // small-drift desync (see docs/cccaster-vs-zzcaster-diffs.md
+    // "Próxima investigação" item 3). After resetting, the busy-wait
+    // below exits immediately (curr ≈ qpc_prev) and the next frame
+    // becomes the new timing baseline.
+    if (state.frame_limiter_needs_reset) {
+        state.frame_limiter_needs_reset = false;
+        _ = qpc.QueryPerformanceCounter(&qpc_prev);
+        return;
+    }
+
     const ticks_per_frame: i64 = @divTrunc(qpc_freq, @as(i64, @intCast(target_fps)));
 
     // Busy-wait until enough time has elapsed since the last frame.

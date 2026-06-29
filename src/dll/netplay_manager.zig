@@ -1399,9 +1399,34 @@ pub const NetplayManager = struct {
     pub fn isRemoteInputReady(self: *const NetplayManager) bool {
         // CharaSelect and InGame block on remote input (lockstep).
         // All other states return true (run at own pace, catch-up mash handles lag).
-        // CharaIntro returns true unconditionally — matches CCCaster.
+        //
+        // EXCEPTION: chara_intro blocks on remote reaching the same index.
+        // Without this, a fast peer (who finished loading and entered
+        // chara_intro first) would advance frames freely while the slow
+        // peer is still in loading. The intro animation would play out
+        // (or round_start_counter would increment) at different relative
+        // frames for each peer → frame-0 state divergence → desync.
+        //
+        // By blocking during chara_intro until the remote reaches our
+        // index, we pause the local game (lockstep wait freezes
+        // frameStep, which freezes the game loop, which freezes
+        // world_timer) until the remote is also in chara_intro. Both
+        // peers then watch the intro from the same starting point and
+        // reach "players can move" at the same relative frame.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .skippable, .retry_menu, .chara_intro => return true,
+            .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
+            .chara_intro => {
+                // Block until remote reaches our transition index.
+                // This prevents the fast peer from advancing chara_intro
+                // frames while the slow peer is still in loading.
+                if (self.config.is_netplay and !self.config.is_spectator) {
+                    const remote_end_index = self.remote_inputs.getEndIndex();
+                    if (remote_end_index <= self.indexed_frame.index) {
+                        return false;
+                    }
+                }
+                return true;
+            },
             .chara_select, .in_game => {},
         }
 

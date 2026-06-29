@@ -1287,19 +1287,33 @@ pub const NetplayManager = struct {
                 return 0;
             },
             .skippable => {
-                // If remote is ahead, mash Confirm to catch up.
-                if (self.shouldCatchUp()) {
+                // ============================================================
+                // Suppress ALL inputs during skippable (victory screen)
+                // ============================================================
+                // Same reasoning as chara_intro (see above). The skippable
+                // state is the inter-round "Round X Winner" / victory screen.
+                // It can be skipped by pressing Confirm. If one peer skips
+                // and the other watches the full victory animation,
+                // round_start_counter increments at different frames →
+                // both peers enter the next round's in_game at different
+                // frames → frame-0 state divergence → desync.
+                //
+                // This was observed in online testing: the desync appeared
+                // at index=8 frame=149 (round 3), after two round-over
+                // transitions. The victory screen skip desynchronized the
+                // round-start timing between peers.
+                //
+                // CCCaster allows Confirm through during skippable
+                // (getSkippableInput), same bug, but RELEASE doesn't detect.
+                //
+                // Spectators are exempt — they mash Confirm to fast-forward.
+                if (self.config.is_spectator) {
                     if (self.indexed_frame.frame % 2 == 0) {
                         return button_confirm << 4;
                     }
                     return 0;
                 }
-                // Otherwise, only allow Confirm/Cancel through — suppress
-                // all direction and action buttons so the player can't
-                // accidentally affect game state during skippable.
-                // Confirm = 0x0400 in btns = 0x4000 in combined.
-                // Cancel  = 0x0800 in btns = 0x8000 in combined.
-                return raw_input & 0xC000; // keep only Confirm + Cancel bits
+                return 0;
             },
             .in_game, .retry_menu => {
                 // Retry-menu sync gate: if in .retry_menu waiting for the remote to
@@ -1414,11 +1428,13 @@ pub const NetplayManager = struct {
         // peers then watch the intro from the same starting point and
         // reach "players can move" at the same relative frame.
         switch (self.state) {
-            .pre_initial, .initial, .loading, .skippable, .retry_menu => return true,
-            .chara_intro => {
+            .pre_initial, .initial, .loading, .retry_menu => return true,
+            .chara_intro, .skippable => {
                 // Block until remote reaches our transition index.
-                // This prevents the fast peer from advancing chara_intro
-                // frames while the slow peer is still in loading.
+                // This prevents the fast peer from advancing the intro /
+                // victory-screen animation frames while the slow peer is
+                // still in the previous state. Same reasoning for both —
+                // see the chara_intro comment above.
                 if (self.config.is_netplay and !self.config.is_spectator) {
                     const remote_end_index = self.remote_inputs.getEndIndex();
                     if (remote_end_index <= self.indexed_frame.index) {

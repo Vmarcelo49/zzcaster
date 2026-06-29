@@ -1254,8 +1254,35 @@ pub const NetplayManager = struct {
                 // getSkippableInput (DllNetplayManager.cpp:158-179).
                 // checkRoundStart transitions to .in_game when round_start_counter
                 // fires (at intro_state==1, pre-game).
+                //
+                // CATCH-UP MASH GUARD (chara_intro):
+                // The catch-up mash (shouldCatchUp → button_confirm) skips the
+                // intro animation. This is ONLY safe if the remote peer has
+                // ALSO reached chara_intro (same index). If the remote is still
+                // in loading (behind our index), mashing Confirm would skip our
+                // intro while the remote watches the full intro → both peers
+                // enter in_game at different frames → frame-0 state divergence
+                // → RNG desync.
+                //
+                // checkRoundStart already gates the chara_intro→in_game
+                // transition on remote_end_index > our_index, so the local peer
+                // won't transition to in_game before the remote catches up.
+                // But the catch-up mash itself would still skip the intro
+                // animation early, causing round_start_counter to increment at
+                // a different frame than the remote's.
+                //
+                // Fix: only mash Confirm if the remote has reached our index
+                // (i.e., remote_end_index > our_index). This ensures both peers
+                // are in chara_intro before either skips the intro.
                 if (self.shouldCatchUp()) {
-                    return button_confirm << 4;
+                    const remote_end_index = self.remote_inputs.getEndIndex();
+                    if (remote_end_index > self.indexed_frame.index) {
+                        // Remote is at or past our index — safe to skip intro.
+                        return button_confirm << 4;
+                    }
+                    // Remote is still behind (in loading) — don't skip intro yet.
+                    // Let the intro play normally; checkRoundStart will wait
+                    // for the remote before transitioning to in_game.
                 }
                 return raw_input & 0xC000; // Confirm + Cancel only
             },

@@ -1249,30 +1249,50 @@ pub const NetplayManager = struct {
                 }
                 return input;
             },
-            .loading, .skippable => {
+            .loading => {
+                // Loading: suppress ALL player input. The loading screen
+                // is not skippable and inputs during loading can cause
+                // issues. Catch-up mash still applies (shouldCatchUp).
+                if (self.config.is_spectator) {
+                    asm_hacks.menu_confirm_state = 2;
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+                if (self.shouldCatchUp()) {
+                    asm_hacks.menu_confirm_state = 2;
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+                return 0;
+            },
+            .skippable => {
                 // ============================================================
-                // Loading: suppress. Skippable: allow Confirm+Cancel.
+                // Skippable: ALWAYS mash Confirm (skip the victory screen)
                 // ============================================================
+                // Same pattern as chara_intro (commit d9ae272). The §B
+                // small drift desync happens because the two peers enter
+                // skippable with a 3-frame game state difference (same
+                // loading I/O variance as §A). If both peers watch the
+                // full victory animation, round_start_counter fires at
+                // different relative frames → Δ1415 uniform offset on
+                // all positions at round 2 frame 149.
                 //
-                // LOADING: suppress ALL player input. The loading screen is
-                // not skippable and inputs during loading can cause issues.
+                // FIX: always mash Confirm during skippable. Both peers
+                // mash at the same frame (per-frame lockstep guarantees
+                // sync), so both skip the victory screen together and
+                // enter round 2 at the same game state.
                 //
-                // SKIPPABLE (victory screen): allow Confirm+Cancel through.
-                // With per-frame lockstep restored, both peers process the
-                // same input at the same frame — so if one peer presses
-                // Confirm to skip/dismiss the victory popup, the lockstep
-                // guarantees the other peer sees it at the same frame.
-                // No asymmetric skip, no desync.
+                // This is safe because:
+                //   - auto-replay-save is disabled (commit 76471ba) — no
+                //     popup to get stuck on
+                //   - retry_menu forces mcs=2 (commit 01376d6) — confirms
+                //     work after the skip
                 //
-                // The menuConfirmState hack (menu_confirm_state = 2) makes
-                // the game actually process the Confirm, which dismisses
-                // the replay-save popup and advances past the victory
-                // animation. Without it, the popup blocks the retry menu.
-                //
-                // PREVIOUS ISSUE: commit b630ccf allowed Confirm through
-                // WITHOUT lockstep (commit 3/3 had removed it) → desync.
-                // Now lockstep is restored (commit 3/3 reverted), so
-                // allowing Confirm is safe again.
+                // Spectators also mash (same behavior).
 
                 // Spectator: always mash Confirm (fast-forward).
                 if (self.config.is_spectator) {
@@ -1283,28 +1303,14 @@ pub const NetplayManager = struct {
                     return 0;
                 }
 
-                // Catch-up mash: remote is ahead by >1 index → mash Confirm.
-                if (self.shouldCatchUp()) {
-                    asm_hacks.menu_confirm_state = 2;
-                    if (self.indexed_frame.frame % 2 == 0) {
-                        return button_confirm << 4;
-                    }
-                    return 0;
-                }
-
-                // Loading: suppress all input.
-                if (self.state == .loading) return 0;
-
-                // Skippable: allow Confirm+Cancel through.
-                // Set menu_confirm_state = 2 so the game's menu code
-                // processes the Confirm (dismisses replay popup, skips
-                // victory animation). Both peers do this at the same
-                // frame (lockstep guarantees sync).
-                //
-                // Mask = COMBINE_INPUT(0, CC_BUTTON_CONFIRM | CC_BUTTON_CANCEL)
-                //      = (0x0400 | 0x0800) << 4 = 0xC000.
+                // ALWAYS mash Confirm during skippable (not just
+                // catch-up). This skips the victory screen on both
+                // peers at the same frame, preventing the §B drift.
                 asm_hacks.menu_confirm_state = 2;
-                return raw_input & 0xC000;
+                if (self.indexed_frame.frame % 2 == 0) {
+                    return button_confirm << 4;
+                }
+                return 0;
             },
             .chara_intro => {
                 // ============================================================

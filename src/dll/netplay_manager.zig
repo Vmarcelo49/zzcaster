@@ -1239,42 +1239,43 @@ pub const NetplayManager = struct {
             },
             .loading, .chara_intro, .skippable => {
                 // ============================================================
-                // Catch-up mash + getSkippableInput (matches CCCaster)
+                // Spectator mash + catch-up mash + input suppression
                 // ============================================================
-                // Ported from CCCaster DllNetplayManager.cpp:789-798. The
-                // three states share the same input logic:
-                //   1. If the remote is ahead by more than 1 index, mash
-                //      Confirm to skip the animation faster (catch-up).
-                //      This requires the menuConfirmState ASM hack
-                //      (applyMenuConfirmHack, commit 9749937) to actually
-                //      advance the game's menu/intro — without it, mashing
-                //      Confirm does nothing.
-                //   2. Otherwise, let the player's Confirm+Cancel inputs
-                //      through (getSkippableInput). This lets players
-                //      manually skip the intro/victory screen by pressing
-                //      Confirm, matching CCCaster's UX.
+                // Three input modes for loading/chara_intro/skippable:
                 //
-                // PREVIOUS BEHAVIOR (reverted by this commit): zzcaster
-                // suppressed ALL inputs during these states (return 0) to
-                // prevent "one peer skips, the other doesn't" desyncs. But
-                // that created the §A chara_intro entry divergence freeze:
-                // when one peer entered chara_intro 1 frame ahead (due to
-                // loading-completion I/O variance), the behind peer couldn't
-                // catch up (no mash), the per-frame lockstep forced
-                // frame-by-frame advancement on divergent game states, and
-                // round_start_counter fired asymmetrically → deadlock.
+                // 1. Spectator: always mash Confirm (fast-forward through
+                //    animations the spectator doesn't care about). Matches
+                //    CCCaster getSkippableInput line 160-161.
                 //
-                // CCCaster avoids this by NOT lockstepping these states
-                // (commit 3/3 will remove the lockstep) and using mash to
-                // catch up instead. The 1-frame entry drift is harmless
-                // because the behind peer mashes and catches up within a
-                // few frames.
+                // 2. Catch-up mash: if the remote is ahead by >1 index,
+                //    mash Confirm to skip the animation faster. Requires
+                //    the menuConfirmState ASM hack (applyMenuConfirmHack).
+                //    With per-frame lockstep restored (commit 3/3 reverted),
+                //    this rarely fires — but it's correct infrastructure
+                //    and matches CCCaster DllNetplayManager.cpp:792-797.
                 //
-                // Spectators always mash Confirm to fast-forward (matches
-                // CCCaster getSkippableInput line 160-161).
+                // 3. Normal path: SUPPRESS ALL player input (return 0).
+                //    This prevents the "one peer skips the victory/intro
+                //    animation, the other doesn't" desync. Even with
+                //    per-frame lockstep, a player's Confirm press arrives
+                //    at the local peer first, then travels to the remote
+                //    1+ frames later — the skip happens at different
+                //    relative frames, diverging the game state. Observed
+                //    in online testing: one peer saw "replay saved"
+                //    notification while the other saw the rematch menu.
+                //
+                //    This is a UX regression (can't skip intro/victory by
+                //    pressing Confirm) but correctness > convenience. Both
+                //    peers watch the full animation, reach the next state
+                //    at the same frame. Matches the pre-Option-1 behavior.
+                //
+                //    CCCaster allows Confirm through (getSkippableInput
+                //    returns raw_input & Confirm|Cancel), but CCCaster
+                //    RELEASE doesn't detect desyncs (SyncHash handler is
+                //    #ifndef RELEASE) so the divergence goes unnoticed.
+                //    zzcaster detects desyncs, so we MUST suppress.
 
-                // Spectator: always mash Confirm (fast-forward through
-                // animations the spectator doesn't care about).
+                // Spectator: always mash Confirm (fast-forward).
                 if (self.config.is_spectator) {
                     asm_hacks.menu_confirm_state = 2;
                     if (self.indexed_frame.frame % 2 == 0) {
@@ -1283,9 +1284,7 @@ pub const NetplayManager = struct {
                     return 0;
                 }
 
-                // Catch-up mash: remote is ahead by >1 index → mash Confirm
-                // to skip the animation. The menuConfirmState hack makes
-                // the game actually process the mashed confirm.
+                // Catch-up mash: remote is ahead by >1 index → mash Confirm.
                 if (self.shouldCatchUp()) {
                     asm_hacks.menu_confirm_state = 2;
                     if (self.indexed_frame.frame % 2 == 0) {
@@ -1294,11 +1293,9 @@ pub const NetplayManager = struct {
                     return 0;
                 }
 
-                // Normal path: let Confirm+Cancel through (getSkippableInput).
-                // Mask = COMBINE_INPUT(0, CC_BUTTON_CONFIRM | CC_BUTTON_CANCEL)
-                //      = (0x0400 | 0x0800) << 4 = 0xC000.
-                // This lets players manually skip the intro/victory screen.
-                return raw_input & 0xC000;
+                // Normal path: suppress ALL player input to prevent
+                // asymmetric skip desyncs.
+                return 0;
             },
             .in_game, .retry_menu => {
                 // Retry-menu sync gate: if in .retry_menu waiting for the remote to

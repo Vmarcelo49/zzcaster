@@ -1397,10 +1397,22 @@ pub const NetplayManager = struct {
                 // interferes with normal menu confirms. Matches CCCaster
                 // line 466: "Disable menu confirms" after the replay-save
                 // block.
-                if (self.state == .retry_menu and menu_state_counter_addr.* > self.retry_menu_state_counter) {
-                    asm_hacks.menu_confirm_state = 2;
-                } else {
-                    asm_hacks.menu_confirm_state = 0;
+                if (self.state == .retry_menu) {
+                    const msc = menu_state_counter_addr.*;
+                    const popup_showing = msc > self.retry_menu_state_counter;
+                    if (popup_showing) {
+                        asm_hacks.menu_confirm_state = 2;
+                    } else {
+                        asm_hacks.menu_confirm_state = 0;
+                    }
+                    // DIAG: log retry menu state every 60 frames to see
+                    // what's happening with the counter and confirm state.
+                    if (self.indexed_frame.frame % 60 == 0) {
+                        self.log.info("DIAG: retry_menu frame={d} counter={d} threshold={d} popup={} mcs={d} raw_input=0x{x:0>4}", .{
+                            self.indexed_frame.frame, msc, self.retry_menu_state_counter,
+                            popup_showing, asm_hacks.menu_confirm_state, raw_input,
+                        });
+                    }
                 }
 
                 // Real input. In netplay, strip the Start button to prevent

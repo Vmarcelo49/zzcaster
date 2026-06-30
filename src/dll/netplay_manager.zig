@@ -1397,22 +1397,29 @@ pub const NetplayManager = struct {
                 // interferes with normal menu confirms. Matches CCCaster
                 // line 466: "Disable menu confirms" after the replay-save
                 // block.
+                // menuConfirmState during retry_menu:
+                //
+                // The menuConfirmHack intercepts the game's menu-confirm
+                // handler. The game sets menuConfirmState=1 when the player
+                // presses Confirm, but the hack ONLY lets the confirm
+                // through if menuConfirmState > 1. So with mcs=0, the game
+                // detects the press (sets mcs=1) but the hack blocks it
+                // (1 is not > 1) → Confirm never registers.
+                //
+                // FIX: always set mcs=2 during retry_menu. This forces
+                // confirms through, letting the player select Rematch /
+                // Character Select. Both the replay-save popup AND normal
+                // retry-menu navigation require this.
+                //
+                // Matches CCCaster's approach: it sets mcs=2 for the popup
+                // (line 395) and relies on the game's own mcs=1 detection
+                // + _localRetryMenuIndex tracking for normal confirms
+                // (line 457-466). zzcaster doesn't have the retry-menu
+                // sync system (_localRetryMenuIndex/_remoteRetryMenuIndex)
+                // ported, so we just force mcs=2 always — simpler and
+                // correct for basic Rematch/Character Select.
                 if (self.state == .retry_menu) {
-                    const msc = menu_state_counter_addr.*;
-                    const popup_showing = msc > self.retry_menu_state_counter;
-                    if (popup_showing) {
-                        asm_hacks.menu_confirm_state = 2;
-                    } else {
-                        asm_hacks.menu_confirm_state = 0;
-                    }
-                    // DIAG: log retry menu state every 60 frames to see
-                    // what's happening with the counter and confirm state.
-                    if (self.indexed_frame.frame % 60 == 0) {
-                        self.log.info("DIAG: retry_menu frame={d} counter={d} threshold={d} popup={} mcs={d} raw_input=0x{x:0>4}", .{
-                            self.indexed_frame.frame, msc, self.retry_menu_state_counter,
-                            popup_showing, asm_hacks.menu_confirm_state, raw_input,
-                        });
-                    }
+                    asm_hacks.menu_confirm_state = 2;
                 }
 
                 // Real input. In netplay, strip the Start button to prevent

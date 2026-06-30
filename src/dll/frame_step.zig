@@ -206,15 +206,17 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
             // Before this, the remote is still in an earlier state (Loading,
             // CharaIntro, etc.) and we wait for them to catch up without a
             // hard timeout — a slow machine can take 30s+ to load.
+            //
+            // (Removed the per-iteration "Remote reached transition index" log
+            // — it fired every frame during chara_intro lockstep, producing
+            // hundreds of lines. The 5s "Waiting for remote input..." warn
+            // below is the actionable signal.)
             const remote_end_index = if (n.remote_inputs.getEndIndex() > 0)
                 n.remote_inputs.getEndIndex() - 1
             else
                 0;
             if (remote_at_index_since == 0 and remote_end_index >= n.indexed_frame.index) {
                 remote_at_index_since = now;
-                state.log.?.info("Remote reached transition index {d} — starting 10s input-wait countdown", .{
-                    n.indexed_frame.index,
-                });
             }
 
             if (now - last_resend > 100) {
@@ -319,15 +321,10 @@ fn frameStepNetplay(n: *netman.NetplayManager, world_timer: u32) void {
         return;
     }
 
-    // DIAGNOSTIC: log when lockstep unblocks for chara_intro/skippable.
-    // This helps identify if one peer is advancing frames while the other
-    // is still blocked, causing the intro/victory animation to diverge.
-    if (n.state == .chara_intro or n.state == .skippable) {
-        state.log.?.info("DIAG: lockstep passed for {s} (frame={d}, index={d}, remote_end_frame={d})", .{
-            @tagName(n.state), n.indexed_frame.frame, n.indexed_frame.index,
-            n.remote_inputs.getEndFrame(n.indexed_frame.index),
-        });
-    }
+    // (Removed per-frame "DIAG: lockstep passed" log — it was diagnostic
+    // for the §A investigation and produced hundreds of lines per match.
+    // The lockstep is now stable; if debugging is needed again, re-enable
+    // temporarily.)
 
     if (n.isRerunning()) {
         // During a rollback re-run, the game still reads inputs from its

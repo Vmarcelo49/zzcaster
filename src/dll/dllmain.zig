@@ -113,6 +113,14 @@ const damage_level_addr: *u32 = @ptrFromInt(0x553FCC);
 const timer_speed_addr: *u32 = @ptrFromInt(0x553FD0);
 const stage_animation_off_addr: *u32 = @ptrFromInt(0x554124);
 const win_count_vs_addr: *u32 = @ptrFromInt(0x553FDC);
+// CC_AUTO_REPLAY_SAVE_ADDR (Constants.hpp:42): 0 = disable auto-replay-save,
+// 1 = enable. When enabled, the game shows a replay-save popup after each
+// match that zzcaster cannot dismiss (the auto-replay-save ASM hacks +
+// menuConfirmState integration are not ported — see HANDOFF "Features not
+// ported" item #4). Disabling it normalizes behavior across peers (some
+// installs have auto-save on by default, others don't) and prevents the
+// post-match popup that blocks the retry menu.
+const auto_replay_save_addr: *u32 = @ptrFromInt(0x553FE8);
 
 const mode_startup: u32 = 65535;
 const mode_opening: u32 = 3;
@@ -521,6 +529,19 @@ fn applyPostLoadHacks() void {
         2;
     win_count_vs_addr.* = win_count;
     state.log.?.info("win_count_vs set to {d}", .{win_count});
+
+    // Disable the game's auto-replay-save. The full auto-replay-save feature
+    // (saveReplay + detectAutoReplaySave ASM hacks + menuConfirmState
+    // integration + currentMenuIndex tracking) is not ported from CCCaster
+    // (HANDOFF "Features not ported" item #4). Without it, the game's
+    // auto-save popup appears on some installs but zzcaster can't dismiss it,
+    // blocking the retry menu and causing the match to end without a clean
+    // rematch flow. Disabling it normalizes behavior across peers.
+    //
+    // Players can still manually save replays from the retry menu if the
+    // game supports it.
+    auto_replay_save_addr.* = 0;
+    state.log.?.info("auto_replay_save disabled (popup not ported)", .{});
 
     // SDL_Init is deferred to initSdlOnMainThread (see below) — SDL is not
     // thread-safe and must run on the main thread.

@@ -1414,55 +1414,7 @@ pub const NetplayManager = struct {
         // CharaSelect and InGame block on remote input (lockstep).
         // All other states return true (run at own pace, catch-up mash handles lag).
         //
-        // EXCEPTION 1: loading state ALSO blocks on remote input (lockstep).
-        // Without this, the two peers' MBAA.exe loading-completion (driven by
-        // disk I/O, cold vs warm cache, CPU scheduling) happens at different
-        // world_timer values. When game_mode flips to mode_in_game (1), each
-        // peer transitions loading → chara_intro independently and captures
-        // its own start_world_time = world_timer_addr.*. If host's loading
-        // completes at world_timer=1082 and client's at 1083, the 1-frame
-        // gap is baked into start_world_time.
-        //
-        // The per-frame chara_intro lockstep (see EXCEPTION 2 below) then
-        // passes for 207 frames because both peers are at index 3 — but
-        // their underlying game states are 1 frame apart. round_start_counter
-        // (incremented by the applyDetectRoundStart ASM code cave when the
-        // game's internal round-start code path executes) fires for the host
-        // at relative frame 207 but NOT for the client (its game hasn't
-        // reached the trigger point). Host transitions to in_game (index 4);
-        // client stays at chara_intro (index 3). Deadlock: host waits for
-        // client's index-4 input, client waits for host's index-3 input.
-        // ENet still connected. No crash. Game window frozen.
-        //
-        // This is the "§A chara_intro entry divergence" freeze documented
-        // in docs/netplay-desync-investigation.md. Lockstepping loading
-        // prevents it at the source: both peers advance loading frames
-        // together regardless of disk speed, so game_mode flips at the same
-        // frame on both, and start_world_time matches at the chara_intro
-        // transition.
-        //
-        // Safe to lockstep loading because getNetplayInput returns 0 during
-        // .loading (no player input, no catch-up mash) — both peers send 0
-        // every frame, the lockstep check passes as soon as the remote's 0
-        // arrives. No deadlock risk.
-        //
-        // DIVERGENCE FROM CCCASTER: CCCaster's isRemoteInputReady
-        // (DllNetplayManager.cpp:974-981) returns true for Loading (no
-        // lockstep). CCCaster doesn't freeze because it also doesn't
-        // lockstep chara_intro — it uses mash-to-catch-up instead
-        // (DllNetplayManager.cpp:792-797). zzcaster added chara_intro
-        // lockstep (see EXCEPTION 2) to fix a previous massive-divergence
-        // bug, which created the deadlock. Lockstepping loading is the
-        // minimal fix that makes the chara_intro lockstep safe without
-        // undoing the 4-commit see-saw (0e4760c → d6a93b6 → d1899e8 →
-        // 515df3b) that established chara_intro lockstep.
-        //
-        // Loading-screen freezes are invisible to players (the screen is
-        // already a fixed-duration loading screen — small synchronization
-        // pauses don't change the UX), so this is the ideal state for
-        // lockstepping.
-        //
-        // EXCEPTION 2: chara_intro blocks on remote reaching the same index.
+        // EXCEPTION: chara_intro blocks on remote reaching the same index.
         // Without this, a fast peer (who finished loading and entered
         // chara_intro first) would advance frames freely while the slow
         // peer is still in loading. The intro animation would play out
@@ -1476,11 +1428,7 @@ pub const NetplayManager = struct {
         // peers then watch the intro from the same starting point and
         // reach "players can move" at the same relative frame.
         switch (self.state) {
-            .pre_initial, .initial => return true,
-            // .loading now falls through to the per-frame lockstep check
-            // below (was previously in the return-true list — see the
-            // EXCEPTION 1 comment above for why it was moved).
-            //
+            .pre_initial, .initial, .loading => return true,
             // chara_intro, skippable, retry_menu, chara_select, and in_game
             // all use the per-frame lockstep logic below (fall through to the
             // generic check that verifies remote has sent input for the
@@ -1511,7 +1459,7 @@ pub const NetplayManager = struct {
             // guarantees the remote has actually advanced to our frame, not
             // just reached our index. Both peers advance one frame at a time,
             // each waiting for the other's input before proceeding.
-            .loading, .chara_intro, .skippable, .retry_menu, .chara_select, .in_game => {},
+            .chara_intro, .skippable, .retry_menu, .chara_select, .in_game => {},
         }
 
         if (!self.config.is_netplay or self.config.is_spectator) return true;

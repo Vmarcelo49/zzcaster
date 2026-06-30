@@ -1222,98 +1222,68 @@ pub const NetplayManager = struct {
                 }
                 return input;
             },
-            .loading => {
-                // During the Loading screen, suppress ALL player input.
-                //
-                // The loading screen in MBAACC is a fixed-duration screen
-                // that loads character/stage data. It should NOT be skippable
-                // by the player — if one peer could advance past it while the
-                // other is still loading, the faster peer would enter InGame
-                // (and potentially CharaIntro) before the slower peer has
-                // finished loading, widening the synchronization gap.
-                //
-                // CCCaster's getSkippableInput (DllNetplayManager.cpp:158-179)
-                // technically allows Confirm+Cancel through during Loading, but
-                // MBAACC's loading screen doesn't respond to those buttons, so
-                // the effect is the same as suppressing them. In zzcaster we
-                // suppress explicitly to make the intent clear and to prevent
-                // any future change to the game's loading screen from
-                // accidentally making it skippable.
-                //
-                // The catch-up mash (shouldCatchUp) is ALSO suppressed during
-                // Loading — we don't want the faster peer's "remote is ahead"
-                // signal to mash Confirm and potentially advance the local
-                // game past the loading screen before the local game has
-                // finished loading character data. The catch-up mash is only
-                // appropriate for CharaIntro and Skippable, where skipping
-                // the intro animation is the intended behavior.
-                return 0;
-            },
-            .chara_intro => {
+            .loading, .chara_intro, .skippable => {
                 // ============================================================
-                // Suppress ALL inputs during chara_intro in netplay
+                // Catch-up mash + getSkippableInput (matches CCCaster)
                 // ============================================================
-                // MBAACC's chara_intro can be skipped by pressing Confirm.
-                // If one peer skips and the other watches the full intro,
-                // round_start_counter increments at different frames for
-                // each peer → both enter in_game at different frames →
-                // frame-0 state divergence → desync.
+                // Ported from CCCaster DllNetplayManager.cpp:789-798. The
+                // three states share the same input logic:
+                //   1. If the remote is ahead by more than 1 index, mash
+                //      Confirm to skip the animation faster (catch-up).
+                //      This requires the menuConfirmState ASM hack
+                //      (applyMenuConfirmHack, commit 9749937) to actually
+                //      advance the game's menu/intro — without it, mashing
+                //      Confirm does nothing.
+                //   2. Otherwise, let the player's Confirm+Cancel inputs
+                //      through (getSkippableInput). This lets players
+                //      manually skip the intro/victory screen by pressing
+                //      Confirm, matching CCCaster's UX.
                 //
-                // CCCaster allows Confirm through during chara_intro
-                // (getSkippableInput returns raw_input & Confirm|Cancel),
-                // so CCCaster has the same bug. But CCCaster RELEASE doesn't
-                // detect desyncs (SyncHash handler is #ifndef RELEASE), so
-                // the divergence goes unnoticed.
+                // PREVIOUS BEHAVIOR (reverted by this commit): zzcaster
+                // suppressed ALL inputs during these states (return 0) to
+                // prevent "one peer skips, the other doesn't" desyncs. But
+                // that created the §A chara_intro entry divergence freeze:
+                // when one peer entered chara_intro 1 frame ahead (due to
+                // loading-completion I/O variance), the behind peer couldn't
+                // catch up (no mash), the per-frame lockstep forced
+                // frame-by-frame advancement on divergent game states, and
+                // round_start_counter fired asymmetrically → deadlock.
                 //
-                // zzcaster detects desyncs, so we MUST prevent the divergence.
-                // The simplest correct fix: suppress ALL inputs during
-                // chara_intro. Both peers watch the full intro (a few seconds
-                // of character animation). The intro is deterministic — same
-                // animation, same length — so both peers reach "players can
-                // move" at the same relative frame. round_start_counter
-                // increments at the same frame for both. Both transition to
-                // in_game at the same frame.
+                // CCCaster avoids this by NOT lockstepping these states
+                // (commit 3/3 will remove the lockstep) and using mash to
+                // catch up instead. The 1-frame entry drift is harmless
+                // because the behind peer mashes and catches up within a
+                // few frames.
                 //
-                // This is a UX regression (can't skip intro) but correctness
-                // > convenience. A future improvement could sync the skip:
-                // when one peer presses Confirm, send a "skip intro" signal,
-                // and both skip at the same frame. That requires a new
-                // protocol message and is deferred for now.
-                //
-                // Spectators are exempt — they mash Confirm to fast-forward.
+                // Spectators always mash Confirm to fast-forward (matches
+                // CCCaster getSkippableInput line 160-161).
+
+                // Spectator: always mash Confirm (fast-forward through
+                // animations the spectator doesn't care about).
                 if (self.config.is_spectator) {
-                    return button_confirm << 4;
-                }
-                return 0;
-            },
-            .skippable => {
-                // ============================================================
-                // Suppress ALL inputs during skippable (victory screen)
-                // ============================================================
-                // Same reasoning as chara_intro (see above). The skippable
-                // state is the inter-round "Round X Winner" / victory screen.
-                // It can be skipped by pressing Confirm. If one peer skips
-                // and the other watches the full victory animation,
-                // round_start_counter increments at different frames →
-                // both peers enter the next round's in_game at different
-                // frames → frame-0 state divergence → desync.
-                //
-                // This was observed in online testing: the desync appeared
-                // at index=8 frame=149 (round 3), after two round-over
-                // transitions. The victory screen skip desynchronized the
-                // round-start timing between peers.
-                //
-                // CCCaster allows Confirm through during skippable
-                // (getSkippableInput), same bug, but RELEASE doesn't detect.
-                //
-                // Spectators are exempt — they mash Confirm to fast-forward.
-                if (self.config.is_spectator) {
+                    asm_hacks.menu_confirm_state = 2;
                     if (self.indexed_frame.frame % 2 == 0) {
                         return button_confirm << 4;
                     }
                     return 0;
                 }
-                return 0;
+
+                // Catch-up mash: remote is ahead by >1 index → mash Confirm
+                // to skip the animation. The menuConfirmState hack makes
+                // the game actually process the mashed confirm.
+                if (self.shouldCatchUp()) {
+                    asm_hacks.menu_confirm_state = 2;
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+
+                // Normal path: let Confirm+Cancel through (getSkippableInput).
+                // Mask = COMBINE_INPUT(0, CC_BUTTON_CONFIRM | CC_BUTTON_CANCEL)
+                //      = (0x0400 | 0x0800) << 4 = 0xC000.
+                // This lets players manually skip the intro/victory screen.
+                return raw_input & 0xC000;
             },
             .in_game, .retry_menu => {
                 // Retry-menu sync gate: if in .retry_menu waiting for the remote to

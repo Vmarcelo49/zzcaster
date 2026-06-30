@@ -1237,43 +1237,18 @@ pub const NetplayManager = struct {
                 }
                 return input;
             },
-            .loading, .chara_intro, .skippable => {
+            .loading, .skippable => {
                 // ============================================================
                 // Spectator mash + catch-up mash + input suppression
                 // ============================================================
-                // Three input modes for loading/chara_intro/skippable:
-                //
-                // 1. Spectator: always mash Confirm (fast-forward through
-                //    animations the spectator doesn't care about). Matches
-                //    CCCaster getSkippableInput line 160-161.
-                //
-                // 2. Catch-up mash: if the remote is ahead by >1 index,
-                //    mash Confirm to skip the animation faster. Requires
-                //    the menuConfirmState ASM hack (applyMenuConfirmHack).
-                //    With per-frame lockstep restored (commit 3/3 reverted),
-                //    this rarely fires — but it's correct infrastructure
-                //    and matches CCCaster DllNetplayManager.cpp:792-797.
-                //
-                // 3. Normal path: SUPPRESS ALL player input (return 0).
-                //    This prevents the "one peer skips the victory/intro
-                //    animation, the other doesn't" desync. Even with
-                //    per-frame lockstep, a player's Confirm press arrives
-                //    at the local peer first, then travels to the remote
-                //    1+ frames later — the skip happens at different
-                //    relative frames, diverging the game state. Observed
-                //    in online testing: one peer saw "replay saved"
-                //    notification while the other saw the rematch menu.
-                //
-                //    This is a UX regression (can't skip intro/victory by
-                //    pressing Confirm) but correctness > convenience. Both
-                //    peers watch the full animation, reach the next state
-                //    at the same frame. Matches the pre-Option-1 behavior.
-                //
-                //    CCCaster allows Confirm through (getSkippableInput
-                //    returns raw_input & Confirm|Cancel), but CCCaster
-                //    RELEASE doesn't detect desyncs (SyncHash handler is
-                //    #ifndef RELEASE) so the divergence goes unnoticed.
-                //    zzcaster detects desyncs, so we MUST suppress.
+                // For loading and skippable (victory screen):
+                //   1. Spectator: always mash Confirm (fast-forward).
+                //   2. Catch-up mash: if remote is >1 index ahead, mash.
+                //   3. Normal path: suppress ALL player input (return 0).
+                //      Prevents "one peer skips victory, other doesn't"
+                //      desync. Observed in online testing when Confirm was
+                //      allowed through — the skip arrived at different
+                //      frames, diverging game state.
 
                 // Spectator: always mash Confirm (fast-forward).
                 if (self.config.is_spectator) {
@@ -1293,8 +1268,57 @@ pub const NetplayManager = struct {
                     return 0;
                 }
 
-                // Normal path: suppress ALL player input to prevent
-                // asymmetric skip desyncs.
+                // Normal path: suppress ALL player input.
+                return 0;
+            },
+            .chara_intro => {
+                // ============================================================
+                // chara_intro: ALWAYS mash Confirm (skip the intro)
+                // ============================================================
+                // The §A chara_intro entry divergence freeze happens when
+                // the two peers enter chara_intro with a 1-frame game
+                // state difference (loading I/O variance). If both peers
+                // watch the full ~207-frame intro, round_start_counter
+                // fires at different relative frames → deadlock.
+                //
+                // FIX: always mash Confirm during chara_intro. Both peers
+                // mash at the same frame (per-frame lockstep guarantees
+                // sync), so both skip the intro together and enter
+                // in_game at the same frame — before the 1-frame
+                // divergence can cause a round_start_counter asymmetry.
+                //
+                // This is the "hybrid approach": lockstep + always-mash.
+                // Lockstep keeps frames synced; always-mash skips the
+                // intro on both peers simultaneously. The menuConfirmState
+                // ASM hack (applyMenuConfirmHack) makes the game process
+                // the mashed confirm and advance past the intro.
+                //
+                // WHY THIS IS DIFFERENT FROM .skippable:
+                //   .skippable (victory screen) — skipping causes a
+                //   replay-save / rematch-menu desync (observed online).
+                //   Suppress inputs there.
+                //   .chara_intro — NOT skipping causes the §A deadlock.
+                //   Always mash here.
+                //
+                // Spectators also mash (same behavior, already handled
+                // by the generic spectator check below).
+
+                // Spectator: always mash Confirm (fast-forward).
+                if (self.config.is_spectator) {
+                    asm_hacks.menu_confirm_state = 2;
+                    if (self.indexed_frame.frame % 2 == 0) {
+                        return button_confirm << 4;
+                    }
+                    return 0;
+                }
+
+                // ALWAYS mash Confirm during chara_intro (not just
+                // catch-up). This skips the intro on both peers at the
+                // same frame, preventing the §A deadlock.
+                asm_hacks.menu_confirm_state = 2;
+                if (self.indexed_frame.frame % 2 == 0) {
+                    return button_confirm << 4;
+                }
                 return 0;
             },
             .in_game, .retry_menu => {

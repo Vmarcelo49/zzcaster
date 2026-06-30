@@ -1140,10 +1140,26 @@ pub const NetplaySession = struct {
             self.stats.avg_ms, self.stats.min_ms, self.stats.max_ms, self.stats.packet_loss,
         });
 
-        const avg_rtt = if (self.stats.avg_ms > 0) self.stats.avg_ms else 50;
-        const computed: u8 = @intFromFloat(@ceil(avg_rtt / (1000.0 / 60.0)));
-        self.config.delay = @min(computed, 8);
-        self.log.info("Auto delay: {d}", .{self.config.delay});
+        // HOST computes the delay from ping RTT. The host's delay is
+        // authoritative — it's sent to the client in the config message
+        // (sendConfigMessage), and the client adopts it (stepExchangeConfig).
+        //
+        // The CLIENT does NOT compute its own delay. It waits for the host's
+        // config and uses whatever delay the host sends. This guarantees both
+        // peers use the same delay value — a mismatch causes immediate desync.
+        //
+        // Previously, both peers computed their own delay from their own RTT
+        // measurement. If the measurements differed (asymmetric routing,
+        // jitter), the peers ended up with different delay values → desync.
+        // Now only the host computes; the client adopts.
+        if (self.config.is_host) {
+            const avg_rtt = if (self.stats.avg_ms > 0) self.stats.avg_ms else 50;
+            const computed: u8 = @intFromFloat(@ceil(avg_rtt / (1000.0 / 60.0)));
+            self.config.delay = @min(computed, 8);
+            self.log.info("Auto delay (host): {d}", .{self.config.delay});
+        } else {
+            self.log.info("Client: waiting for host's delay (not computing own)", .{});
+        }
 
         // After ping exchange:
         // - Host: go to waiting_confirmation. Config is sent later when

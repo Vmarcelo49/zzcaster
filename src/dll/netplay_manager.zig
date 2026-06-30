@@ -133,6 +133,12 @@ const rng_state3_size: u32 = 220;
 // Used by the SyncHash desync detector and the intro→in-game transition.
 const game_state_addr: *u32 = @ptrFromInt(0x74D598); // CC_GAME_STATE_ADDR (99 = intro done)
 const intro_state_addr: *u8 = @ptrFromInt(0x55D20B); // CC_INTRO_STATE_ADDR (2=chara intro, 1=pre-game, 0=in-game)
+// CC_MENU_STATE_COUNTER_ADDR (Constants.hpp:68): increments when a new menu
+// state appears (e.g. the replay-save popup after a match). Used to detect
+// when the popup is showing so we can set menu_confirm_state=2 and let the
+// player dismiss it with Confirm. Matches CCCaster getRetryMenuInput
+// (DllNetplayManager.cpp:393).
+const menu_state_counter_addr: *u32 = @ptrFromInt(0x767440);
 const round_timer_addr: *u32 = @ptrFromInt(0x562A3C); // CC_ROUND_TIMER_ADDR
 const real_timer_addr: *u32 = @ptrFromInt(0x562A40); // CC_REAL_TIMER_ADDR
 const camera_x_addr: *i32 = @ptrFromInt(0x564B14); // CC_CAMERA_X_ADDR
@@ -669,6 +675,12 @@ pub const NetplayManager = struct {
     // crashar ou o TransitionIndex se perder, os inputs são liberados
     // para não travar o jogo indefinidamente.
     retry_menu_wait_start_ms: i64 = 0,
+    // CC_MENU_STATE_COUNTER_ADDR value saved when entering .retry_menu
+    // (value + 1, matching CCCaster DllNetplayManager.cpp:749). When the
+    // replay-save popup appears, the counter increments above this saved
+    // value, signaling that menu_confirm_state should be set to 2 so the
+    // player can dismiss the popup with Confirm.
+    retry_menu_state_counter: u32 = 0,
 
     local_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
     remote_sync: [sync_queue_len]SyncHash = [_]SyncHash{.{}} ** sync_queue_len,
@@ -1369,6 +1381,17 @@ pub const NetplayManager = struct {
                         return 0; // suppress input
                     }
                 }
+
+                // Replay-save popup detection: when the game shows the
+                // replay-save popup, CC_MENU_STATE_COUNTER_ADDR increments
+                // above the value we saved when entering .retry_menu.
+                // Set menu_confirm_state=2 so the player's Confirm goes
+                // through and dismisses the popup. Matches CCCaster
+                // getRetryMenuInput (DllNetplayManager.cpp:393-397).
+                if (self.state == .retry_menu and menu_state_counter_addr.* > self.retry_menu_state_counter) {
+                    asm_hacks.menu_confirm_state = 2;
+                }
+
                 // Real input. In netplay, strip the Start button to prevent
                 // pausing — pausing halts the game loop while the remote peer
                 // keeps simulating, causing an instant desync. Matches CCCaster
@@ -2191,6 +2214,11 @@ pub const NetplayManager = struct {
                     remote_end_index, self.indexed_frame.index,
                 });
             }
+            // Save the menu state counter (+1, matching CCCaster line 749)
+            // so we can detect when the replay-save popup appears (counter
+            // increments above this value). Used by getNetplayInput to
+            // set menu_confirm_state=2 when the popup is showing.
+            self.retry_menu_state_counter = menu_state_counter_addr.* + 1;
         }
 
         if (self.enet_connected and !self.config.is_spectator and self.config.is_netplay) {

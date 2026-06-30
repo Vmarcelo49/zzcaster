@@ -1381,55 +1381,57 @@ pub const NetplayManager = struct {
     }
 
     pub fn isRemoteInputReady(self: *const NetplayManager) bool {
-        // CharaSelect and InGame block on remote input (lockstep).
-        // All other states return true (run at own pace, catch-up mash handles lag).
+        // Matches CCCaster DllNetplayManager.cpp:974-981: only CharaSelect
+        // and InGame block on remote input (lockstep). All other states
+        // return true (run at own pace, catch-up mash handles lag).
         //
-        // EXCEPTION: chara_intro blocks on remote reaching the same index.
-        // Without this, a fast peer (who finished loading and entered
-        // chara_intro first) would advance frames freely while the slow
-        // peer is still in loading. The intro animation would play out
-        // (or round_start_counter would increment) at different relative
-        // frames for each peer → frame-0 state divergence → desync.
+        // States that return true (no lockstep):
+        //   pre_initial, initial — startup menus, mash to advance
+        //   loading              — I/O-bound, can't lockstep (see below)
+        //   chara_intro          — catch-up mash handles drift
+        //   skippable            — catch-up mash handles drift
+        //   retry_menu           — player navigates menu, no frame sync needed
         //
-        // By blocking during chara_intro until the remote reaches our
-        // index, we pause the local game (lockstep wait freezes
-        // frameStep, which freezes the game loop, which freezes
-        // world_timer) until the remote is also in chara_intro. Both
-        // peers then watch the intro from the same starting point and
-        // reach "players can move" at the same relative frame.
+        // States that fall through to per-frame lockstep:
+        //   chara_select — both peers must agree on character/moon/color picks
+        //   in_game      — rollback/delay-based netplay requires frame sync
+        //
+        // WHY chara_intro/skippable/retry_menu are NOT lockstepped (revert of
+        // the 4-commit see-saw 0e4760c → d6a93b6 → d1899e8 → 515df3b):
+        //
+        // The see-saw tried to fix "massive divergence" (camera Δ19613,
+        // P1.x Δ45227, RNG mismatch) by adding lockstep to these states.
+        // But lockstep without mash-to-catch-up created the §A chara_intro
+        // entry divergence freeze: when one peer entered chara_intro 1
+        // frame ahead (loading I/O variance), the behind peer couldn't
+        // catch up (no mash), the lockstep forced frame-by-frame advancement
+        // on divergent game states, and round_start_counter fired
+        // asymmetrically → deadlock (host at index 4, client stuck at
+        // index 3, ENet connected, game frozen).
+        //
+        // CCCaster avoids this by NOT lockstepping these states and using
+        // mash-to-catch-up (DllNetplayManager.cpp:792-797) instead. The
+        // behind peer mashes Confirm to skip the animation faster, catching
+        // up within a few frames. The 1-frame entry drift is harmless.
+        //
+        // This commit (3/3 of Option 1) completes the CCCaster alignment:
+        //   - Commit 1/3 (9749937): ported menuConfirmState ASM hack
+        //     (prerequisite — makes mash actually work)
+        //   - Commit 2/3 (b630ccf): ported catch-up mash + getSkippableInput
+        //     (the actual "if remote_ahead, mash Confirm" logic)
+        //   - Commit 3/3 (this): removed lockstep from these states
+        //     (lets peers advance freely, like CCCaster)
+        //
+        // The "massive divergence" that the see-saw was trying to fix
+        // should NOT recur because the mash (commit 2/3) provides the
+        // catch-up mechanism that lockstep was poorly substituting for.
+        // If it does recur, revert this commit only — the mash stays.
         switch (self.state) {
-            .pre_initial, .initial, .loading => return true,
-            // chara_intro, skippable, retry_menu, chara_select, and in_game
-            // all use the per-frame lockstep logic below (fall through to the
-            // generic check that verifies remote has sent input for the
-            // current frame).
-            //
-            // Originally tried index-based blocking for chara_intro/skippable
-            // (commits 0e4760c, 0dc28ab, e4a8ba5), then per-frame lockstep
-            // (commit d6a93b6), then reverted to index-based (commit d1899e8),
-            // then reverted back to per-frame lockstep (this commit).
-            //
-            // The revert to index-based (d1899e8) was a mistake. Diagnostic
-            // logs showed the remote was 30 frames ahead at the start of
-            // chara_intro (remote_end_frame=30 while local frame=0). With
-            // index-based blocking, the local peer advanced freely because
-            // remote_end_index (4) > our_index (3), even though the remote
-            // was 30 frames ahead in the animation. Both peers reached
-            // "players can move" at different frames → massive divergence
-            // (camera Δ19613, P1.x Δ45227, RNG mismatch).
-            //
-            // Per-frame lockstep (d6a93b6) had a minor regression: small
-            // position drift over ~150 frames (camera Δ161, P1.x Δ250) with
-            // RNG matching. This is MUCH better than the massive divergence
-            // from index-based blocking. The small drift needs separate
-            // investigation (possibly the cooperative sleep / RTT EMA
-            // interacting with the lockstep during animation).
-            //
-            // The per-frame check (getEndFrame(our_index) > our_frame)
-            // guarantees the remote has actually advanced to our frame, not
-            // just reached our index. Both peers advance one frame at a time,
-            // each waiting for the other's input before proceeding.
-            .chara_intro, .skippable, .retry_menu, .chara_select, .in_game => {},
+            .pre_initial, .initial, .loading, .chara_intro, .skippable, .retry_menu => return true,
+            // chara_select and in_game use the per-frame lockstep logic
+            // below (fall through to the generic check that verifies remote
+            // has sent input for the current frame).
+            .chara_select, .in_game => {},
         }
 
         if (!self.config.is_netplay or self.config.is_spectator) return true;

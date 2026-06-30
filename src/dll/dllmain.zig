@@ -882,6 +882,13 @@ fn frameStep() callconv(.c) void {
 
     if (is_pre_game) {
         skip_frames_addr.* = 1;
+        // MUST set menu_confirm_state = 2 before writing the mash input —
+        // the menuConfirmState ASM hack (applyMenuConfirmHack) gates the
+        // game's menu-confirm handler on this value. Without it, the
+        // pre-game title-screen mash is silently blocked and the game
+        // never advances past game_mode=65535 (title screen).
+        // Matches CCCaster getPreInitialInput (DllNetplayManager.cpp:93).
+        asm_hacks.menu_confirm_state = 2;
         if (world_timer % 2 == 0) {
             writeInput(1, button_confirm << 4);
         }

@@ -1185,6 +1185,21 @@ pub const NetplayManager = struct {
             .pre_initial, .initial => {
                 // Mash Confirm every other frame to auto-advance through
                 // the title screen and menus.
+                //
+                // MUST set menu_confirm_state = 2 before returning the mash
+                // — the menuConfirmState ASM hack (applyMenuConfirmHack)
+                // gates the game's menu-confirm handler on this value:
+                //   - >1: force the confirm through (LABEL_B path)
+                //   - <=1: normal path (LABEL_A), which may NOT process
+                //     the confirm if the game's own menu code drops it
+                // Without setting this, the title-screen mash is silently
+                // blocked by the hack and the game never advances past
+                // game_mode=65535.
+                //
+                // Matches CCCaster getPreInitialInput (DllNetplayManager.cpp:93)
+                // and getInitialInput (line 110), both of which set
+                // AsmHacks::menuConfirmState = 2 before RETURN_MASH_INPUT.
+                asm_hacks.menu_confirm_state = 2;
                 if (self.indexed_frame.frame % 2 == 0) {
                     return button_confirm << 4;
                 }

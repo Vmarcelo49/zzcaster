@@ -1239,16 +1239,28 @@ pub const NetplayManager = struct {
             },
             .loading, .skippable => {
                 // ============================================================
-                // Spectator mash + catch-up mash + input suppression
+                // Loading: suppress. Skippable: allow Confirm+Cancel.
                 // ============================================================
-                // For loading and skippable (victory screen):
-                //   1. Spectator: always mash Confirm (fast-forward).
-                //   2. Catch-up mash: if remote is >1 index ahead, mash.
-                //   3. Normal path: suppress ALL player input (return 0).
-                //      Prevents "one peer skips victory, other doesn't"
-                //      desync. Observed in online testing when Confirm was
-                //      allowed through — the skip arrived at different
-                //      frames, diverging game state.
+                //
+                // LOADING: suppress ALL player input. The loading screen is
+                // not skippable and inputs during loading can cause issues.
+                //
+                // SKIPPABLE (victory screen): allow Confirm+Cancel through.
+                // With per-frame lockstep restored, both peers process the
+                // same input at the same frame — so if one peer presses
+                // Confirm to skip/dismiss the victory popup, the lockstep
+                // guarantees the other peer sees it at the same frame.
+                // No asymmetric skip, no desync.
+                //
+                // The menuConfirmState hack (menu_confirm_state = 2) makes
+                // the game actually process the Confirm, which dismisses
+                // the replay-save popup and advances past the victory
+                // animation. Without it, the popup blocks the retry menu.
+                //
+                // PREVIOUS ISSUE: commit b630ccf allowed Confirm through
+                // WITHOUT lockstep (commit 3/3 had removed it) → desync.
+                // Now lockstep is restored (commit 3/3 reverted), so
+                // allowing Confirm is safe again.
 
                 // Spectator: always mash Confirm (fast-forward).
                 if (self.config.is_spectator) {
@@ -1268,8 +1280,19 @@ pub const NetplayManager = struct {
                     return 0;
                 }
 
-                // Normal path: suppress ALL player input.
-                return 0;
+                // Loading: suppress all input.
+                if (self.state == .loading) return 0;
+
+                // Skippable: allow Confirm+Cancel through.
+                // Set menu_confirm_state = 2 so the game's menu code
+                // processes the Confirm (dismisses replay popup, skips
+                // victory animation). Both peers do this at the same
+                // frame (lockstep guarantees sync).
+                //
+                // Mask = COMBINE_INPUT(0, CC_BUTTON_CONFIRM | CC_BUTTON_CANCEL)
+                //      = (0x0400 | 0x0800) << 4 = 0xC000.
+                asm_hacks.menu_confirm_state = 2;
+                return raw_input & 0xC000;
             },
             .chara_intro => {
                 // ============================================================

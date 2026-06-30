@@ -1388,8 +1388,19 @@ pub const NetplayManager = struct {
                 // Set menu_confirm_state=2 so the player's Confirm goes
                 // through and dismisses the popup. Matches CCCaster
                 // getRetryMenuInput (DllNetplayManager.cpp:393-397).
+                //
+                // When the popup is NOT showing (counter <= threshold or
+                // has stopped incrementing), reset menu_confirm_state=0
+                // so the game processes Confirm normally for retry-menu
+                // navigation (Rematch / Character Select). Without this
+                // reset, menu_confirm_state stays stuck at 2 and the hack
+                // interferes with normal menu confirms. Matches CCCaster
+                // line 466: "Disable menu confirms" after the replay-save
+                // block.
                 if (self.state == .retry_menu and menu_state_counter_addr.* > self.retry_menu_state_counter) {
                     asm_hacks.menu_confirm_state = 2;
+                } else {
+                    asm_hacks.menu_confirm_state = 0;
                 }
 
                 // Real input. In netplay, strip the Start button to prevent

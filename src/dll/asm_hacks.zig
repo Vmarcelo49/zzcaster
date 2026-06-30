@@ -21,6 +21,27 @@ const multiple_melty_addr: *u8 = @ptrFromInt(0x40D25A);
 // Variable::RoundStart change-monitor in DllMain.cpp:1266-1270.
 pub var round_start_counter: u32 = 0;
 
+// Menu confirm override state. Ported from legacy DllAsmHacks.cpp:46
+// (menuConfirmState). The game's menu-confirm code path is patched
+// (applyMenuConfirmHack) to gate on this value:
+//   - 0: normal operation (game sets it to 1 when a confirm happens,
+//        confirm goes through because 1 is not > 1... actually see below)
+//   - 1: game sets this when a menu confirm happens naturally
+//   - >1 (we set it to 2): forces the next confirm to go through
+//
+// The ASM hack (5 patches at 0x428F52..0x428F82) intercepts the game's
+// menu confirm handler. When the game is about to process a confirm, it
+// checks menu_confirm_state: if >1, the confirm is forced through
+// (LABEL_B path); otherwise normal (LABEL_A path). The game then writes
+// the input value back into menu_confirm_state, so it auto-resets.
+//
+// This is the mechanism that makes mash-to-catch-up work: when we want
+// to skip an intro/animation, we set menu_confirm_state = 2 and return
+// a mashed Confirm input. The game's menu code sees >1, processes the
+// confirm, and advances the menu/intro. Without this hack, mashing
+// Confirm does nothing — the game's menu code ignores rapid presses.
+pub var menu_confirm_state: u32 = 0;
+
 pub fn applyPreLoadHacks() void {
     if (state.log == null) return;
     state.log.?.info("Applying pre-load ASM hacks...", .{});
@@ -29,6 +50,7 @@ pub fn applyPreLoadHacks() void {
     writeBytes(@intFromPtr(multiple_melty_addr), &multi_melty);
     applyHijackControls();
     applyDetectRoundStart();
+    applyMenuConfirmHack();
 
     applySfxAsmHacks();
     state.log.?.info("Pre-load hacks applied", .{});
@@ -222,6 +244,134 @@ pub fn applyDetectRoundStart() void {
     writeBytes(0x440CC5, &p3);
 
     state.log.?.info("detectRoundStart applied (round_start_counter @0x{x:0>8})", .{counter_addr});
+}
+
+// menuConfirmHack — 5 patches that intercept the game's menu-confirm code
+// path and gate it on `menu_confirm_state`. Ported from legacy
+// DllAsmHacks.hpp:282-318 (the hijackMenu list, menuConfirmState portion).
+//
+// The game's menu code at 0x428F82 is the menu-confirm handler. Without
+// these patches, the game processes a confirm input normally. With these
+// patches, the handler is redirected through a code cave that checks
+// menu_confirm_state:
+//   - If menu_confirm_state > 1: force the confirm through (LABEL_B)
+//   - Otherwise: normal path (LABEL_A)
+// The game then writes the input value back into menu_confirm_state,
+// auto-resetting it for the next frame.
+//
+// This is what makes mash-to-catch-up work: zzcaster sets
+// menu_confirm_state = 2 and returns a mashed Confirm input from
+// getNetplayInput. The patched handler sees >1, processes the confirm,
+// and advances the menu/intro/loading screen faster than normal.
+//
+// Patch map (addresses are hardcoded for the MBAACC build — same as all
+// other ASM hacks in this file). Byte counts verified against the legacy
+// AsmList entries in DllAsmHacks.hpp:285-318:
+//   0x428F52 (14 bytes): entry — push ebx/ecx/edx; lea ebx,[esp+30];
+//                        mov ecx,&menu_confirm_state; jmp 0x428F64
+//   0x428F64 (11 bytes): cmp [ecx],1; mov edx,[ebx]; mov [ecx],edx;
+//                        jg LABEL_B; jmp LABEL_A
+//   0x428F7A (6 bytes):  pop edx/ecx/ebx; nop; jmp RETURN
+//   0x428FC4 (8 bytes):  LABEL_A (4 bytes): mov [ebx],eax; jmp 0x428F7A
+//                        LABEL_B (4 bytes): mov [ecx],eax; jmp 0x428F7A
+//   0x428F82 (14 bytes): entry redirect — cmp [esp],0x4299F5 (return addr
+//                        of menu call); jne RETURN; jmp 0x428F52;
+//                        RETURN: ret 0004
+//
+// Patch order matters: the entry redirect at 0x428F82 is written LAST
+// so the code cave patches at 0x428F52/0x428F64/0x428F7A/0x428FC4 are
+// in place before execution can reach them (legacy comment: "Write this
+// last due to dependencies"). Matches the same ordering strategy as
+// applyDetectRoundStart.
+pub fn applyMenuConfirmHack() void {
+    const mcs_addr: u32 = @intCast(@intFromPtr(&menu_confirm_state));
+
+    // Patch 1 @ 0x428F52 (14 bytes):
+    //   53              push ebx
+    //   51              push ecx
+    //   52              push edx
+    //   8D 5C 24 30     lea ebx, [esp+30]
+    //   B9 <imm32>      mov ecx, &menu_confirm_state
+    //   EB 04           jmp 0x428F64  (next_ip=0x428F60, target=0x428F64, rel8=+4)
+    var p1: [14]u8 = undefined;
+    p1[0] = 0x53;
+    p1[1] = 0x51;
+    p1[2] = 0x52;
+    p1[3] = 0x8D;
+    p1[4] = 0x5C;
+    p1[5] = 0x24;
+    p1[6] = 0x30;
+    p1[7] = 0xB9;
+    std.mem.writeInt(u32, p1[8..12], mcs_addr, .little);
+    p1[12] = 0xEB;
+    p1[13] = 0x04;
+    writeBytes(0x428F52, &p1);
+
+    // Patch 2 @ 0x428F64 (11 bytes):
+    //   83 39 01        cmp dword ptr [ecx], 1
+    //   8B 13           mov edx, [ebx]
+    //   89 11           mov [ecx], edx
+    //   7F 5B           jg LABEL_B   (next_ip=0x428F6D, target=0x428FC8, rel8=+0x5B)
+    //   EB 55           jmp LABEL_A  (next_ip=0x428F6F, target=0x428FC4, rel8=+0x55)
+    const p2: [11]u8 = .{
+        0x83, 0x39, 0x01,
+        0x8B, 0x13,
+        0x89, 0x11,
+        0x7F, 0x5B,
+        0xEB, 0x55,
+    };
+    writeBytes(0x428F64, &p2);
+
+    // Patch 3 @ 0x428F7A (6 bytes):
+    //   5A              pop edx
+    //   59              pop ecx
+    //   5B              pop ebx
+    //   90              nop
+    //   EB 0D           jmp RETURN   (next_ip=0x428F80, target=0x428F8D, rel8=+0x0D)
+    const p3: [6]u8 = .{ 0x5A, 0x59, 0x5B, 0x90, 0xEB, 0x0D };
+    writeBytes(0x428F7A, &p3);
+
+    // Patch 4 @ 0x428FC4 (8 bytes): LABEL_A + LABEL_B (contiguous)
+    //   LABEL_A (0x428FC4, 4 bytes):
+    //     89 03           mov [ebx], eax
+    //     EB B2           jmp 0x428F7A  (next_ip=0x428FC8, target=0x428F7A, rel8=-0x4E = 0xB2)
+    //   LABEL_B (0x428FC8, 4 bytes):
+    //     89 01           mov [ecx], eax
+    //     EB AE           jmp 0x428F7A  (next_ip=0x428FCC, target=0x428F7A, rel8=-0x52 = 0xAE)
+    const p4: [8]u8 = .{
+        0x89, 0x03, 0xEB, 0xB2, // LABEL_A
+        0x89, 0x01, 0xEB, 0xAE, // LABEL_B
+    };
+    writeBytes(0x428FC4, &p4);
+
+    // Patch 5 @ 0x428F82 (14 bytes): entry redirect (written LAST)
+    //   81 3C 24 F5 99 42 00    cmp [esp], 0x004299F5  (return addr of menu call)
+    //   75 02                   jne RETURN  (next_ip=0x428F8B, target=0x428F8D, rel8=+2)
+    //   EB C5                   jmp 0x428F52 (next_ip=0x428F8D... wait, that's RETURN)
+    //
+    // Recompute: the jmp at offset 9 is EB C5. next_ip = 0x428F82 + 11 = 0x428F8D.
+    // But 0x428F8D is RETURN (the ret 0004 below). That can't be right — the jmp
+    // should go to 0x428F52 (the entry), not RETURN.
+    //
+    // Actually: EB C5 at offset 9 means the jmp instruction is at 0x428F82+9 =
+    // 0x428F8B. next_ip = 0x428F8B + 2 = 0x428F8D. target = 0x428F8D + (i32)0xC5
+    // = 0x428F8D - 0x3B = 0x428F52. Correct! (0xC5 as i8 = -0x3B)
+    //
+    // Layout:
+    //   81 3C 24 F5 99 42 00    cmp [esp], 0x004299F5   (7 bytes)
+    //   75 02                   jne RETURN (0x428F8D)    (2 bytes)
+    //   EB C5                   jmp 0x428F52             (2 bytes)
+    //   C2 04 00                ret 0004  (RETURN)       (3 bytes)
+    // Total = 14 bytes.
+    const p5: [14]u8 = .{
+        0x81, 0x3C, 0x24, 0xF5, 0x99, 0x42, 0x00,
+        0x75, 0x02,
+        0xEB, 0xC5,
+        0xC2, 0x04, 0x00,
+    };
+    writeBytes(0x428F82, &p5);
+
+    state.log.?.info("menuConfirmHack applied (menu_confirm_state @0x{x:0>8})", .{mcs_addr});
 }
 
 // SFX dedup hooks. filterRepeatedSfx suppresses repeated/muted playbacks;

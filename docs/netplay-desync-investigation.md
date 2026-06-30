@@ -4,523 +4,261 @@
 > Read this entirely before making changes — it captures the history, the
 > current open issues, and the hard-won findings that must not be rediscovered.
 >
-> **Two open issues as of 2026-06-29:**
-> 1. **chara_intro entry divergence** (PRIMARY — root cause of the freeze
->    users are seeing in delay mode) — documented in §A below
-> 2. **rollback small drift at frame 149** (SECONDARY — rollback-mode-only,
->    on the `fix/small-drift-animation-states` branch, not yet finished) —
->    documented in §B below
+> **Last updated:** 2026-06-30
+> **Current HEAD:** `bdad26e`
 
 ---
 
-## Contexto
+## Quick Status
 
-ZZCaster é um port em Zig 0.16 do CCCaster (netplay launcher para MBAACC).
-Estamos resolvendo desyncs de netplay. O trabalho foi feito na branch `main`
-do repo `git@github.com:Vmarcelo49/zzcaster.git`.
+| Issue | Status | Fixed by |
+|---|---|---|
+| §A chara_intro entry divergence freeze | ✅ RESOLVED | `d9ae272` always-mash during chara_intro |
+| §B small drift at frame 149 (round 2+) | ✅ RESOLVED | `b098c32` always-mash during skippable |
+| §C end-of-round delay desync | ❌ **OPEN** | — |
+| Replay save popup | ✅ RESOLVED | `76471ba` + `c6ae0db` + `01376d6` |
+| Retry menu navigation | ✅ RESOLVED | `01376d6` always mcs=2 |
+| Delay mismatch (host vs client) | ✅ RESOLVED | `bdad26e` host dictates delay |
+| Victory screen skip desync | ✅ RESOLVED | `b098c32` always-mash during skippable |
+| Title screen freeze (menuConfirmHack) | ✅ RESOLVED | `0936798` mcs=2 in pre-game mashes |
 
-**Antes de continuar:** clone o repo, leia `docs/rollback-desync-investigation.md`
-e `docs/cccaster-vs-zzcaster-diffs.md` para contexto completo. O repo de
-referência do CCCaster (C++) está em `https://github.com/Rhekar/CCCaster` —
-clone se precisar comparar implementações.
+**§C is the current open issue.** Delay mode desyncs at end of round (frame 149,
+uniform position offset ~2750 units, no RNG mismatch). Details in §C below.
+
+---
 
 ## Setup
 
 - **Repo zzcaster:** `git@github.com:Vmarcelo49/zzcaster.git`
 - **Repo CCCaster ref:** `https://github.com/Rhekar/CCCaster.git`
-- **SSH key:** o usuário fornece uma chave OpenSSH privada. Salve em
-  `/home/z/my-project/.ssh/id_ed25519` com header/footer
-  `-----BEGIN/END OPENSSH PRIVATE KEY-----`, chmod 600. Use o shim em
-  `/home/z/my-project/.ssh/ssh-shim.py` (requer `paramiko`) já que não há
-  `openssh-client` instalado. Configure:
-  `git config core.sshCommand "/home/z/my-project/.ssh/ssh-shim.py -i /home/z/my-project/.ssh/id_ed25519 -o StrictHostKeyChecking=no"`
+- **SSH:** shim at `/home/z/my-project/.ssh/ssh-shim.py` (paramiko, no openssh-client)
 - **Build:** `zig build -Dtarget=x86-windows-gnu -Doptimize=ReleaseFast`
-  → `zig-out/bin/{zzcaster.exe,hook.dll}`
-- **Toolchain:** Zig 0.16.0 de
-  `https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz`
-  (sha256: `70e49664a74374b48b51e6f3fdfbf437f6395d42509050588bd49abe52ba3d00`)
-- **Usuário:** `vmarcelo49 <vmarcelo49@gmail.com>` — todos os commits devem
-  ser authored como este usuário.
-- **TZ do usuário:** America/Sao_Paulo (fala português, responde em português)
+- **Toolchain:** Zig 0.16.0
+- **Usuário:** `vmarcelo49 <vmarcelo49@gmail.com>` — todos os commits authored as this user
+- **TZ:** America/Sao_Paulo (fala português, responde em português)
+- **CCCaster reference:** `/home/z/my-project/CCCaster` — a "pure truth". Always verify against this.
 
 ---
 
-## §A — chara_intro entry divergence (PRIMARY ISSUE)
+## §A — chara_intro entry divergence (RESOLVED)
 
-> **Status:** open, under active investigation (2026-06-29)
-> **Mode affected:** delay mode (rollback=0) — and likely rollback mode too,
-> but most visible in delay mode because there's no rollback to paper over it
-> **Symptom:** first online match after launching zzcaster freezes at the
-> chara_intro → in_game transition. Game window stops rendering (no crash,
-> like it activated sleep). Closing both instances + retrying sometimes works.
+**Status:** ✅ Fixed 2026-06-30 (`d9ae272`)
 
-### Root cause (confirmed via dual-peer logs)
+**Root cause:** Loading is I/O-bound and not lockstepped (same as CCCaster). The
+two peers enter chara_intro at different `world_timer` values (typically 1-3
+frames apart). With per-frame lockstep during chara_intro, both peers advance
+frame-by-frame, but the underlying game state is diverged. After ~207 frames,
+`round_start_counter` fires for one peer but not the other → deadlock.
 
-The two peers enter the `chara_intro` state at **different `world_timer`
-values**, 1 frame apart. This 1-frame divergence at the loading→chara_intro
-transition propagates through 207 frames of chara_intro (the per-frame
-lockstep passes because both peers are at index=3, so they pass each other
-regardless of underlying game-state drift), then bites at the
-chara_intro→in_game transition where the index advances.
+**Fix:** Always mash Confirm during chara_intro. Both peers mash at the same
+frame (lockstep guarantees sync), skip the intro together, and enter in_game at
+the same game state — before the divergence can cause a `round_start_counter`
+asymmetry.
 
-### Evidence (from `dll_512.log` host + `dll_640.log` client, 2026-06-29)
-
-**Config (both peers, delay mode):**
-```
-Config: netplay=true host=true  ... delay=1 rollback=0 port=1234 local_udp_port=0
-Config: netplay=true host=false ... delay=1 rollback=0 port=1234 local_udp_port=0
-```
-
-**The smoking gun — loading → chara_intro transition:**
-```
-HOST   (PID 512) line 49: DIAG: transition to chara_intro at world_timer=1082 (index=3)
-CLIENT (PID 640) line 50: DIAG: transition to chara_intro at world_timer=1083 (index=3)
-```
-**1 frame difference.** Both peers transitioned to chara_intro at index=3,
-but their game state was already 1 frame out of sync before chara_intro
-even started.
-
-**Consequence — chara_intro → in_game transition (207 frames later):**
-```
-HOST   line 261: Round start (counter 0 -> 1) — chara_intro -> InGame (frame=207, world_timer=1290)
-HOST   line 262: DIAG: transition to in_game at world_timer=1290 (index=4)
-HOST   line 265: RNG state sent (index=4, attempt=1)
-HOST   line 266: RNG sync confirmed by peer ack (index=4)
-HOST   (log ends — host is now in in_game waiting for remote's index-4 input)
-
-CLIENT line 263: DIAG: lockstep passed for chara_intro (frame=207, index=3, remote_end_frame=208)
-CLIENT line 264: DIAG: lockstep passed for chara_intro (frame=208, index=3, remote_end_frame=209)
-CLIENT line 264: Remote transition index: 4 (remote_inputs.end_index now 5)
-CLIENT line 265: Cached future remote RNG state (index=4, current=3)
-CLIENT line 266: Sent RNG_ACK (index=4)
-CLIENT line 267: Remote reached transition index 3 — starting 10s input-wait countdown
-CLIENT line 268: [WARN] Waiting for remote input... (5s elapsed, enet_connected=true, remote_end_index=4, local_index=3)
-```
-
-**What happened:**
-- HOST's game hit `round_start_counter 0→1` at frame 207, world_timer=1290
-  → transitioned to in_game (index 4)
-- CLIENT's game (1 frame behind from the start) was still at chara_intro
-  frame 207-208 — it never saw `round_start_counter 0→1` because its game
-  state was 1 frame behind
-- CLIENT received HOST's index-4 RNG state ("Cached future remote RNG
-  state (index=4, current=3)") but stayed at index=3 because its own game
-  hadn't reached round-start yet
-- CLIENT is now stuck waiting for HOST's index-3 input that doesn't exist
-  anymore (HOST is at index 4)
-- HOST is stuck waiting for CLIENT's index-4 input that will never come
-  (CLIENT is stuck at index 3)
-- **Deadlock. ENet still connected. No crash. Game window frozen.**
-
-### Why the per-frame lockstep doesn't catch this
-
-The per-frame lockstep (`DIAG: lockstep passed for chara_intro`) only checks
-that both peers are at the same `index` (3 = chara_intro). It does NOT check
-that their underlying `world_timer` values match. So the 1-frame divergence
-at entry (1082 vs 1083) is invisible to the lockstep — both peers happily
-report "lockstep passed" for 207 frames while their game states drift.
-
-The drift only becomes visible at the chara_intro→in_game transition,
-where `round_start_counter` (an ASM-driven counter incremented by the
-`applyDetectRoundStart` code cave) fires for the host but not the client,
-because the client's game state hasn't reached the round-start trigger
-point yet.
-
-### Key files to investigate
-
-- `src/dll/netplay_manager.zig` — `onStateTransition` (loading → chara_intro),
-  `checkRoundStart` (chara_intro → in_game via `round_start_counter`)
-- `src/dll/asm_hacks.zig` — `applyDetectRoundStart` (the code cave that
-  increments `round_start_counter`), `applyHijackIntroState` (NOPs the
-  game's natural intro_state 1→0 progression)
-- `src/dll/dllmain.zig` — `lazyInit` (applies `hijackIntroState` +
-  `stage_animation_off` BEFORE `waitForConfig` to eliminate the race where
-  the game reaches chara_intro before the hack is applied)
-- `src/dll/frame_step.zig` — `frameStepNetplay` (per-frame lockstep wait loop)
-
-### Hypotheses for the 1-frame entry divergence (NOT YET VERIFIED)
-
-1. **`hijackIntroState` timing** — applied in `lazyInit` before `waitForConfig`,
-   but the two peers might reach the chara_intro state machine point at
-   different frames due to loading-time differences. The hack NOPs the
-   intro_state 1→0 progression, but if one peer's game state is already at
-   intro_state=0 when the hack lands, that peer advances immediately while
-   the other waits.
-
-2. **`stage_animation_off` timing** — applied alongside `hijackIntroState`.
-   If this flag affects when the game transitions loading→chara_intro,
-   a 1-frame difference in when it's applied could cause the divergence.
-
-3. **Loading state duration** — the loading→chara_intro transition is driven
-   by the game's internal loading completion. If one peer's MBAA.exe loads
-   1 frame faster (disk cache, CPU scheduling), it enters chara_intro 1
-   frame earlier. The lockstep should catch this, but if the transition
-   index (3) is set before the lockstep wait fires, the 1-frame gap is
-   baked in.
-
-4. **`world_timer` increment timing** — `world_timer` is incremented by the
-   game's main loop, which zzcaster hooks. If the hook fires at a different
-   point in the loop on the two peers (due to the 1-frame loading
-   difference), the `world_timer` at the chara_intro transition differs.
-
-### Next steps for investigation
-
-1. **Add `world_timer` to the lockstep check** — currently the lockstep only
-   checks `index`. Add a `world_timer` comparison so a 1-frame divergence
-   at chara_intro entry is caught immediately (and the peer that's ahead
-   waits for the one that's behind, rather than both advancing to index=3
-   with divergent state).
-
-2. **Log the exact frame at which `hijackIntroState` + `stage_animation_off`
-   are applied** relative to the game's first `frameStep` call. If the two
-   peers apply the hack at different frames, that's the divergence source.
-
-3. **Check whether CCCaster has this same 1-frame entry divergence** —
-   CCCaster's `getbase()` + lock-at-entry-point mechanism (see
-   `tools/Launcher.cpp:57-183`, documented in `src/launcher/launcher.zig`
-   comment block) might enforce stricter timing than zzcaster's
-   CREATE_SUSPENDED approach. This is speculative — needs verification.
-
-### Important: do NOT confuse with the rollback small drift (§B)
-
-This is a **different bug** from the rollback small drift at frame 149
-documented in §B below. The key differences:
-
-| | §A chara_intro entry divergence | §B rollback small drift |
-|---|---|---|
-| **Mode** | delay mode (rollback=0) | rollback mode (rollback=4) |
-| **When** | chara_intro → in_game transition (frame 207) | in_game frame 149 |
-| **Root cause** | 1-frame world_timer divergence at chara_intro entry | unknown — RNG matches, camera/P1.x drift |
-| **RNG** | matches (sync confirmed) | matches |
-| **Symptom** | freeze/deadlock at in_game entry | small drift, desync detected later |
-| **Branch** | `main` | `fix/small-drift-animation-states` (RC, not finished) |
-
-**Solving §A may or may not solve §B.** They could share a root cause
-(timing divergence at a state transition) or be independent. Investigate
-§A first because it's the one users are hitting in delay mode.
+**Key commits:**
+- `9749937` — Port `menuConfirmState` ASM hack (prerequisite for mash)
+- `b630ccf` — Port catch-up mash + getSkippableInput
+- `0936798` — Set `menu_confirm_state=2` in pre-game mashes (title screen fix)
+- `d9ae272` — Always mash Confirm during chara_intro (the actual §A fix)
 
 ---
 
-## §B — rollback small drift at frame 149 (SECONDARY ISSUE)
+## §B — small drift at frame 149 (RESOLVED)
 
-> **Status:** open, release candidate on branch `fix/small-drift-animation-states`
-> (not fully tested — consider it unfinished as of 2026-06-29)
-> **Mode affected:** rollback mode only (rollback=4)
-> **Symptom:** desync at frame 149 with small drift (camera Δ161, P1.x Δ250),
-> RNG matching. Occurs especially in the second match after rematch.
+**Status:** ✅ Fixed 2026-06-30 (`b098c32`)
 
-### Sintoma
-- Desync no frame 149 (index 4, frame 149 = `indexed_frame=0x400000095`)
-- `camera_x` e `P1.x` divergem (Δ161 e Δ250 respectivamente)
-- **RNG hash: MATCH** (determinism root está OK)
-- Ocorre mais na segunda partida após rematch
+**Root cause:** Same as §A but for the victory screen (`.skippable`). The two
+peers enter skippable with a 3-frame game state difference. If both watch the
+full victory animation, `round_start_counter` fires at different relative frames
+→ Δ1415 uniform offset on all positions at round 2 frame 149.
 
-### Comparação de Approaches
+**Fix:** Always mash Confirm during skippable. Same pattern as chara_intro —
+both peers skip the victory screen together, enter round 2 at the same game
+state.
 
-| Lockstep | Desync | RNG | Magnitude |
-|---|---|---|---|
-| Index-based | ✗ Massive | **Mismatch** | camera Δ19613, P1.x Δ45227 |
-| Per-frame (atual) | ✗ Small drift | **Match** | camera Δ161, P1.x Δ250 |
+**Key commit:** `b098c32` — Always mash Confirm during skippable
 
-O per-frame é claramente melhor. O small drift é o próximo a investigar.
+**Note:** The `fix/small-drift-animation-states` branch (3 timing fixes — skip
+cooperative sleep, skip RTT EMA, reset frame limiter after lockstep wait) was
+merged (`981c1fb`) but did NOT fully fix §B. The actual fix was the
+always-mash approach. The branch's fixes are still beneficial (reduce timing
+variability during animations) and remain in the codebase.
 
-### Hipóteses para o Small Drift
+---
 
-1. **Cooperative sleep** (`recommendPerFrameSleepMs` em
-   `frame_step.zig:128-135`) — pode estar adicionando latência extra durante
-   `chara_intro`/`skippable`, onde não é necessário (inputs suprimidos,
-   animação determinística)
+## §C — end-of-round delay desync (OPEN)
 
-2. **RTT EMA** (`updateRttEma` em `netplay_manager.zig`) — alimentado durante
-   `chara_intro`/`skippable`, pode ter valores stale
+**Status:** ❌ Open — current focus
 
-3. **Frame rate limiter** (`limitFrameRate` em `dllmain.zig`) — busy-wait pode
-   se comportar diferente quando lockstep pausa o frameStep
+**Symptom:** Delay mode desyncs at end of round (frame 149, index 4 or 6).
+Uniform position offset (~2750 units on camera_x, P1_x, P2_x), **no RNG
+mismatch**. The match completes a full round but desyncs right at the end.
 
-### Próximo Passo Sugerido
+**Evidence (from 2026-06-30 online testing):**
 
-Desabilitar o cooperative sleep e o RTT EMA durante `chara_intro`/`skippable`
-(esses estados não precisam de time-sync). Em `frame_step.zig:128`:
-
-```zig
-// Atual:
-if (n.state == .in_game and !n.isRerunning()) {
-    const sleep_ms = n.recommendPerFrameSleepMs();
-    ...
-}
-
-// Sugerido:
-if (n.state == .in_game and !n.isRerunning()) {
-    const sleep_ms = n.recommendPerFrameSleepMs();
-    ...
-}
-// (não mudar — já é gated em .in_game)
+Match with delay=1 on both peers (delay mismatch fixed):
+```
+[ERROR] DESYNC detected at indexed_frame=0x0000000400000095
+[ERROR]   camera_x: -12500 vs -9750    (Δ2750)
+[ERROR]   P1 x: -37880 vs -35130       (Δ2750)
+[ERROR]   P2 x: (not reported)
+[ERROR]   (no RNG mismatch)
 ```
 
-Na verdade o sleep já é gated em `.in_game`. O problema pode ser que o
-lockstep wait durante `chara_intro` introduz variabilidade no timing que o
-`limitFrameRate` não compensa. Investigue a interação entre lockstep wait e
-frame limiter.
+**Key observations:**
+1. The offset is **uniform** on all positions → the entire game world is shifted
+2. **No RNG mismatch** → determinism root is OK, this is a position/timing offset
+3. Δ2750 / 149 frames ≈ 18.5 units/frame (much smaller than §B's 472 units/frame)
+4. Happens at frame 149 = `indexed_frame=0x...00000095` = the sync-hash check frame
+5. Both delay=1 and delay=2 reproduce the issue
+
+**Hypotheses (NOT YET VERIFIED):**
+1. **Timing injection during in_game** — the cooperative sleep / RTT EMA / frame
+   limiter interaction during active gameplay (not just animations) may cause
+   small per-frame drift that accumulates to Δ2750 over 149 frames
+2. **Input delay asymmetry** — even with matching delay values, the way inputs
+   are buffered and applied might differ between host and client
+3. **Frame limiter drift** — the busy-wait frame limiter may drift differently
+   on the two peers' hardware (different CPU speeds, timer resolution)
+4. **Air dash macro** — the macro modifies inputs; if it triggers at different
+   frames on the two peers (due to input timing), it could cause position drift
+
+**What to investigate next:**
+1. **Get both peers' full logs** for a desync match — compare frame-by-frame
+   from in_game entry (frame 0) to the desync (frame 149). Look for any
+   divergence in inputs, rollback triggers, or timing.
+2. **Check if the desync happens at the EXACT same frame** every time (149) or
+   varies. If always 149, it's the sync-hash check catching a drift that
+   accumulated over the round. If it varies, it's a specific event.
+3. **Test with delay=0** (if possible) to isolate whether the delay mechanism
+   itself contributes to the drift.
+4. **Compare with CCCaster** — does CCCaster have this same drift in delay mode?
+   CCCaster RELEASE doesn't detect desyncs, so it might have the drift but not
+   crash. Test CCCaster delay mode with debug build if possible.
 
 ---
 
-## Estado Atual (commit `671a9da` no main, 2026-06-29)
+## Key Files
 
-### O que está funcionando
-- **Delay mode (rollback=0)**: Funciona online APÓS a primeira partida —
-  mas a **primeira partida** frequentemente freeze devido ao bug §A
-  (chara_intro entry divergence). Os fixes que levaram ao delay mode
-  funcionar (quando não freeze) foram:
-  - `hijackIntroState` aplicado antes de `waitForConfig` (race condition fix)
-  - `clearIntroStateDuringRollback` em todos os modos netplay (não só rollback)
-  - Supressão de inputs durante `chara_intro` e `skippable`
-  - Per-frame lockstep para `chara_intro`, `skippable`, `retry_menu`
-
-### O que ainda tem problema
-- **§A chara_intro entry divergence** (PRIMARY) — freeze na primeira partida
-  em delay mode. Root cause identificado: 1-frame world_timer divergence no
-  loading→chara_intro transition. Investigações em andamento.
-- **§B rollback small drift** (SECONDARY) — desync intermitente com small
-  drift no frame 149 em rollback mode. RC na branch
-  `fix/small-drift-animation-states`, não terminado.
+- `src/dll/netplay_manager.zig` — NetplayManager, FSM, lockstep, rollback, sync hash
+  - `getNetplayInput` — input handling per state (chara_intro/skippable always-mash)
+  - `isRemoteInputReady` — lockstep gate (chara_select + in_game only; chara_intro/skippable/retry_menu return true)
+  - `checkRoundStart` — chara_intro/skippable → in_game transition via round_start_counter
+  - `onStateTransition` — captures start_world_time, arms RNG sync
+- `src/dll/asm_hacks.zig` — ASM hacks including menuConfirmState (commit `9749937`)
+- `src/dll/frame_step.zig` — frameStepNetplay, lockstep wait loop, cooperative sleep
+- `src/dll/dllmain.zig` — lazyInit, applyPostLoadHacks (auto_replay_save disable), frameStep
+- `src/launcher/session.zig` — handshake, delay negotiation (host dictates, commit `bdad26e`)
 
 ---
 
-## Histórico de Commits (em ordem cronológica)
+## Important Findings (must not rediscover)
 
-Commits 1-16 são do trabalho pré-QA (documentado na versão original deste
-arquivo, então chamado `HANDOFF.md`).
-Commits 17+ são da QA cleanup pass iniciada em 2026-06-29.
+### 1. CCCaster RELEASE doesn't detect desyncs
+The `SyncHash` handler is `#ifndef RELEASE` (`DllMain.cpp:1432-1436`). In RELEASE,
+`remoteSync` never receives entries. zzcaster detects at frame 149; CCCaster
+wouldn't. **"CCCaster works" is not proof there's no drift.**
 
-1. **`4509eea`** — Gate `hijackIntroState` em `is_netplay` em vez de
-   `rollback > 0` (delay mode fix inicial)
-2. **`5a5c13c`** — Aplicar `hijackIntroState` ANTES de `waitForConfig`
-   (race condition: jogo chegava em chara_intro antes do hack ser aplicado)
-3. **`3c51919`** — Documentação da investigação
-   (`docs/rollback-desync-investigation.md`)
-4. **`18221dc`** — Flag `enable_rollback_min_frame_delay_guard` (default
-   false, match CCCaster)
-5. **`220b8a0`** — `clearIntroStateDuringRollback` em todos os modos netplay
-   + log state pool erosion
-6. **`d07dd8f`** — `setRemote` break após primeira misprediction + suprimir
-   rollbacks ao frame 0
-7. **`434cbb1`** — Gate chara_intro catch-up mash (depois supersedido por
-   supressão total de inputs)
-8. **`2664a43`** — Suprimir TODOS os inputs durante `chara_intro` (não só
-   auto mash)
-9. **`0e4760c`** — Lockstep block para `chara_intro` (index-based)
-10. **`0dc28ab`** — Mesmo para `skippable` (tela de vitória)
-11. **`e4a8ba5`** — Mesmo para `retry_menu`
-12. **`d6a93b6`** — Per-frame lockstep para
-    `chara_intro`/`skippable`/`retry_menu` (tentativa de fix da segunda partida)
-13. **`d1899e8`** — REVERT do per-frame para index-based (regressão: small
-    drift com delay=2) — **este foi um erro**
-14. **`6495b94`** — Logging diagnóstico (`DIAG:` lines)
-15. **`ed1b458`** — Documentação `docs/cccaster-vs-zzcaster-diffs.md`
-16. **`515df3b`** — REVERT de volta ao per-frame lockstep (logs confirmaram
-    que index-based causa divergência massiva)
-17. **`2aa714a`** — docs: handoff document for next agent session (último
-    commit antes da QA cleanup pass)
-18. **`a6f0eec`** — fix(launcher): CLI netplay sends 9-byte IPC header to
-    match DLL expectation (QA A1)
-19. **`b70b00d`** — fix(launcher): drop dead orig_bytes read, document
-    CCCaster divergence (QA A2)
-20. **`d682a20`** — fix(net): nat_probe.resolveHost endianness — port
-    relay_client.zig fix (QA A3)
-21. **`8aa8664`** — refactor(net): dedupe ws2_32 extern bindings into shared
-    module (QA B1)
-22. **`671a9da`** — fix(ui): initialize rollback/wincount text fields from
-    config (QA — found while investigating §A)
+### 2. Loading is I/O-bound — cannot lockstep
+Loading completion depends on disk speed / cache warmth, not frame count.
+Lockstepping loading deadlocks (Option 2, commit `bdfbfe0`, reverted `295cf06`).
+The entry divergence must be handled by skipping the animation (always-mash),
+not by synchronizing the entry.
+
+### 3. Always-mash + lockstep is the winning pattern
+For animation states (chara_intro, skippable): always mash Confirm + per-frame
+lockstep. The mash skips the animation on both peers at the same frame; lockstep
+guarantees both peers mash together. This prevents the entry divergence from
+causing `round_start_counter` asymmetry.
+
+### 4. menuConfirmState hack is required for mashing
+The game's menu code ignores rapid Confirm presses. The `menuConfirmState` ASM
+hack (5 patches at `0x428F52`-`0x428F82`) intercepts the menu-confirm handler
+and forces it through when `menu_confirm_state > 1`. Every mash site MUST set
+`menu_confirm_state = 2`.
+
+### 5. retry_menu needs mcs=2 always
+The menuConfirmHack gates ALL confirms on `mcs > 1`. With `mcs=0`, the game
+detects the Confirm press (sets mcs=1) but the hack blocks it (1 is not > 1).
+During retry_menu, always set `mcs=2` so confirms work for Rematch/Character
+Select.
+
+### 6. Host dictates delay
+Both peers computing their own delay from RTT leads to mismatches (asymmetric
+routing, jitter). Only the host computes delay; the client adopts the host's
+value via the config message. (commit `bdad26e`)
+
+### 7. auto-replay-save is disabled
+The full auto-replay-save feature (saveReplay + detectAutoReplaySave ASM hacks +
+currentMenuIndex tracking) is NOT ported. Writing 0 to `CC_AUTO_REPLAY_SAVE_ADDR`
+(`0x553FE8`) disables the popup. The `menu_state_counter` (`0x767440`) detects
+when the popup appears so `mcs=2` can dismiss it. (commits `76471ba`, `c6ae0db`)
 
 ---
 
-## Arquivos-Chave
+## Commit History (this session, 2026-06-30)
 
-- `src/dll/netplay_manager.zig` — NetplayManager, FSM, lockstep, rollback,
-  sync hash. **`onStateTransition` (loading→chara_intro) e `checkRoundStart`
-  (chara_intro→in_game) são os pontos críticos para §A.**
-- `src/dll/rollback.zig` — InputBuffer, StatePool, loadStateForFrame
-- `src/dll/rollback_regions.zig` — 271 regiões de memória para save/restore
-- `src/dll/frame_step.zig` — frameStepNetplay, lockstep wait loop,
-  cooperative sleep. **O lockstep wait loop é onde §A se manifesta como
-  deadlock.**
-- `src/dll/dllmain.zig` — lazyInit, applyPostLoadHacks, frameStep,
-  limitFrameRate. **`lazyInit` aplica `hijackIntroState` +
-  `stage_animation_off` antes de `waitForConfig` — timing deste apply é
-  suspeito #1 para §A.**
-- `src/dll/asm_hacks.zig` — hijackIntroState, detectRoundStart,
-  round_start_counter. **`applyDetectRoundStart` (code cave que incrementa
-  `round_start_counter`) é o trigger que dispara chara_intro→in_game —
-  dispara no host mas não no client quando §A ocorre.**
-- `docs/rollback-desync-investigation.md` — Análise dos 3 suspeitos do
-  desync de rollback (§B)
-- `docs/cccaster-vs-zzcaster-diffs.md` — Features do CCCaster não portadas
-  + análise do drift
+### QA cleanup commits (earlier in session)
+- `a6f0eec` — fix(launcher): CLI netplay sends 9-byte IPC header (QA A1)
+- `b70b00d` — fix(launcher): drop dead orig_bytes read (QA A2)
+- `d682a20` — fix(net): nat_probe.resolveHost endianness (QA A3)
+- `8aa8664` — refactor(net): dedupe ws2_32 extern bindings (QA B1)
+- `671a9da` — fix(ui): initialize rollback/wincount from config
+- `26cb2c7` — docs: rename HANDOFF.md → netplay-desync-investigation.md
 
----
+### §A investigation + fix
+- `bdfbfe0` — lockstep loading state (Option 2 — FAILED, reverted)
+- `295cf06` — revert Option 2
+- `9749937` — port menuConfirmState ASM hack (Option 1, commit 1/3)
+- `b630ccf` — port catch-up mash + getSkippableInput (Option 1, commit 2/3)
+- `7338950` — remove chara_intro/skippable/retry_menu lockstep (Option 1, 3/3 — FAILED, reverted)
+- `3cde42c` — revert Option 1 commit 3/3 (restore lockstep)
+- `0936798` — set menu_confirm_state=2 in pre-game mashes (title screen fix)
+- `d9ae272` — **always mash Confirm during chara_intro** (§A FIX)
 
-## Descobertas Importantes (para não redescobrir)
+### §B + branch merge
+- `981c1fb` — merge fix/small-drift-animation-states (3 timing fixes, rebased)
+- `620570f` — suppress player input during loading/chara_intro/skippable (reverted by d9ae272)
+- `b587751` — logging dedup (consecutive identical lines → [Nx] prefix)
+- `e23b1a3` — remove per-frame DIAG lockstep + wait-loop spam
+- `b098c32` — **always mash Confirm during skippable** (§B FIX)
 
-### 1. CCCaster RELEASE não detecta desyncs em rollback mode
-O handler de `SyncHash` é `#ifndef RELEASE` (`DllMain.cpp:1432-1436`). Em
-RELEASE, `remoteSync` nunca recebe entries. zzcaster detecta no frame 149,
-CCCaster não detectaria. **Não existe "CCCaster rollback funcionando" como
-referência.**
+### Replay popup + retry menu + delay
+- `76471ba` — disable game's auto-replay-save popup
+- `85f20a9` — allow Confirm during skippable to dismiss replay popup
+- `c6ae0db` — detect replay-save popup via menu_state_counter
+- `ce95d80` — reset menu_confirm_state when popup not showing (reverted by 01376d6)
+- `0a57dad` — diag: log retry_menu counter/confirm state (temporary, removed)
+- `01376d6` — **always set mcs=2 during retry_menu** (retry menu FIX)
+- `bdad26e` — **host dictates delay** (delay mismatch FIX)
 
-### 2. `rollback_min_frame_delay = 8` era um bug
-O guard silenciosamente dropava mispredictions de early-frame. `lcf_frame` é
-fixo — se for 5, `5 < 8` é true para sempre, rollback nunca dispara. Agora é
-default false (`enable_rollback_min_frame_delay_guard`).
-
-### 3. Frame-0 rollbacks causam erosão do state pool
-`loadState` apaga todos os states depois do carregado. Re-run não salva
-intermediários. Rollback ao frame 0 → pool vira
-`[frame_0, frame_at_rerun_end]` → rollbacks subsequentes caem no frame 0.
-Por isso suprimimos rollbacks ao frame 0 em `checkRollback`.
-
-### 4. `InputBuffer.get` faz fallback cross-index
-Retorna `last_inputs` de índices anteriores se não há input exato. Igual ao
-CCCaster. Pode causar mispredictions falsas no frame 0 (inputs stale do
-chara_intro). Já mitigado pela supressão de frame-0 rollbacks.
-
-### 5. `setRemote` agora faz break após primeira misprediction
-Matches CCCaster (`InputsContainer.hpp:73-81`). Antes continuava verificando,
-podendo sobrescrever `lcf` com frame mais tarde.
-
-### 6. Per-frame lockstep é necessário
-Index-based permite o peer rápido avançar frames enquanto o lento carrega.
-Logs mostraram remote 30 frames à frente no frame 0 do chara_intro.
-Per-frame corrige isso. **MAS per-frame lockstep só verifica `index`, não
-`world_timer` — por isso §A não é pego pelo lockstep. Ver §A hipóteses.**
-
-### 7. `hijackIntroState` + `stage_animation_off` devem ser aplicados antes de `waitForConfig`
-Senão o jogo chega em chara_intro antes do hack ser aplicado → intro_state
-progride naturalmente em frame não-determinístico → desync. Aplicamos
-incondicionalmente e revertemos se for offline/spectator. **O timing exato
-deste apply em relação ao primeiro frameStep é suspeito #1 para §A.**
-
-### 8. §A e §B são bugs diferentes
-Não confunda. Ver tabela comparativa no §A. **Solving §A may or may not
-solve §B** — could share a root cause (timing divergence at a state
-transition) or be independent. Investigate §A first because it's the one
-users are hitting in delay mode.
+### Failed approaches (do not retry)
+- Option 2 (`bdfbfe0`): lockstep loading → deadlocks on slow disk
+- Option 1 commit 3/3 (`7338950`): remove chara_intro lockstep → massive divergence
+- Input suppression during chara_intro (`620570f`): §A freeze returns
 
 ---
 
-## Features do CCCaster Não Portadas (documentadas em `docs/cccaster-vs-zzcaster-diffs.md`)
+## How the User Tests
 
-1. Reset de variáveis ASM ao sair do retry_menu (`currentMenuIndex`,
-   `menuConfirmState`, `targetMenuState`, `targetMenuIndex`)
-2. Gerenciamento de `_startIndex` (`eraseIndexOlderThan` preserva inputs
-   recentes)
-3. Sistema de retry menu sincronizado (`_localRetryMenuIndex` /
-   `_remoteRetryMenuIndex` via mensagens `MenuIndex`)
-4. Variáveis ASM não portadas (`currentMenuIndex`, `menuConfirmState`,
-   `numLoadedColors`, `autoReplaySaveState`)
-5. `exportResults` ao entrar no RetryMenu
-6. `CC_MENU_STATE_COUNTER_ADDR` para timing de menu
-
-**Nenhuma dessas explica diretamente §A ou §B**, mas podem ser relevantes
-para bugs futuros.
+1. Build: `bash scripts/build-and-deploy.sh`
+2. Open zzcaster.exe in the game folder
+3. Test online with a friend OR localhost with 2 instances
+4. Config: `defaultRollback=0` for delay mode, `defaultRollback=4` for rollback
+5. Logs: `dll_<pid>.log` in `zzcaster/` next to MBAA.exe
+6. Look for: `DESYNC detected`, `transition to`, `Round start`, `Round over`
 
 ---
 
-## Como o Usuário Testa
+## Notes for the Next Agent
 
-1. Build: `bash scripts/build-and-deploy.sh` (faz build + deploy para a
-   pasta do jogo)
-2. Abre zzcaster.exe na pasta do jogo
-3. Testa online com um amigo (diferentes estados/máquinas para expor
-   timing issues) OU localhost com 2 instâncias
-4. Config: `defaultRollback=0` para delay mode, `defaultRollback=4` para
-   rollback mode. **Nota: o campo de texto na UI de "Game Config" agora
-   reflete o valor do config.ini (fix em `671a9da`); antes sempre mostrava
-   "4".**
-5. Logs da DLL: `dll_<pid>.log` na pasta `zzcaster/` ao lado do MBAA.exe
-   (envia os dois logs de ambos os peers)
-6. Procura por `DESYNC detected`, `DIAG:`, `transition to`, `Round start`,
-   `Waiting for remote input`
-
-### Padrão de freeze da §A (reconhecer pelos logs)
-
-```
-HOST:   Round start (counter 0 -> 1) — chara_intro -> InGame (frame=N, world_timer=W)
-HOST:   DIAG: transition to in_game at world_timer=W (index=4)
-HOST:   RNG state sent (index=4)
-HOST:   (log ends — host waiting for client's index-4 input)
-
-CLIENT: DIAG: lockstep passed for chara_intro (frame=N, index=3, remote_end_frame=N+1)
-CLIENT: Cached future remote RNG state (index=4, current=3)
-CLIENT: [WARN] Waiting for remote input... (5s elapsed, enet_connected=true, remote_end_index=4, local_index=3)
-```
-
-**Key diagnostic:** compare the `world_timer` values at the
-`transition to chara_intro` log line on both peers. If they differ by even
-1 frame, that's §A.
-
----
-
-## Padrões de Desync (reconhecer pelos logs)
-
-| Padrão | Causa | Status |
-|---|---|---|
-| RNG mismatch + camera/P1.x divergência massiva | Lockstep insuficiente (index-based) | ✗ Resolvido (per-frame) |
-| RNG match + camera/P1.x small drift no frame 149 | Per-frame lockstep + timing variability (§B) | **Em investigação (branch RC)** |
-| RNG mismatch + P1/P2 seq_state divergente | Skip de intro assimétrico | ✗ Resolvido (supressão de inputs) |
-| RNG match + camera/P1.x/P2.x offset uniforme | State pool erosion (frame-0 rollbacks) | ✗ Resolvido (supressão frame-0) |
-| **Freeze no chara_intro→in_game transition, host vê round_start mas client não, world_timer diverge por 1 frame no loading→chara_intro entry** | **§A chara_intro entry divergence** | **PRIMARY ISSUE — em investigação** |
-
----
-
-## Notas para o Próximo Agente
-
-1. **Sempre peça logs de AMBOS os peers.** Comparar os dois é essencial.
-   Para §A, compare especificamente os `world_timer` values na linha
-   `transition to chara_intro`.
-2. **Não faça mudanças sem confirmar com logs.** Já cometemos erros por
-   adivinhar (ex: revert `d1899e8`).
-3. **Documente cada fix com comentários no código.** O usuário valoriza isso.
-4. **Commits atômicos com mensagens detalhadas.** Inclua os números de delta
-   do desync nos commits.
-5. **O usuário testa online com um amigo E em localhost com 2 instâncias.**
-   Resultados podem variar entre localhost e online devido a latency.
-6. **§A (chara_intro entry divergence) é o PRIMARY ISSUE.** §B (rollback
-   small drift) é secondary, na branch `fix/small-drift-animation-states`,
-   não terminado. Foque em §A primeiro.
-7. **O usuário fala português.** Responda em português.
-8. **SSH push funciona** com o shim paramiko. Não tente instalar
-   openssh-client.
-9. **Sempre verifique contra o CCCaster reference** antes de assumir que algo
-   é um bug zzcaster — o CCCaster é a "pure truth". Clone de
-   `https://github.com/Rhekar/CCCaster` está em `/home/z/my-project/CCCaster`
-   se disponível.
-
----
-
-## Próximos Passos (plano mental do usuário)
-
-1. **Investigar §A** — chara_intro entry divergence (1-frame world_timer
-   difference no loading→chara_intro transition). Adicionar `world_timer`
-   ao lockstep check é o próximo passo sugerido.
-2. **Terminar §B** — validar o RC na branch `fix/small-drift-animation-states`
-   (não mexer até §A estar resolvido, podem compartilhar root cause).
-3. Se §A resolvido, partir para melhorar rollback (state pool, determinism).
-4. Considerar portar features do CCCaster (retry menu sync, etc.) conforme
-   necessário.
-
----
-
-## Documentos de Referência
-
-- `docs/rollback-desync-investigation.md` — Análise dos 3 suspeitos do
-  desync de rollback (§B específico)
-- `docs/cccaster-vs-zzcaster-diffs.md` — Features do CCCaster não portadas
-  + análise do drift atualizada
-- `docs/roadmap.md` — Roadmap geral do projeto
-- `docs/rollback-improvement-plan.md` — Plano de melhorias de rollback
-- `docs/nat-traversal-protocol.md` — Protocolo de NAT traversal (autoritativo
-  para wire format)
-- `docs/threading-architecture-plan.md` — Arquitetura de threading
-- **CCCaster reference:** `https://github.com/Rhekar/CCCaster` — a "pure
-  truth" para comportamento esperado. Sempre verifique contra este antes de
-  assumir que algo é um bug zzcaster.
+1. **§C (end-of-round desync) is the current focus.** Read §C above carefully.
+2. **Always verify against CCCaster** — clone is at `/home/z/my-project/CCCaster`.
+3. **Always get BOTH peers' logs.** Compare frame-by-frame.
+4. **Don't guess — confirm with logs.** The see-saw history (§A) shows guessing causes regressions.
+5. **The user fala português.** Responda em português.
+6. **SSH push works** with the paramiko shim. Don't try to install openssh-client.
+7. **menuConfirmState hack is at `0x428F52`-`0x428F82`** — 5 patches, ported in `9749937`.
+8. **Always-mash + lockstep** is the proven pattern for animation states. Don't remove lockstep.
+9. **Loading cannot be lockstepped** — it's I/O-bound. Handle entry divergence by skipping the animation.
+10. **auto-replay-save is disabled, not ported.** Don't try to port the full feature unless needed.
